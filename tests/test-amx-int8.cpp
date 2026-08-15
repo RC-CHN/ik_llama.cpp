@@ -332,11 +332,13 @@ int main(int argc, char ** argv) {
          bench_case(GGML_TYPE_Q5_K_R4, GGML_TYPE_Q8_K32,  32,  512) &&
          bench_case(GGML_TYPE_Q5_K_R4, GGML_TYPE_Q8_K32,  64,  256) &&
          bench_case(GGML_TYPE_Q5_K_R4, GGML_TYPE_Q8_K32, 512,   32)) : benchmark_q8 ?
-        (bench_case(GGML_TYPE_Q8_0_R8, GGML_TYPE_Q8_2_X4,  8, 4096, 2048, 2048) &&
+        (bench_case(GGML_TYPE_Q8_0_R8, GGML_TYPE_Q8_2_X4,  1, 32768, 2048, 2048) &&
+         bench_case(GGML_TYPE_Q8_0_R8, GGML_TYPE_Q8_2_X4,  8, 4096, 2048, 2048) &&
          bench_case(GGML_TYPE_Q8_0_R8, GGML_TYPE_Q8_2_X4, 16, 2048, 2048, 2048) &&
          bench_case(GGML_TYPE_Q8_0_R8, GGML_TYPE_Q8_2_X4, 32, 1024, 2048, 2048) &&
          bench_case(GGML_TYPE_Q8_0_R8, GGML_TYPE_Q8_2_X4, 64,  512, 2048, 2048)) : benchmark_iq3_moe ?
-        (bench_case(GGML_TYPE_IQ3_S_R4, GGML_TYPE_Q8_K,  4, 20480, 512, 2048) &&
+        (bench_case(GGML_TYPE_IQ3_S_R4, GGML_TYPE_Q8_K,  1, 32768, 512, 2048) &&
+         bench_case(GGML_TYPE_IQ3_S_R4, GGML_TYPE_Q8_K,  4, 20480, 512, 2048) &&
          bench_case(GGML_TYPE_IQ3_S_R4, GGML_TYPE_Q8_K,  8, 10240, 512, 2048) &&
          bench_case(GGML_TYPE_IQ3_S_R4, GGML_TYPE_Q8_K, 16,  5120, 512, 2048) &&
          bench_case(GGML_TYPE_IQ3_S_R4, GGML_TYPE_Q8_K, 32,  2560, 512, 2048) &&
@@ -380,6 +382,7 @@ int main(int argc, char ** argv) {
         run_case(GGML_TYPE_Q8_0_R8, GGML_TYPE_Q8_2_X4, 64, 32, 1024, 1) &&
         run_case(GGML_TYPE_Q8_0_R8, GGML_TYPE_Q8_2_X4, 64, 16, 1024, 1) &&
         run_case(GGML_TYPE_Q8_0_R8, GGML_TYPE_Q8_2_X4, 64,  8, 1024, 1) &&
+        run_case(GGML_TYPE_Q8_0_R8, GGML_TYPE_Q8_2_X4, 64,  1, 1024, 1) &&
         run_case(GGML_TYPE_IQ4_NL_R4, GGML_TYPE_Q8_2_X4, 64, 32, 1024, 1) &&
         run_case(GGML_TYPE_IQ4_NL_R4, GGML_TYPE_Q8_2_X4, 64, 16, 1024, 1) &&
         run_case(GGML_TYPE_IQ4_NL_R4, GGML_TYPE_Q8_2_X4, 64,  8, 1024, 4);

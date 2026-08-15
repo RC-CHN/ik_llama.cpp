@@ -4543,6 +4543,8 @@ struct ggml_numa_nodes {
     uint32_t n_nodes;
     uint32_t total_cpus; // hardware threads on system
     uint32_t current_node; // node on which main process is execting
+    bool row_shard;
+    bool exact_pin;
 #if defined(__gnu_linux__)
     cpu_set_t cpuset; // cpuset from numactl
 #else
@@ -4657,6 +4659,16 @@ void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
 
     // set numa scheme
     g_state.numa.numa_strategy = numa_flag;
+    const char * row_shard = getenv("GGML_NUMA_ROW_SHARD");
+    g_state.numa.row_shard = numa_flag == GGML_NUMA_STRATEGY_DISTRIBUTE &&
+            row_shard != NULL && row_shard[0] != '\0' &&
+            strcmp(row_shard, "0") != 0 && strcmp(row_shard, "false") != 0 && strcmp(row_shard, "off") != 0;
+    const char * exact_pin = getenv("GGML_NUMA_EXACT_PIN");
+    const bool exact_pin_set = exact_pin != NULL && exact_pin[0] != '\0';
+    const bool exact_pin_value = exact_pin_set &&
+            strcmp(exact_pin, "0") != 0 && strcmp(exact_pin, "false") != 0 && strcmp(exact_pin, "off") != 0;
+    g_state.numa.exact_pin = numa_flag == GGML_NUMA_STRATEGY_DISTRIBUTE &&
+            (exact_pin_set ? exact_pin_value : g_state.numa.row_shard);
 
     GGML_PRINT_DEBUG("numa strategy %u\n",g_state.numa.numa_strategy);
 
@@ -4716,6 +4728,13 @@ void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
     }
 
     if (ggml_is_numa()) {
+        if (g_state.numa.row_shard) {
+            GGML_PRINT("ggml_numa_init: experimental row-sharded NUMA scheduling enabled across %u nodes\n",
+                    g_state.numa.n_nodes);
+        } else if (g_state.numa.exact_pin) {
+            GGML_PRINT("ggml_numa_init: exact NUMA worker pinning enabled across %u nodes\n",
+                    g_state.numa.n_nodes);
+        }
         FILE *fptr = fopen("/proc/sys/kernel/numa_balancing", "r");
         if (fptr != NULL) {
             char buf[42];
@@ -4733,6 +4752,24 @@ void ggml_numa_init(enum ggml_numa_strategy numa_flag) {
 
 bool ggml_is_numa(void) {
     return g_state.numa.n_nodes > 1;
+}
+
+uint32_t ggml_numa_node_count(void) {
+    return g_state.numa.n_nodes;
+}
+
+bool ggml_numa_row_shard_enabled(void) {
+    return g_state.numa.row_shard && ggml_is_numa();
+}
+
+// DISTRIBUTE pins thread i to NUMA node i % n_nodes. Reorder its matrix-work
+// index so all threads on a node consume one contiguous output-row shard.
+static inline int ggml_numa_work_thread(int ith, int nth) {
+    const int n_nodes = (int) g_state.numa.n_nodes;
+    if (!ggml_numa_row_shard_enabled() || n_nodes < 2 || nth % n_nodes != 0) {
+        return ith;
+    }
+    return (ith % n_nodes) * (nth / n_nodes) + ith / n_nodes;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -17860,6 +17897,20 @@ static inline uint32_t simple_gcd(uint32_t a, uint32_t b) {
     return a;
 }
 
+// Prefer a per-expert chunk count that gives every worker on a NUMA node the
+// same number of active-expert tasks. Only reduce the chunk count: this keeps
+// each task at least as large as the kernel's existing granularity heuristic.
+static int ggml_numa_balanced_expert_chunks(
+        int chunks_per_expert, int n_active, int n_nodes, int local_nth) {
+    for (int candidate = chunks_per_expert; candidate >= n_nodes; candidate -= n_nodes) {
+        const int tasks_per_node = n_active * (candidate / n_nodes);
+        if (tasks_per_node >= local_nth && tasks_per_node % local_nth == 0) {
+            return candidate;
+        }
+    }
+    return chunks_per_expert;
+}
+
 static int ggml_compute_forward_mul_mat(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst,
@@ -17873,6 +17924,7 @@ static int ggml_compute_forward_mul_mat(
 
     const int ith = params->ith;
     const int nth = params->nth;
+    const int work_ith = ggml_numa_work_thread(ith, nth);
 
     const enum ggml_type type = src0->type;
 
@@ -17911,7 +17963,7 @@ static int ggml_compute_forward_mul_mat(
                     ne02, ne03, ne12, ne13, nb02, nb03, nb12, nb13, nb2/sizeof(float), nb3/sizeof(float),
                     src0->type, src0->data, nb01,
                     src1->type, src1->data, nb11,
-                    (float *)dst->data, nb1/sizeof(float), ith, nth)) return node_n;
+                    (float *)dst->data, nb1/sizeof(float), work_ith, nth)) return node_n;
     }
 #endif
 
@@ -17979,7 +18031,7 @@ static int ggml_compute_forward_mul_mat(
                     nb2/sizeof(float), nb3/sizeof(float),
                     src0->type, src0->data, nb01,
                     vec_dot_type, wdata, row_size,
-                    (float *)dst->data, nb1/sizeof(float), ith, nth)) {
+                    (float *)dst->data, nb1/sizeof(float), work_ith, nth)) {
             if (!cgraph) return node_n;
             while (node_n < cgraph->n_nodes - 1 &&
                    cgraph->nodes[node_n+1]->op == GGML_OP_MUL_MAT &&
@@ -17995,7 +18047,7 @@ static int ggml_compute_forward_mul_mat(
                     dst_next->nb[2]/sizeof(float), dst_next->nb[3]/sizeof(float),
                     src0_next->type, src0_next->data, src0_next->nb[1],
                     vec_dot_type, wdata, row_size,
-                    (float *)dst_next->data, dst_next->nb[1]/sizeof(float), ith, nth)) break;
+                    (float *)dst_next->data, dst_next->nb[1]/sizeof(float), work_ith, nth)) break;
                 ++node_n;
             }
         }
@@ -18051,8 +18103,8 @@ static int ggml_compute_forward_mul_mat(
     if ((ggml_n_dims(src0) == 2) && gemv) {
         const void * src1_wdata      = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t src1_col_stride = ggml_is_contiguous(src1) || src1->type != vec_dot_type ? ggml_row_size(vec_dot_type, ne10) : nb11;
-        int64_t src0_start = (ith * ne01) / nth;
-        int64_t src0_end   = ((ith + 1) * ne01) / nth;
+        int64_t src0_start = (work_ith * ne01) / nth;
+        int64_t src0_end   = ((work_ith + 1) * ne01) / nth;
         src0_start = (src0_start % matmul_num_cols) ? src0_start + matmul_num_cols - (src0_start % matmul_num_cols): src0_start;
         src0_end   = (src0_end   % matmul_num_cols) ? src0_end   + matmul_num_cols - (src0_end   % matmul_num_cols): src0_end;
         if (src0_start >= src0_end) return node_n;
@@ -18150,6 +18202,7 @@ static void ggml_compute_forward_mul_mat_id(
 
     int64_t * matrix_row_counts = (int64_t *) (wdata_src1_end); // [n_as]
     struct mmid_row_mapping * matrix_rows = (struct mmid_row_mapping *)(matrix_row_counts + n_as); // [n_as][ne11]
+    int32_t * active_experts = (int32_t *)(matrix_rows + n_as*ne12); // [count, active expert ids...]
 
     if (src1->type != vec_dot_type) {
         char * wdata = params->wdata;
@@ -18202,6 +18255,14 @@ static void ggml_compute_forward_mul_mat_id(
                 matrix_row_counts[i02] += 1;
             }
         }
+
+        int n_active = 0;
+        for (int a = 0; a < n_as; ++a) {
+            if (matrix_row_counts[a] > 0) {
+                active_experts[++n_active] = a;
+            }
+        }
+        active_experts[0] = n_active;
     }
 
     if (ith == 0) {
@@ -18216,7 +18277,33 @@ static void ggml_compute_forward_mul_mat_id(
         const void * wdata_mm    = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t row_size_mm = ggml_row_size(vec_dot_type, ne10);
 
-        const int chunks_per_expert = MAX(1, MIN(nth, (int)(ne01 / 32)));
+        int chunks_per_expert = MAX(1, MIN(nth, (int)(ne01 / 32)));
+
+        const int n_nodes = (int) ggml_numa_node_count();
+        if (ggml_numa_row_shard_enabled() && n_nodes > 1 &&
+                nth % n_nodes == 0 && chunks_per_expert % n_nodes == 0) {
+            const int node = ith % n_nodes;
+            const int local_ith = ith / n_nodes;
+            const int local_nth = nth / n_nodes;
+            const int n_active = active_experts[0];
+            chunks_per_expert = ggml_numa_balanced_expert_chunks(
+                    chunks_per_expert, n_active, n_nodes, local_nth);
+            const int chunks_per_node = chunks_per_expert / n_nodes;
+
+            for (int task = local_ith; task < n_active * chunks_per_node; task += local_nth) {
+                const int active_index = task / chunks_per_node;
+                const int local_chunk = node * chunks_per_node + task % chunks_per_node;
+                const int cur_a = active_experts[active_index + 1];
+
+                const char * src0_cur = (const char *) src0->data + cur_a*nb02;
+                if (!iqk_mul_mat_moe(ne01, matrix_row_counts[cur_a], ne00, ne11,
+                            src0->type, src0_cur, nb01,
+                            vec_dot_type, (const char *)wdata_mm, row_size_mm,
+                            (float *)dst->data, nb1, nb2,
+                            matrix_rows + cur_a*ne12, local_chunk, chunks_per_expert)) goto IQK_MulMat_Not_Available0;
+            }
+            return;
+        }
 
         int total_chunks = 0;
         for (int a = 0; a < n_as; a++) {
@@ -18476,6 +18563,7 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
 
     int64_t * matrix_row_counts = (int64_t *) (wdata_src1_end); // [n_as]
     struct mmid_row_mapping * matrix_rows = (struct mmid_row_mapping *)(matrix_row_counts + n_as); // [n_as][ne11]
+    int32_t * active_experts = (int32_t *)(matrix_rows + n_as*ne12); // [count, active expert ids...]
 
     if (src1->type != vec_dot_type) {
 
@@ -18531,6 +18619,14 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
                 matrix_row_counts[i02] += 1;
             }
         }
+
+        int n_active = 0;
+        for (int a = 0; a < n_as; ++a) {
+            if (matrix_row_counts[a] > 0) {
+                active_experts[++n_active] = a;
+            }
+        }
+        active_experts[0] = n_active;
     }
 
 #if defined GGML_EXPERT_CHUNKING
@@ -18547,7 +18643,49 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
     const size_t row_size_ug = ggml_row_size(vec_dot_type, ne10);
     const int64_t nr0_base = src0_2 ? ne01 : ne01/2;
 
-    const int chunks_per_expert_ug = MAX(1, MIN(nth, (int)(nr0_base / 32)));
+    int chunks_per_expert_ug = MAX(1, MIN(nth, (int)(nr0_base / 32)));
+
+    const int n_nodes_ug = (int) ggml_numa_node_count();
+    if (ggml_numa_row_shard_enabled() && n_nodes_ug > 1 &&
+            nth % n_nodes_ug == 0 && chunks_per_expert_ug % n_nodes_ug == 0) {
+        const int node = ith % n_nodes_ug;
+        const int local_ith = ith / n_nodes_ug;
+        const int local_nth = nth / n_nodes_ug;
+        const int n_active = active_experts[0];
+        chunks_per_expert_ug = ggml_numa_balanced_expert_chunks(
+                chunks_per_expert_ug, n_active, n_nodes_ug, local_nth);
+        const int chunks_per_node = chunks_per_expert_ug / n_nodes_ug;
+
+        for (int task = local_ith; task < n_active * chunks_per_node; task += local_nth) {
+            const int active_index = task / chunks_per_node;
+            const int local_chunk = node * chunks_per_node + task % chunks_per_node;
+            const int cur_a = active_experts[active_index + 1];
+
+            const char *src0_1_cur, *src0_2_cur, *up_b_cur = NULL, *gate_b_cur = NULL;
+            if (src0_2) {
+                src0_1_cur = (const char *) src0_1->data + cur_a*nb02;
+                src0_2_cur = (const char *) src0_2->data + cur_a*nb02;
+                up_b_cur   = up_b   ? (const char *)up_b->data + cur_a*nb41 : NULL;
+                gate_b_cur = gate_b ? (const char *)gate_b->data + cur_a*nb51 : NULL;
+            } else {
+                src0_2_cur = (const char *) src0_1->data + cur_a*nb02;
+                src0_1_cur = src0_2_cur + nb02/2;
+                if (up_b) {
+                    GGML_ASSERT(!gate_b);
+                    gate_b_cur = (const char *)up_b->data + cur_a*nb41;
+                    up_b_cur   = gate_b_cur + nb41/2;
+                }
+            }
+
+            if (!iqk_moe_fused_up_gate(nr0_base, matrix_row_counts[cur_a], ne00, ne11, dst->op_params[0],
+                                type, src0_1_cur, src0_2_cur, nb01,
+                                vec_dot_type, (const char *)wdata_ug, row_size_ug,
+                                up_b_cur, gate_b_cur,
+                                (float *)dst->data, nb1, nb2,
+                                matrix_rows + cur_a*ne12, limit, local_chunk, chunks_per_expert_ug)) GGML_ABORT("fatal error");
+        }
+        return;
+    }
 
     int total_chunks_ug = 0;
     for (int a = 0; a < n_as; a++) {
@@ -28478,8 +28616,34 @@ static void set_numa_thread_affinity(int thread_n) {
 
     cpu_set_t * cpus = CPU_ALLOC(g_state.numa.total_cpus);
     CPU_ZERO_S(setsize, cpus);
-    for (size_t i = 0; i < node->n_cpus; ++i) {
-        CPU_SET_S(node->cpus[i], setsize, cpus);
+
+    if (g_state.numa.exact_pin && g_state.numa.numa_strategy == GGML_NUMA_STRATEGY_DISTRIBUTE) {
+        // Preserve the caller's cpuset (for example taskset -c 0-51) and pin
+        // each node-local worker to one distinct CPU from that set. The normal
+        // DISTRIBUTE path deliberately allows migration across an entire node.
+        const uint32_t local_thread = (uint32_t) thread_n / g_state.numa.n_nodes;
+        uint32_t allowed = 0;
+        for (size_t i = 0; i < node->n_cpus; ++i) {
+            if (CPU_ISSET(node->cpus[i], &g_state.numa.cpuset)) {
+                ++allowed;
+            }
+        }
+        if (allowed > 0) {
+            const uint32_t target = local_thread % allowed;
+            for (size_t i = 0, index = 0; i < node->n_cpus; ++i) {
+                if (!CPU_ISSET(node->cpus[i], &g_state.numa.cpuset)) continue;
+                if (index++ == target) {
+                    CPU_SET_S(node->cpus[i], setsize, cpus);
+                    break;
+                }
+            }
+        }
+    }
+
+    if (CPU_COUNT_S(setsize, cpus) == 0) {
+        for (size_t i = 0; i < node->n_cpus; ++i) {
+            CPU_SET_S(node->cpus[i], setsize, cpus);
+        }
     }
 
     rv = pthread_setaffinity_np(pthread_self(), setsize, cpus);
@@ -28848,6 +29012,7 @@ struct ggml_cplan ggml_graph_plan(const struct ggml_cgraph * cgraph, int n_threa
                     cur += GGML_PAD(cur, sizeof(int64_t));       // align
                     cur += n_as * sizeof(int64_t);               // matrix_row_counts
                     cur += n_as * src1->ne[2] * sizeof(int64_t); // matrix_rows
+                    cur += (n_as + 1) * sizeof(int32_t);         // active expert count + ids
                 } break;
             case GGML_OP_MOE_FUSED_UP_GATE:
                 {
@@ -28863,6 +29028,7 @@ struct ggml_cplan ggml_graph_plan(const struct ggml_cgraph * cgraph, int n_threa
                     cur += GGML_PAD(cur, sizeof(int64_t));       // align
                     cur += n_as * sizeof(int64_t);               // matrix_row_counts
                     cur += n_as * src2->ne[2] * sizeof(int64_t); // matrix_rows
+                    cur += (n_as + 1) * sizeof(int32_t);         // active expert count + ids
                 } break;
             case GGML_OP_FUSED_UP_GATE:
                 {

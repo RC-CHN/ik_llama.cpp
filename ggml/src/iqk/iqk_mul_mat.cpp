@@ -620,9 +620,10 @@ extern "C" IQK_API bool iqk_mul_mat(long Nx, long Ny, long ne00,
 
         auto num_rows = MulMat::num_rows(ggml_type(dequant_type));
         GGML_ASSERT(Nx%num_rows == 0);
-        auto nrc_x = (Nx/num_rows + nth - 1)/nth;
-        auto first_x = ith*nrc_x;
-        if (first_x + nrc_x > Nx/num_rows) nrc_x = Nx/num_rows - first_x;
+        const long nrow_groups = Nx/num_rows;
+        auto first_x = ith*nrow_groups/nth;
+        const auto last_x = (ith + 1)*nrow_groups/nth;
+        auto nrc_x = last_x - first_x;
         first_x *= num_rows;
         nrc_x   *= num_rows;
 
@@ -849,9 +850,10 @@ extern "C" IQK_API bool iqk_mul_mat_moe(long Nx, long Ny, long ne00, int ne11,
     size_t row_size_qy = strideB;
     auto num_rows = MulMat::num_rows(ggml_type(typeA));
     GGML_ASSERT(Nx%num_rows == 0);
-    auto nrc_x = (Nx/num_rows + nth - 1)/nth;
-    auto first_x = ith*nrc_x;
-    if (first_x + nrc_x > Nx/num_rows) nrc_x = Nx/num_rows - first_x;
+    const long nrow_groups = Nx/num_rows;
+    auto first_x = ith*nrow_groups/nth;
+    const auto last_x = (ith + 1)*nrow_groups/nth;
+    auto nrc_x = last_x - first_x;
     first_x *= num_rows;
     nrc_x *= num_rows;
     DataInfo info{C + first_x, (const char *)B, nb1/sizeof(float),
@@ -881,9 +883,10 @@ extern "C" IQK_API bool iqk_moe_fused_up_gate(long Nx, long Ny, long ne00, int n
 
             auto num_rows = MulMat::num_rows(ggml_type(dequant_type));
             GGML_ASSERT(Nx%num_rows == 0);
-            auto nrc_x = (Nx/num_rows + nth - 1)/nth;
-            auto first_x = ith*nrc_x;
-            if (first_x + nrc_x > Nx/num_rows) nrc_x = Nx/num_rows - first_x;
+            const long nrow_groups = Nx/num_rows;
+            auto first_x = ith*nrow_groups/nth;
+            const auto last_x = (ith + 1)*nrow_groups/nth;
+            auto nrc_x = last_x - first_x;
             first_x *= num_rows;
             nrc_x   *= num_rows;
 
@@ -923,9 +926,10 @@ extern "C" IQK_API bool iqk_moe_fused_up_gate(long Nx, long Ny, long ne00, int n
     }
     auto num_rows = MulMat::num_rows(ggml_type(typeA));
     GGML_ASSERT(Nx%num_rows == 0);
-    auto nrc_x = (Nx/num_rows + nth - 1)/nth;
-    auto first_x = ith*nrc_x;
-    if (first_x + nrc_x > Nx/num_rows) nrc_x = Nx/num_rows - first_x;
+    const long nrow_groups = Nx/num_rows;
+    auto first_x = ith*nrow_groups/nth;
+    const auto last_x = (ith + 1)*nrow_groups/nth;
+    auto nrc_x = last_x - first_x;
     first_x *= num_rows;
     nrc_x *= num_rows;
     DataInfo info{C + first_x, (const char *)B, nb1/sizeof(float),

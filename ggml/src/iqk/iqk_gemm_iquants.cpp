@@ -1793,8 +1793,7 @@ static void mul_mat_iq3_s_r4_q8_k(int n, const void * vx, size_t bx, const DataI
                 for (int i = 0; i < 4; ++i) {
                     auto idx_l = _mm_cvtepu8_epi16(_mm_loadl_epi64((const __m128i *)(qs + 8*i)));
                     hidx.vec = _mm_or_si128(idx_l, _mm_and_si128(idx_h, _mm_set1_epi16(0x100))); idx_h = _mm_srli_epi16(idx_h, 1);
-                    qx[i] = _mm256_set_epi32(iq3s_grid[hidx.val[7]], iq3s_grid[hidx.val[6]], iq3s_grid[hidx.val[5]], iq3s_grid[hidx.val[4]],
-                                             iq3s_grid[hidx.val[3]], iq3s_grid[hidx.val[2]], iq3s_grid[hidx.val[1]], iq3s_grid[hidx.val[0]]);
+                    qx[i] = _mm256_i32gather_epi32((const int *)iq3s_grid, _mm256_cvtepu16_epi32(hidx.vec), 4);
                 }
                 qs += 32; qh += 4;
                 auto signs128 = _mm_loadu_si128((const __m128i*)iq3[ibl].signs + ib);

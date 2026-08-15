@@ -93,6 +93,7 @@ void llama_set_mtp_n_heads(struct llama_context * ctx, int32_t mtp_n_heads);
 #include <cassert>
 #include <cctype>
 #include <cfloat>
+#include <cerrno>
 #include <cinttypes>
 #include <climits>
 #include <cmath>
@@ -120,6 +121,11 @@ void llama_set_mtp_n_heads(struct llama_context * ctx, int32_t mtp_n_heads);
 #include <unordered_map>
 #include <regex>
 #include <tuple>
+
+#if defined(__linux__)
+#include <linux/mempolicy.h>
+#include <sys/syscall.h>
+#endif
 
 #if defined(_MSC_VER)
 #pragma warning(disable: 4244 4267) // possible loss of data
@@ -174,6 +180,83 @@ static bool llama_env_flag_enabled(const char * name) {
             std::strcmp(env, "0") != 0 &&
             std::strcmp(env, "false") != 0 &&
             std::strcmp(env, "off") != 0;
+}
+
+static void llama_numa_row_shard_model(llama_model & model) {
+#if defined(__linux__) && defined(SYS_mbind)
+    if (!ggml_numa_row_shard_enabled()) {
+        return;
+    }
+
+    const uint32_t n_nodes = ggml_numa_node_count();
+    const long page_size_l = sysconf(_SC_PAGESIZE);
+    if (n_nodes < 2 || n_nodes > sizeof(unsigned long) * CHAR_BIT || page_size_l <= 0) {
+        LLAMA_LOG_WARN("%s: unsupported NUMA topology (%u nodes)\n", __func__, n_nodes);
+        return;
+    }
+
+    const uintptr_t page_size = (uintptr_t) page_size_l;
+    size_t bound_bytes = 0;
+    size_t bound_ranges = 0;
+    size_t failed_ranges = 0;
+    int first_error = 0;
+
+    for (const auto & item : model.tensors_by_name) {
+        ggml_tensor * tensor = item.second;
+        if (tensor == nullptr || tensor->view_src != nullptr || tensor->data == nullptr ||
+                !ggml_backend_buffer_is_host(tensor->buffer) || !ggml_is_contiguous(tensor) ||
+                tensor->ne[1] < (int64_t) n_nodes) {
+            continue;
+        }
+
+        for (int64_t i3 = 0; i3 < tensor->ne[3]; ++i3) {
+            for (int64_t i2 = 0; i2 < tensor->ne[2]; ++i2) {
+                char * plane = (char *) tensor->data + i3 * tensor->nb[3] + i2 * tensor->nb[2];
+                // A merged up/gate expert tensor stores [gate rows][up rows]
+                // inside every expert plane. Shard each half independently so
+                // a node gets matching gate and up output rows.
+                const bool paired_rows = tensor->ne[1] % 2 == 0 &&
+                        (std::strstr(tensor->name, "ffn_gate_up_exps") != nullptr ||
+                         std::strstr(tensor->name, "ffn_up_gate_exps") != nullptr);
+                const int n_row_segments = paired_rows ? 2 : 1;
+                const int64_t rows_per_segment = tensor->ne[1] / n_row_segments;
+
+                for (int segment = 0; segment < n_row_segments; ++segment) {
+                    const int64_t segment_row = segment * rows_per_segment;
+                    for (uint32_t node = 0; node < n_nodes; ++node) {
+                        const int64_t row_begin = segment_row + rows_per_segment * node / n_nodes;
+                        const int64_t row_end = segment_row + rows_per_segment * (node + 1) / n_nodes;
+                        const uintptr_t begin = (uintptr_t) plane + row_begin * tensor->nb[1];
+                        const uintptr_t end = (uintptr_t) plane + row_end * tensor->nb[1];
+                        const uintptr_t page_begin = (begin + page_size - 1) & ~(page_size - 1);
+                        const uintptr_t page_end = end & ~(page_size - 1);
+                        if (page_begin >= page_end) {
+                            continue;
+                        }
+
+                        unsigned long mask = 1UL << node;
+                        const long rc = syscall(SYS_mbind, (void *) page_begin, page_end - page_begin,
+                                MPOL_BIND | MPOL_F_STATIC_NODES, &mask,
+                                sizeof(mask) * CHAR_BIT, MPOL_MF_MOVE);
+                        if (rc == 0) {
+                            bound_bytes += page_end - page_begin;
+                            ++bound_ranges;
+                        } else {
+                            ++failed_ranges;
+                            if (first_error == 0) first_error = errno;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    LLAMA_LOG_INFO("%s: bound %.2f GiB in %zu row-shard ranges across %u NUMA nodes; %zu failures%s%s\n",
+            __func__, bound_bytes / 1024.0 / 1024.0 / 1024.0, bound_ranges, n_nodes, failed_ranges,
+            first_error ? ", first error: " : "", first_error ? std::strerror(first_error) : "");
+#else
+    (void) model;
+#endif
 }
 
 // extract ip and port from RPC[ip:port] for rpc and keep other device names
@@ -4920,6 +5003,10 @@ static bool llm_load_tensors(
             }
         }
         if (n_repacked > 0) LLAMA_LOG_INFO("============ Repacked %d tensors\n", n_repacked);
+    }
+
+    if (!dry_run && !ml.use_mmap && ggml_numa_row_shard_enabled()) {
+        llama_numa_row_shard_model(model);
     }
 
     if (model.arch == LLM_ARCH_BITNET) {
