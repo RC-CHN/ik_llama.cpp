@@ -19,6 +19,7 @@
 #include "ggml-impl.h"
 #include "ggml-quants.h"
 #include "iqk_mul_mat.h"
+#include "iqk_gemm_amx.h"
 #include "iqk_quantize.h"
 #include "iqk_flash_impl.h"
 #include "iqk_gemm_floats.h"
@@ -57,13 +58,51 @@ namespace {
 struct MulMat {
     std::array<mul_mat_t, IQK_MAX_NY> funcs = {};
     mul_mat_t func16 = nullptr;
+    mul_mat_t func32 = nullptr;
+    mul_mat_t func64 = nullptr;
+    mul_mat_t func128 = nullptr;
+    mul_mat_t func256 = nullptr;
+    mul_mat_t func512 = nullptr;
     inline void mul_mat_NxM(int n, const void * vx, size_t bx, DataInfo& info, int nrc_x, int nrc_y) {
 #ifdef __aarch64__
         constexpr int k_x_step = 64; //8192; // Tiling does not seem to help on my M2 Max (but difference to tiling is small)
 #else
         constexpr int k_x_step = 64; // This works best on my Ryzen-7950X (but differences to other tile size are small)
 #endif
-        if (func16 && nrc_y >= 16) {
+        const int block_sizes[] = {512, 256, 128, 64};
+        const mul_mat_t block_funcs[] = {func512, func256, func128, func64};
+        for (int ib = 0; ib < 4; ++ib) {
+            const int ny = block_sizes[ib];
+            const mul_mat_t func = block_funcs[ib];
+            if (!func || nrc_y - info.cur_y < ny) continue;
+            int n_step = (nrc_y - info.cur_y)/ny;
+            for (int ix = 0; ix < nrc_x; ix += k_x_step) {
+                auto this_info = info;
+                this_info.s += ix;
+                int this_nrc_x = ix + k_x_step <= nrc_x ? k_x_step : nrc_x - ix;
+                for (int iy = 0; iy < n_step; ++iy) {
+                    func(n, (const void *)((const char *)vx + ix*bx), bx, this_info, this_nrc_x);
+                    this_info.cur_y += ny;
+                }
+            }
+            info.cur_y += ny * n_step;
+            if (info.cur_y == nrc_y) return;
+        }
+        if (func32 && nrc_y - info.cur_y >= 32) {
+            int n_step = (nrc_y - info.cur_y)/32;
+            for (int ix = 0; ix < nrc_x; ix += k_x_step) {
+                auto this_info = info;
+                this_info.s += ix;
+                int this_nrc_x = ix + k_x_step <= nrc_x ? k_x_step : nrc_x - ix;
+                for (int iy = 0; iy < n_step; ++iy) {
+                    func32(n, (const void *)((const char *)vx + ix*bx), bx, this_info, this_nrc_x);
+                    this_info.cur_y += 32;
+                }
+            }
+            info.cur_y += 32 * n_step;
+            if (info.cur_y == nrc_y) return;
+        }
+        if (func16 && nrc_y - info.cur_y >= 16) {
             int n_step = (nrc_y - info.cur_y)/16;
             for (int ix = 0; ix < nrc_x; ix += k_x_step) {
                 auto this_info = info;
@@ -135,15 +174,19 @@ struct MulMat {
     }
     inline void mul_mat_up_gate_NxM(int n, const void * vx_up, const void * vx_gate, size_t bx,
             const float * up_b, const float * gate_b,
-            DataInfo& info, int nrc_x, int nrc_y, int unary_op, float limit) {
+            DataInfo& info, int nrc_x, int nrc_y, int unary_op, float limit,
+            const void * origin_up, const void * origin_gate, int origin_row, int origin_rows) {
 #ifdef __aarch64__
         constexpr int k_x_step = 64; //8192; // Tiling does not seem to help on my M2 Max (but difference to tiling is small)
 #else
         constexpr int k_x_step = 64; // This works best on my Ryzen-7950X (but differences to other tile size are small)
 #endif
         auto op = ggml_unary_op(unary_op);
-        float tmp[k_x_step*16];
-        auto process = [&tmp, n, op, vx_gate, vx_up, gate_b, up_b, bx, xstep = k_x_step, limit] (mul_mat_t func, const DataInfo& this_info, int ix, int this_nrc_x, int ny) {
+        float tmp[k_x_step*512];
+        auto process = [&tmp, n, op, vx_gate, vx_up, gate_b, up_b, bx, xstep = k_x_step, limit,
+                        origin_up, origin_gate, origin_row, origin_rows]
+                (mul_mat_t func, const DataInfo& this_info, int ix, int this_nrc_x, int ny) {
+            iqk_amx_set_weight_origin(origin_gate, origin_row + ix, origin_rows);
             func(n, (const void *)((const char *)vx_gate + ix*bx), bx, this_info, this_nrc_x);
             for (int ky = 0; ky < ny; ++ky) {
                 if (gate_b) {
@@ -156,6 +199,7 @@ struct MulMat {
                     for (int j = 0; j < this_nrc_x; ++j) tmp[ky*xstep + j] = std::min(tmp[ky*xstep + j], limit);
                 }
             }
+            iqk_amx_set_weight_origin(origin_up, origin_row + ix, origin_rows);
             func(n, (const void *)((const char *)vx_up + ix*bx), bx, this_info, this_nrc_x);
             for (int ky = 0; ky < ny; ++ky) {
                 auto result = this_info.dst_row(ky);
@@ -170,8 +214,42 @@ struct MulMat {
                 }
                 for (int j = 0; j < this_nrc_x; ++j) result[j] *= tmp[ky*xstep + j];
             }
+            iqk_amx_set_weight_origin(nullptr, 0, 0);
         };
-        if (func16 && nrc_y >= 16) {
+        const int block_sizes[] = {512, 256, 128, 64};
+        const mul_mat_t block_funcs[] = {func512, func256, func128, func64};
+        for (int ib = 0; ib < 4; ++ib) {
+            const int ny = block_sizes[ib];
+            const mul_mat_t func = block_funcs[ib];
+            if (!func || nrc_y - info.cur_y < ny) continue;
+            int n_step = (nrc_y - info.cur_y)/ny;
+            for (int ix = 0; ix < nrc_x; ix += k_x_step) {
+                auto this_info = info;
+                this_info.s += ix;
+                int this_nrc_x = ix + k_x_step <= nrc_x ? k_x_step : nrc_x - ix;
+                for (int iy = 0; iy < n_step; ++iy) {
+                    process(func, this_info, ix, this_nrc_x, ny);
+                    this_info.cur_y += ny;
+                }
+            }
+            info.cur_y += ny * n_step;
+            if (info.cur_y == nrc_y) return;
+        }
+        if (func32 && nrc_y - info.cur_y >= 32) {
+            int n_step = (nrc_y - info.cur_y)/32;
+            for (int ix = 0; ix < nrc_x; ix += k_x_step) {
+                auto this_info = info;
+                this_info.s += ix;
+                int this_nrc_x = ix + k_x_step <= nrc_x ? k_x_step : nrc_x - ix;
+                for (int iy = 0; iy < n_step; ++iy) {
+                    process(func32, this_info, ix, this_nrc_x, 32);
+                    this_info.cur_y += 32;
+                }
+            }
+            info.cur_y += 32 * n_step;
+            if (info.cur_y == nrc_y) return;
+        }
+        if (func16 && nrc_y - info.cur_y >= 16) {
             int n_step = (nrc_y - info.cur_y)/16;
             for (int ix = 0; ix < nrc_x; ix += k_x_step) {
                 auto this_info = info;
@@ -563,7 +641,9 @@ extern "C" IQK_API bool iqk_mul_mat(long Nx, long Ny, long ne00,
             if (!iqk_convert_repack(typeA, ne00, (const char *)A + (first_x + ix)*strideA, strideA, f.data(), ne00, this_nrc_x)) {
                 GGML_ABORT("Fatal error");
             }
+            iqk_amx_set_transient_weights(true);
             mm.mul_mat_NxM(ne00, f.data(), row_size_qx, this_info, this_nrc_x, Ny);
+            iqk_amx_set_transient_weights(false);
         }
 
         return true;
@@ -829,7 +909,8 @@ extern "C" IQK_API bool iqk_moe_fused_up_gate(long Nx, long Ny, long ne00, int n
                 }
                 auto up_b   = up_b_c   ? (const float *)up_b_c + first_x + ix : nullptr;
                 auto gate_b = gate_b_c ? (const float *)gate_b_c + first_x + ix : nullptr;
-                mm.mul_mat_up_gate_NxM(ne00, Xu, Xg, row_size_qx, up_b, gate_b, this_info, this_nrc_x, Ny, unary_op, limit);
+                mm.mul_mat_up_gate_NxM(ne00, Xu, Xg, row_size_qx, up_b, gate_b, this_info,
+                    this_nrc_x, Ny, unary_op, limit, nullptr, nullptr, 0, 0);
             }
 
             return true;
@@ -852,7 +933,7 @@ extern "C" IQK_API bool iqk_moe_fused_up_gate(long Nx, long Ny, long ne00, int n
     auto up_b   = up_b_c   ? (const float *)up_b_c + first_x : nullptr;
     auto gate_b = gate_b_c ? (const float *)gate_b_c + first_x : nullptr;
     mm.mul_mat_up_gate_NxM(ne00, (const char *)Aup + row_size_qx*first_x, (const char *)Agate + row_size_qx*first_x, row_size_qx,
-            up_b, gate_b, info, nrc_x, Ny, unary_op, limit);
+            up_b, gate_b, info, nrc_x, Ny, unary_op, limit, Aup, Agate, first_x, Nx);
     return true;
 }
 
@@ -886,7 +967,8 @@ bool MulMat::prepare(int typeA, int typeB, int ne00, MulMat& mm, int Ny) {
         case GGML_TYPE_Q8_KV:
         case GGML_TYPE_Q8_KV_R8:
         case GGML_TYPE_Q8_K_R16:
-            return iqk_set_kernels_kquants(ne00, typeA, typeB, mm.funcs, mm.func16);
+            return iqk_set_kernels_kquants(ne00, typeA, typeB, mm.funcs,
+                    mm.func16, mm.func32, mm.func64, mm.func128, mm.func256, mm.func512);
         case GGML_TYPE_IQ2_XXS:
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ2_S:
@@ -897,7 +979,7 @@ bool MulMat::prepare(int typeA, int typeB, int ne00, MulMat& mm, int Ny) {
         case GGML_TYPE_IQ2_S_R4:
         case GGML_TYPE_IQ3_XXS_R4:
         case GGML_TYPE_IQ3_S_R4:
-            return iqk_set_kernels_iquants(ne00, typeA, typeB, mm.funcs, mm.func16);
+            return iqk_set_kernels_iquants(ne00, typeA, typeB, mm.funcs, mm.func16, mm.func32);
         case GGML_TYPE_IQ2_KS:
         case GGML_TYPE_IQ2_K:
         case GGML_TYPE_IQ2_KL:
@@ -936,7 +1018,7 @@ bool MulMat::prepare(int typeA, int typeB, int ne00, MulMat& mm, int Ny) {
         case GGML_TYPE_IQ4_NL_R4:
         case GGML_TYPE_MXFP4:
         case GGML_TYPE_MXFP4_R8:
-            return iqk_set_kernels_legacy_quants(ne00, typeA, typeB, mm.funcs, mm.func16);
+            return iqk_set_kernels_legacy_quants(ne00, typeA, typeB, mm.funcs, mm.func16, mm.func32);
         case GGML_TYPE_IQ1_S:
         case GGML_TYPE_IQ1_M:
         case GGML_TYPE_IQ1_S_R4:
@@ -984,7 +1066,8 @@ bool MulMat::prepare(int typeA, int typeB, int ne00, MulMat& m, int /*Ny*/) {
         case GGML_TYPE_Q8_KV:
         case GGML_TYPE_Q8_KV_R8:
         case GGML_TYPE_Q8_K_R16:
-            return iqk_set_kernels_kquants(ne00, typeA, typeB, m.funcs, m.func16);
+            return iqk_set_kernels_kquants(ne00, typeA, typeB, m.funcs,
+                    m.func16, m.func32, m.func64, m.func128, m.func256, m.func512);
         case GGML_TYPE_IQ2_KS:
         case GGML_TYPE_IQ2_K:
         case GGML_TYPE_IQ2_KL:
@@ -1013,7 +1096,7 @@ bool MulMat::prepare(int typeA, int typeB, int ne00, MulMat& m, int /*Ny*/) {
         case GGML_TYPE_IQ2_S_R4:
         case GGML_TYPE_IQ3_XXS_R4:
         case GGML_TYPE_IQ3_S_R4:
-            return iqk_set_kernels_iquants(ne00, typeA, typeB, m.funcs, m.func16);
+            return iqk_set_kernels_iquants(ne00, typeA, typeB, m.funcs, m.func16, m.func32);
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
         case GGML_TYPE_Q5_0:
@@ -1028,7 +1111,7 @@ bool MulMat::prepare(int typeA, int typeB, int ne00, MulMat& m, int /*Ny*/) {
         case GGML_TYPE_Q8_1:
         case GGML_TYPE_IQ4_NL_R4:
         case GGML_TYPE_MXFP4:
-            return iqk_set_kernels_legacy_quants(ne00, typeA, typeB, m.funcs, m.func16);
+            return iqk_set_kernels_legacy_quants(ne00, typeA, typeB, m.funcs, m.func16, m.func32);
         case GGML_TYPE_IQ1_BN:
         case GGML_TYPE_IQ2_BN:
         case GGML_TYPE_IQ2_BN_R4:

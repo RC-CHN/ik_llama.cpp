@@ -119,6 +119,22 @@ function(llama_build_and_test source)
     set_property(TEST ${TEST_TARGET} PROPERTY LABELS ${LLAMA_TEST_LABEL})
 endfunction()
 
+if (GGML_AMX_BF16)
+    add_executable(test-amx-bf16 test-amx-bf16.cpp)
+    target_include_directories(test-amx-bf16 PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src/iqk)
+    target_link_libraries(test-amx-bf16 PRIVATE ggml)
+    llama_test(test-amx-bf16 LABEL "cpu")
+endif()
+
+if (GGML_AMX_INT8)
+    add_executable(test-amx-int8 test-amx-int8.cpp)
+    target_include_directories(test-amx-int8 PRIVATE
+        ${PROJECT_SOURCE_DIR}/ggml/src
+        ${PROJECT_SOURCE_DIR}/ggml/src/iqk)
+    target_link_libraries(test-amx-int8 PRIVATE ggml)
+    llama_test(test-amx-int8 LABEL "cpu")
+endif()
+
 # build test-tokenizer-0 target once and add many tests
 add_executable(test-tokenizer-0 test-tokenizer-0.cpp)
 target_link_libraries(test-tokenizer-0 PRIVATE common)
@@ -212,5 +228,3 @@ llama_target_and_test(test-autorelease.cpp        LABEL "model")
 get_filename_component(TEST_TARGET test-c.c NAME_WE)
 add_executable(${TEST_TARGET} test-c.c)
 target_link_libraries(${TEST_TARGET} PRIVATE llama)
-
-

@@ -1,4 +1,5 @@
 #include "iqk_gemm_iquants.h"
+#include "iqk_gemm_amx.h"
 
 #ifdef IQK_IMPLEMENT
 
@@ -1860,6 +1861,22 @@ static void mul_mat_iq3_s_r4_q8_k(int n, const void * vx, size_t bx, const DataI
     }
 }
 
+template <int nrc_y>
+static void mul_mat_iq3_s_r4_q8_k_dispatch(
+        int n, const void * vx, size_t bx, const DataInfo& info, int nrc_x) {
+    if (!iqk_amx_mul_mat_iq3_s_r4(n, vx, bx, info, nrc_x, nrc_y)) {
+        if constexpr (nrc_y <= 16) {
+            mul_mat_iq3_s_r4_q8_k<nrc_y>(n, vx, bx, info, nrc_x);
+        } else {
+            for (int iy = 0; iy < nrc_y; iy += 16) {
+                auto this_info = info;
+                this_info.cur_y += iy;
+                mul_mat_iq3_s_r4_q8_k<16>(n, vx, bx, this_info, nrc_x);
+            }
+        }
+    }
+}
+
 void iqk_convert_iq2_xxs_q8_0_r8(int n, const void * vx, size_t bx, void * vy, int nrc_x) {
     GGML_ASSERT(n%QK_K == 0);
     GGML_ASSERT(nrc_x%8 == 0);
@@ -2693,7 +2710,8 @@ template <typename Dequantizer> void set_functions(std::array<mul_mat_t, IQK_MAX
 
 } // namespace
 
-bool iqk_set_kernels_iquants(int ne00, int typeA, int typeB, std::array<mul_mat_t, IQK_MAX_NY>& kernels, mul_mat_t& func16) {
+bool iqk_set_kernels_iquants(int ne00, int typeA, int typeB,
+        std::array<mul_mat_t, IQK_MAX_NY>& kernels, mul_mat_t& func16, mul_mat_t& func32) {
 
     if (ne00%QK_K != 0) return false;
 
@@ -2755,6 +2773,7 @@ bool iqk_set_kernels_iquants(int ne00, int typeA, int typeB, std::array<mul_mat_
     }
 
     func16 = nullptr;
+    func32 = nullptr;
 
     switch (typeA) {
         case GGML_TYPE_IQ2_XXS:
@@ -2793,8 +2812,9 @@ bool iqk_set_kernels_iquants(int ne00, int typeA, int typeB, std::array<mul_mat_
             func16 = mul_mat_iq3_xxs_r4_q8_k<16>;
             break;
         case GGML_TYPE_IQ3_S_R4:
-            IQK_SET_MUL_MAT_FUNCTIONS(mul_mat_iq3_s_r4_q8_k, kernels);
-            func16 = mul_mat_iq3_s_r4_q8_k<16>;
+            IQK_SET_MUL_MAT_FUNCTIONS(mul_mat_iq3_s_r4_q8_k_dispatch, kernels);
+            func16 = mul_mat_iq3_s_r4_q8_k_dispatch<16>;
+            func32 = mul_mat_iq3_s_r4_q8_k_dispatch<32>;
             break;
         default:
             return false;
@@ -3705,13 +3725,15 @@ bool iqk_convert_iquants_q80_r8([[maybe_unused]] int type, int n, [[maybe_unused
     return true;
 }
 
-bool iqk_set_kernels_iquants(int ne00, int typeA, int typeB, std::array<mul_mat_t, IQK_MAX_NY>& kernels, mul_mat_t& func16) {
+bool iqk_set_kernels_iquants(int ne00, int typeA, int typeB,
+        std::array<mul_mat_t, IQK_MAX_NY>& kernels, mul_mat_t& func16, mul_mat_t& func32) {
 
     if (ne00%QK_K != 0 || ggml_type(typeB) != GGML_TYPE_Q8_K) {
         return false;
     }
 
     func16 = nullptr;
+    func32 = nullptr;
 
     switch (typeA) {
         case GGML_TYPE_IQ2_XXS:

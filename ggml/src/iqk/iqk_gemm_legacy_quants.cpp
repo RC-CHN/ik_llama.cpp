@@ -1,4 +1,5 @@
 #include "iqk_gemm_legacy_quants.h"
+#include "iqk_gemm_amx.h"
 
 #include <type_traits>
 
@@ -2000,6 +2001,22 @@ static void mul_mat_q8_0_r8_q8_2(int n, const void * vx, size_t bx, const DataIn
 }
 #endif
 
+template <int nrc_y>
+static void mul_mat_q8_0_r8_q8_2_dispatch(
+        int n, const void * vx, size_t bx, const DataInfo& info, int nrc_x) {
+    if (!iqk_amx_mul_mat_q8_0_r8(n, vx, bx, info, nrc_x, nrc_y)) {
+        if constexpr (nrc_y <= 8) {
+            mul_mat_q8_0_r8_q8_2<nrc_y>(n, vx, bx, info, nrc_x);
+        } else {
+            for (int iy = 0; iy < nrc_y; iy += 8) {
+                auto this_info = info;
+                this_info.cur_y += iy;
+                mul_mat_q8_0_r8_q8_2<8>(n, vx, bx, this_info, nrc_x);
+            }
+        }
+    }
+}
+
 typedef struct {
     ggml_half d[16];
     uint8_t   qs[256];
@@ -2311,6 +2328,32 @@ template <typename Dequantizer> void set_functions(std::array<mul_mat_t, IQK_MAX
 
 } // namespace
 
+#if defined(GGML_AMX_INT8) && defined(__AMX_TILE__) && defined(__AMX_INT8__)
+template <int nrc_y>
+void mul_mat_iq4_nl_r4_q8_2_amx(int n, const void * vx, size_t bx, const DataInfo& info, int nrc_x) {
+    if (!iqk_amx_mul_mat_iq4_nl_r4(n, vx, bx, info, nrc_x, nrc_y)) {
+        if constexpr (nrc_y == 32) {
+            mul_mat_iq4_nl_r4_q8_2<16>(n, vx, bx, info, nrc_x);
+            auto info1 = info;
+            info1.cur_y += 16;
+            mul_mat_iq4_nl_r4_q8_2<16>(n, vx, bx, info1, nrc_x);
+        } else {
+            mul_mat_iq4_nl_r4_q8_2<nrc_y>(n, vx, bx, info, nrc_x);
+        }
+    }
+}
+
+static void set_iq4_nl_r4_amx_functions(std::array<mul_mat_t, IQK_MAX_NY>& kernels, mul_mat_t& func16, mul_mat_t& func32) {
+    kernels[3] = mul_mat_iq4_nl_r4_q8_2_amx<4>;
+    kernels[4] = mul_mat_iq4_nl_r4_q8_2_amx<5>;
+    kernels[5] = mul_mat_iq4_nl_r4_q8_2_amx<6>;
+    kernels[6] = mul_mat_iq4_nl_r4_q8_2_amx<7>;
+    kernels[7] = mul_mat_iq4_nl_r4_q8_2_amx<8>;
+    func16 = mul_mat_iq4_nl_r4_q8_2_amx<16>;
+    func32 = mul_mat_iq4_nl_r4_q8_2_amx<32>;
+}
+#endif
+
 bool iqk_convert_legacy_quants_q8_r8(int type, int n, const void * vx, size_t bx, void * vy, int nrc_x) {
     switch (type) {
         case GGML_TYPE_Q4_0  : iqk_convert_qX_q80_r8<block_q4_0, Q4_0_Dequantizer>(n, vx, bx, vy, nrc_x); break;
@@ -2326,13 +2369,14 @@ bool iqk_convert_legacy_quants_q8_r8(int type, int n, const void * vx, size_t bx
     return true;
 }
 
-bool iqk_set_kernels_legacy_quants(int ne00, int typeA, int typeB, std::array<mul_mat_t, IQK_MAX_NY>& kernels, mul_mat_t& func16) {
+bool iqk_set_kernels_legacy_quants(int ne00, int typeA, int typeB, std::array<mul_mat_t, IQK_MAX_NY>& kernels, mul_mat_t& func16, mul_mat_t& func32) {
 
     if (ne00%QK8_0 != 0) return false;
 
     auto expected_typeB = GGML_TYPE_Q8_2_X4;
 
     func16 = nullptr;
+    func32 = nullptr;
 
     switch (typeA) {
         case GGML_TYPE_Q4_0:
@@ -2386,10 +2430,17 @@ bool iqk_set_kernels_legacy_quants(int ne00, int typeA, int typeB, std::array<mu
             IQK_SET_MUL_MAT_FUNCTIONS(mul_mat_q6_0_r4_q8_2, kernels)
             break;
         case GGML_TYPE_Q8_0_R8:
-            IQK_SET_MUL_MAT_FUNCTIONS(mul_mat_q8_0_r8_q8_2, kernels)
+            IQK_SET_MUL_MAT_FUNCTIONS(mul_mat_q8_0_r8_q8_2_dispatch, kernels)
+            func16 = mul_mat_q8_0_r8_q8_2_dispatch<16>;
+            func32 = mul_mat_q8_0_r8_q8_2_dispatch<32>;
             break;
         case GGML_TYPE_IQ4_NL_R4:
             IQK_SET_MUL_MAT_FUNCTIONS(mul_mat_iq4_nl_r4_q8_2, kernels)
+#if defined(GGML_AMX_INT8) && defined(__AMX_TILE__) && defined(__AMX_INT8__)
+            if (iqk_amx_int8_runtime_available()) {
+                set_iq4_nl_r4_amx_functions(kernels, func16, func32);
+            }
+#endif
             break;
         case GGML_TYPE_Q8_1: // Note: we are misusing the Q8_1 type for Q8_1_R8
             IQK_SET_MUL_MAT_FUNCTIONS(mul_mat_q8_1_r8_q8_2, kernels)
@@ -3562,7 +3613,7 @@ bool iqk_convert_legacy_quants_q8_r8(int type, int n, const void * vx, size_t bx
     return true;
 }
 
-bool iqk_set_kernels_legacy_quants(int ne00, int typeA, int typeB, std::array<mul_mat_t, IQK_MAX_NY>& kernels, mul_mat_t& func16) {
+bool iqk_set_kernels_legacy_quants(int ne00, int typeA, int typeB, std::array<mul_mat_t, IQK_MAX_NY>& kernels, mul_mat_t& func16, mul_mat_t& func32) {
 
     if (ne00%QK8_0 != 0) return false;
 
@@ -3571,6 +3622,7 @@ bool iqk_set_kernels_legacy_quants(int ne00, int typeA, int typeB, std::array<mu
     if (ggml_type(typeB) != expected_typeB) return false;
 
     func16 = nullptr;
+    func32 = nullptr;
 
     switch (typeA) {
         case GGML_TYPE_Q4_0:

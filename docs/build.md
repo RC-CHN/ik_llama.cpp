@@ -249,6 +249,44 @@ objdump -d build/bin/llama-cli | grep -c vpdpbusd
 You can also check the runtime banner: a successful AVX-512 build prints
 `HAVE_FANCY_SIMD is defined` and `system_info: AVX512_VNNI = 1 ...`.
 
+### Experimental Intel AMX GEMM
+
+Linux x86-64 builds can enable the experimental BF16 and INT8 matrix-matrix
+kernels on Sapphire Rapids and newer Intel CPUs:
+
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Release \
+    -DGGML_NATIVE=ON \
+    -DGGML_AMX_BF16=ON \
+    -DGGML_AMX_INT8=ON
+cmake --build build --config Release -j"$(nproc)"
+```
+
+The BF16 kernel handles `BF16 x BF16 -> F32` GEMM. The INT8 IQK kernels handle
+the prompt-processing shapes for `Q4_K_R4`, `Q5_K_R4`, `Q6_K_R4`, `IQ3_S_R4`,
+`IQ4_NL_R4`, and `Q8_0_R8` weights with quantized activations. Unsupported or
+small shapes automatically use the existing AVX-512/AVX2 kernels. Original
+`Q*_K` GGUF tensors need `-rtr 1` so that the runtime-repacked `R4` path is
+available.
+
+At runtime the backend checks the AMX CPUID bits and requests Linux XTILEDATA
+permission separately for each worker thread. Set `GGML_AMX_DISABLE=1` to force
+all AMX kernels to fall back without rebuilding. `GGML_AMX_STATS=1` prints
+per-quant call/tile counts and persistent prepack memory at shutdown.
+
+The Q4_K cache is compact by default. A bounded hybrid cache can retain some
+fully expanded weights with `GGML_AMX_Q4_K_EXPANDED_BUDGET_MB=<MiB>`; setting
+`GGML_AMX_Q4_K_EXPANDED=1` expands all eligible Q4_K weights and consumes much
+more memory. With tests enabled, the focused correctness tests are:
+
+```bash
+cmake -B build -DLLAMA_BUILD_TESTS=ON \
+    -DGGML_AMX_BF16=ON -DGGML_AMX_INT8=ON
+cmake --build build --target test-amx-bf16 test-amx-int8
+ctest --test-dir build -R 'test-amx-(bf16|int8)' --output-on-failure
+```
+
+
 ### Fallback: explicit `GGML_ARCH_FLAGS`
 
 If the recommended options above do not produce `HAVE_FANCY_SIMD is defined`

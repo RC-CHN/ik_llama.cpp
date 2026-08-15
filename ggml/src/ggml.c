@@ -32208,6 +32208,22 @@ int ggml_cpu_has_avx512_bf16(void) {
 #endif
 }
 
+int ggml_cpu_has_amx_bf16(void) {
+#if defined(GGML_AMX_BF16) && defined(__AMX_TILE__) && defined(__AMX_BF16__)
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+int ggml_cpu_has_amx_int8(void) {
+#if defined(GGML_AMX_INT8) && defined(__AMX_TILE__) && defined(__AMX_INT8__)
+    return 1;
+#else
+    return 0;
+#endif
+}
+
 int ggml_cpu_has_fma(void) {
 #if defined(__FMA__)
     return 1;

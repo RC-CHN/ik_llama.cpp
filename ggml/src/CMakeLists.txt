@@ -192,6 +192,7 @@ if (GGML_IQK_MUL_MAT)
                             iqk/fa/iqk_fa_96_96.cpp
                             iqk/fa/iqk_fa_64_64.cpp
                             iqk/iqk_gemm_floats.cpp
+                            iqk/iqk_gemm_amx.cpp
                             iqk/iqk_gemm_kquants.cpp
                             iqk/iqk_gemm_ktquants.cpp
                             iqk/iqk_gemm_iquants.cpp
@@ -202,6 +203,7 @@ if (GGML_IQK_MUL_MAT)
                             iqk/iqk_flash_impl.h
                             iqk/fa/iqk_fa_templates.h
                             iqk/iqk_gemm_floats.h
+                            iqk/iqk_gemm_amx.h
                             iqk/iqk_gemm_kquants.h
                             iqk/iqk_gemm_ktquants.h
                             iqk/iqk_gemm_iquants.h
@@ -1188,6 +1190,30 @@ elseif (CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64" OR CMAKE_GENERATOR_PLATFORM_LW
         endif()
         if (GGML_AVX512_BF16)
             list(APPEND ARCH_FLAGS -mavx512bf16)
+        endif()
+        if (GGML_AMX_BF16)
+            if (NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+                message(FATAL_ERROR "GGML_AMX_BF16 currently supports Linux x86-64 only")
+            endif()
+            check_cxx_compiler_flag(-mamx-tile COMPILER_SUPPORTS_AMX_TILE)
+            check_cxx_compiler_flag(-mamx-bf16 COMPILER_SUPPORTS_AMX_BF16)
+            if (NOT COMPILER_SUPPORTS_AMX_TILE OR NOT COMPILER_SUPPORTS_AMX_BF16)
+                message(FATAL_ERROR "GGML_AMX_BF16 requires compiler support for -mamx-tile and -mamx-bf16")
+            endif()
+            add_compile_definitions(GGML_AMX_BF16)
+            list(APPEND ARCH_FLAGS -mamx-tile -mamx-bf16)
+        endif()
+        if (GGML_AMX_INT8)
+            if (NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+                message(FATAL_ERROR "GGML_AMX_INT8 currently supports Linux x86-64 only")
+            endif()
+            check_cxx_compiler_flag(-mamx-tile COMPILER_SUPPORTS_AMX_TILE)
+            check_cxx_compiler_flag(-mamx-int8 COMPILER_SUPPORTS_AMX_INT8)
+            if (NOT COMPILER_SUPPORTS_AMX_TILE OR NOT COMPILER_SUPPORTS_AMX_INT8)
+                message(FATAL_ERROR "GGML_AMX_INT8 requires compiler support for -mamx-tile and -mamx-int8")
+            endif()
+            add_compile_definitions(GGML_AMX_INT8)
+            list(APPEND ARCH_FLAGS -mamx-tile -mamx-int8)
         endif()
     endif()
 elseif (${CMAKE_SYSTEM_PROCESSOR} MATCHES "ppc64")

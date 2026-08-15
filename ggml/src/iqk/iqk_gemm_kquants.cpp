@@ -1,4 +1,6 @@
 #include "iqk_gemm_kquants.h"
+#include "iqk_gemm_amx.h"
+#include <cstdlib>
 #include <cstring>
 
 #ifdef IQK_IMPLEMENT
@@ -2668,10 +2670,140 @@ void iqk_convert_iq4_xs_q8_k_r8(int n, const void * vx, size_t bx, void * vy, in
     }
 }
 
+#if defined(GGML_AMX_INT8) && defined(__AMX_TILE__) && defined(__AMX_INT8__)
+static int q4_amx_max_nrc_y() {
+    const char * value = std::getenv("GGML_AMX_Q4_K_MAX_NY");
+    if (!value || !value[0]) return 512;
+    const int requested = std::atoi(value);
+    if (requested >= 512) return 512;
+    if (requested >= 256) return 256;
+    if (requested >= 128) return 128;
+    return 64;
+}
+
+static int q6_amx_max_nrc_y() {
+    const char * value = std::getenv("GGML_AMX_Q6_K_MAX_NY");
+    if (!value || !value[0]) return 512;
+    const int requested = std::atoi(value);
+    if (requested >= 512) return 512;
+    if (requested >= 256) return 256;
+    if (requested >= 128) return 128;
+    return 64;
+}
+
+static int q5_amx_max_nrc_y() {
+    const char * value = std::getenv("GGML_AMX_Q5_K_MAX_NY");
+    if (!value || !value[0]) return 512;
+    const int requested = std::atoi(value);
+    if (requested >= 512) return 512;
+    if (requested >= 256) return 256;
+    if (requested >= 128) return 128;
+    return 64;
+}
+
+template <int nrc_y>
+void mul_mat_q4_k_r4_q8_k_amx(int n, const void * vx, size_t bx, const DataInfo& info, int nrc_x) {
+    if (!iqk_amx_mul_mat_q4_k_r4(n, vx, bx, info, nrc_x, nrc_y)) {
+        if constexpr (nrc_y >= 32) {
+            auto fallback_info = info;
+            for (int iy = 0; iy < nrc_y; iy += 16) {
+                mul_mat_q4_k_r4_q8_k<16>(n, vx, bx, fallback_info, nrc_x);
+                fallback_info.cur_y += 16;
+            }
+        } else {
+            mul_mat_q4_k_r4_q8_k<nrc_y>(n, vx, bx, info, nrc_x);
+        }
+    }
+}
+
+template <int nrc_y>
+void mul_mat_q6_k_r4_q8_k_amx(int n, const void * vx, size_t bx, const DataInfo& info, int nrc_x) {
+    if (!iqk_amx_mul_mat_q6_k_r4(n, vx, bx, info, nrc_x, nrc_y)) {
+        if constexpr (nrc_y >= 32) {
+            auto fallback_info = info;
+            for (int iy = 0; iy < nrc_y; iy += 16) {
+                mul_mat_q6_k_r4_q8_k<16>(n, vx, bx, fallback_info, nrc_x);
+                fallback_info.cur_y += 16;
+            }
+        } else {
+            mul_mat_q6_k_r4_q8_k<nrc_y>(n, vx, bx, info, nrc_x);
+        }
+    }
+}
+
+template <int nrc_y>
+void mul_mat_q5_k_r4_q8_k_amx(int n, const void * vx, size_t bx, const DataInfo& info, int nrc_x) {
+    if (!iqk_amx_mul_mat_q5_k_r4(n, vx, bx, info, nrc_x, nrc_y)) {
+        if constexpr (nrc_y >= 32) {
+            auto fallback_info = info;
+            for (int iy = 0; iy < nrc_y; iy += 16) {
+                mul_mat_q5_k_r4_q8_k<16>(n, vx, bx, fallback_info, nrc_x);
+                fallback_info.cur_y += 16;
+            }
+        } else {
+            mul_mat_q5_k_r4_q8_k<nrc_y>(n, vx, bx, info, nrc_x);
+        }
+    }
+}
+
+static void set_q4_k_r4_amx_functions(std::array<mul_mat_t, IQK_MAX_NY>& kernels,
+        mul_mat_t& func16, mul_mat_t& func32, mul_mat_t& func64,
+        mul_mat_t& func128, mul_mat_t& func256, mul_mat_t& func512) {
+    kernels[3] = mul_mat_q4_k_r4_q8_k_amx<4>;
+    kernels[4] = mul_mat_q4_k_r4_q8_k_amx<5>;
+    kernels[5] = mul_mat_q4_k_r4_q8_k_amx<6>;
+    kernels[6] = mul_mat_q4_k_r4_q8_k_amx<7>;
+    kernels[7] = mul_mat_q4_k_r4_q8_k_amx<8>;
+    func16 = mul_mat_q4_k_r4_q8_k_amx<16>;
+    func32 = mul_mat_q4_k_r4_q8_k_amx<32>;
+    func64 = mul_mat_q4_k_r4_q8_k_amx<64>;
+    const int max_nrc_y = q4_amx_max_nrc_y();
+    func128 = max_nrc_y >= 128 ? mul_mat_q4_k_r4_q8_k_amx<128> : nullptr;
+    func256 = max_nrc_y >= 256 ? mul_mat_q4_k_r4_q8_k_amx<256> : nullptr;
+    func512 = max_nrc_y >= 512 ? mul_mat_q4_k_r4_q8_k_amx<512> : nullptr;
+}
+
+static void set_q6_k_r4_amx_functions(std::array<mul_mat_t, IQK_MAX_NY>& kernels,
+        mul_mat_t& func16, mul_mat_t& func32, mul_mat_t& func64,
+        mul_mat_t& func128, mul_mat_t& func256, mul_mat_t& func512) {
+    kernels[3] = mul_mat_q6_k_r4_q8_k_amx<4>;
+    kernels[4] = mul_mat_q6_k_r4_q8_k_amx<5>;
+    kernels[5] = mul_mat_q6_k_r4_q8_k_amx<6>;
+    kernels[6] = mul_mat_q6_k_r4_q8_k_amx<7>;
+    kernels[7] = mul_mat_q6_k_r4_q8_k_amx<8>;
+    func16 = mul_mat_q6_k_r4_q8_k_amx<16>;
+    func32 = mul_mat_q6_k_r4_q8_k_amx<32>;
+    func64 = mul_mat_q6_k_r4_q8_k_amx<64>;
+    const int max_nrc_y = q6_amx_max_nrc_y();
+    func128 = max_nrc_y >= 128 ? mul_mat_q6_k_r4_q8_k_amx<128> : nullptr;
+    func256 = max_nrc_y >= 256 ? mul_mat_q6_k_r4_q8_k_amx<256> : nullptr;
+    func512 = max_nrc_y >= 512 ? mul_mat_q6_k_r4_q8_k_amx<512> : nullptr;
+}
+
+static void set_q5_k_r4_amx_functions(std::array<mul_mat_t, IQK_MAX_NY>& kernels,
+        mul_mat_t& func16, mul_mat_t& func32, mul_mat_t& func64,
+        mul_mat_t& func128, mul_mat_t& func256, mul_mat_t& func512) {
+    kernels[3] = mul_mat_q5_k_r4_q8_k_amx<4>;
+    kernels[4] = mul_mat_q5_k_r4_q8_k_amx<5>;
+    kernels[5] = mul_mat_q5_k_r4_q8_k_amx<6>;
+    kernels[6] = mul_mat_q5_k_r4_q8_k_amx<7>;
+    kernels[7] = mul_mat_q5_k_r4_q8_k_amx<8>;
+    func16 = mul_mat_q5_k_r4_q8_k_amx<16>;
+    func32 = mul_mat_q5_k_r4_q8_k_amx<32>;
+    func64 = mul_mat_q5_k_r4_q8_k_amx<64>;
+    const int max_nrc_y = q5_amx_max_nrc_y();
+    func128 = max_nrc_y >= 128 ? mul_mat_q5_k_r4_q8_k_amx<128> : nullptr;
+    func256 = max_nrc_y >= 256 ? mul_mat_q5_k_r4_q8_k_amx<256> : nullptr;
+    func512 = max_nrc_y >= 512 ? mul_mat_q5_k_r4_q8_k_amx<512> : nullptr;
+}
+#endif
+
 
 } // namespace
 
-bool iqk_set_kernels_kquants(int ne00, int typeA, int typeB, std::array<mul_mat_t, IQK_MAX_NY>& kernels, mul_mat_t& func16) {
+bool iqk_set_kernels_kquants(int ne00, int typeA, int typeB, std::array<mul_mat_t, IQK_MAX_NY>& kernels,
+        mul_mat_t& func16, mul_mat_t& func32, mul_mat_t& func64,
+        mul_mat_t& func128, mul_mat_t& func256, mul_mat_t& func512) {
 
     auto etypeA = ggml_type(typeA);
     auto expected_type_B = etypeA == GGML_TYPE_IQ4_XS_R8 || etypeA == GGML_TYPE_Q4_K_R4 || etypeA == GGML_TYPE_Q5_K_R4 ? GGML_TYPE_Q8_K32
@@ -2688,6 +2820,11 @@ bool iqk_set_kernels_kquants(int ne00, int typeA, int typeB, std::array<mul_mat_
     }
 
     func16 = nullptr;
+    func32 = nullptr;
+    func64 = nullptr;
+    func128 = nullptr;
+    func256 = nullptr;
+    func512 = nullptr;
 
     switch (typeA) {
         case GGML_TYPE_Q2_K:
@@ -2720,12 +2857,27 @@ bool iqk_set_kernels_kquants(int ne00, int typeA, int typeB, std::array<mul_mat_
             break;
         case GGML_TYPE_Q4_K_R4:
             IQK_SET_MUL_MAT_FUNCTIONS(mul_mat_q4_k_r4_q8_k, kernels)
+#if defined(GGML_AMX_INT8) && defined(__AMX_TILE__) && defined(__AMX_INT8__)
+            if (iqk_amx_int8_runtime_available()) {
+                set_q4_k_r4_amx_functions(kernels, func16, func32, func64, func128, func256, func512);
+            }
+#endif
             break;
         case GGML_TYPE_Q5_K_R4:
             IQK_SET_MUL_MAT_FUNCTIONS(mul_mat_q5_k_r4_q8_k, kernels)
+#if defined(GGML_AMX_INT8) && defined(__AMX_TILE__) && defined(__AMX_INT8__)
+            if (iqk_amx_int8_runtime_available()) {
+                set_q5_k_r4_amx_functions(kernels, func16, func32, func64, func128, func256, func512);
+            }
+#endif
             break;
         case GGML_TYPE_Q6_K_R4:
             IQK_SET_MUL_MAT_FUNCTIONS(mul_mat_q6_k_r4_q8_k, kernels)
+#if defined(GGML_AMX_INT8) && defined(__AMX_TILE__) && defined(__AMX_INT8__)
+            if (iqk_amx_int8_runtime_available()) {
+                set_q6_k_r4_amx_functions(kernels, func16, func32, func64, func128, func256, func512);
+            }
+#endif
             break;
         case GGML_TYPE_IQ4_XS_R8:
             IQK_SET_MUL_MAT_FUNCTIONS(mul_mat_iq4_xs_r8_q8_k_avx2, kernels)
@@ -4484,7 +4636,10 @@ bool iqk_convert_kquants_q8X_r8(int type, int n, const void * vx, size_t bx, voi
     return true;
 }
 
-bool iqk_set_kernels_kquants(int ne00, int typeA, int typeB, std::array<mul_mat_t, IQK_MAX_NY>& kernels, [[maybe_unused]] mul_mat_t& func16) {
+bool iqk_set_kernels_kquants(int ne00, int typeA, int typeB, std::array<mul_mat_t, IQK_MAX_NY>& kernels,
+        [[maybe_unused]] mul_mat_t& func16, [[maybe_unused]] mul_mat_t& func32,
+        [[maybe_unused]] mul_mat_t& func64, [[maybe_unused]] mul_mat_t& func128,
+        [[maybe_unused]] mul_mat_t& func256, [[maybe_unused]] mul_mat_t& func512) {
 
     auto etypeA = ggml_type(typeA);
     auto expected_type_B = etypeA == GGML_TYPE_IQ4_XS_R8 || etypeA == GGML_TYPE_Q4_K_R4 || etypeA == GGML_TYPE_Q5_K_R4 ? GGML_TYPE_Q8_K32
@@ -4499,6 +4654,11 @@ bool iqk_set_kernels_kquants(int ne00, int typeA, int typeB, std::array<mul_mat_
     }
 
     func16 = nullptr;
+    func32 = nullptr;
+    func64 = nullptr;
+    func128 = nullptr;
+    func256 = nullptr;
+    func512 = nullptr;
 
     switch (typeA) {
         case GGML_TYPE_Q2_K:

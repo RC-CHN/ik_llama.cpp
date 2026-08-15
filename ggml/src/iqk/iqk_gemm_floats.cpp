@@ -7,6 +7,14 @@
 #define GGML_COMMON_IMPL_C
 #include "ggml-common.h"
 
+#if defined(GGML_AMX_BF16) && defined(__AMX_TILE__) && defined(__AMX_BF16__)
+#include <algorithm>
+#include <cpuid.h>
+#include <cstdlib>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
+
 #ifdef __x86_64__
 
 namespace {
@@ -559,6 +567,141 @@ void mul_mat_fX_fY_Tx8(int n, const void * vx, size_t bx, const DataInfo& info, 
 }
 #endif
 
+#if defined(GGML_AMX_BF16) && defined(__AMX_TILE__) && defined(__AMX_BF16__)
+
+// Linux enables XTILEDATA lazily. Requesting it on every worker is cheap after
+// the first call and avoids executing an AMX instruction on an unprepared
+// thread. Keep the result thread-local because the xstate belongs to a thread.
+#define IQK_ARCH_REQ_XCOMP_PERM 0x1023
+#define IQK_XFEATURE_XTILEDATA  18
+
+static bool amx_bf16_runtime_available() {
+    static thread_local int available = -1;
+    if (available >= 0) {
+        return available != 0;
+    }
+
+    const char * disabled = std::getenv("GGML_AMX_DISABLE");
+    if (disabled && disabled[0] != '\0' && disabled[0] != '0') {
+        available = 0;
+        return false;
+    }
+
+    unsigned int eax, ebx, ecx, edx;
+    constexpr unsigned int cpuid_amx_bf16 = 1u << 22;
+    constexpr unsigned int cpuid_amx_tile = 1u << 24;
+    if (!__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx) ||
+        (edx & (cpuid_amx_bf16 | cpuid_amx_tile)) != (cpuid_amx_bf16 | cpuid_amx_tile)) {
+        available = 0;
+        return false;
+    }
+
+    available = syscall(SYS_arch_prctl, IQK_ARCH_REQ_XCOMP_PERM, IQK_XFEATURE_XTILEDATA) == 0;
+    return available != 0;
+}
+
+struct amx_tile_config {
+    uint8_t  palette_id;
+    uint8_t  start_row;
+    uint8_t  reserved[14];
+    uint16_t colsb[16];
+    uint8_t  rows[16];
+};
+
+static_assert(sizeof(amx_tile_config) == 64, "AMX tile configuration must be 64 bytes");
+static_assert(sizeof(ggml_bf16_t) == sizeof(uint16_t), "unexpected BF16 representation");
+
+template <int nrc_y>
+IQK_NOINLINE void mul_mat_bf16_amx(int n, const void * vx, size_t bx, const DataInfo& info, int nrc_x) {
+    static_assert(nrc_y >= 1 && nrc_y <= 8, "AMX kernel supports between one and eight RHS rows");
+
+    // Thin matrices do not fill enough of the tile to pay for packing and
+    // tile-state setup. They remain on the existing AVX512-BF16 path.
+    if constexpr (nrc_y < 4) {
+#ifdef __AVX512BF16__
+        mul_mat_fX_fY_T<nrc_y>(n, vx, bx, info, nrc_x);
+#else
+        mul_mat_fX_fY_T<nrc_y, ggml_bf16_t, ggml_bf16_t>(n, vx, bx, info, nrc_x);
+#endif
+        return;
+    }
+    if (nrc_x < 16 || n < 256 || n % 32 != 0) {
+#ifdef __AVX512BF16__
+        mul_mat_fX_fY_T<nrc_y>(n, vx, bx, info, nrc_x);
+#else
+        mul_mat_fX_fY_T<nrc_y, ggml_bf16_t, ggml_bf16_t>(n, vx, bx, info, nrc_x);
+#endif
+        return;
+    }
+
+    constexpr int tile_m = 16;
+    constexpr int tile_k = 32;
+    constexpr int b_rows = tile_k / 2; // two BF16 values per VNNI dword
+    const int n_k_blocks = n / tile_k;
+
+    const ggml_bf16_t * y[nrc_y];
+    for (int iy = 0; iy < nrc_y; ++iy) {
+        y[iy] = reinterpret_cast<const ggml_bf16_t *>(info.src1_row(iy));
+    }
+
+    // AMX expects B in VNNI-pair order: [K/2][N][2]. Pack each RHS group
+    // once, then reuse it for every 16-row block from A.
+    static thread_local std::vector<uint16_t> packed_b;
+    const size_t packed_block_size = b_rows * nrc_y * 2;
+    packed_b.resize(static_cast<size_t>(n_k_blocks) * packed_block_size);
+    for (int kb = 0; kb < n_k_blocks; ++kb) {
+        uint16_t * block = packed_b.data() + static_cast<size_t>(kb) * packed_block_size;
+        for (int ik = 0; ik < b_rows; ++ik) {
+            for (int iy = 0; iy < nrc_y; ++iy) {
+                block[(ik*nrc_y + iy)*2 + 0] = y[iy][kb*tile_k + 2*ik + 0].bits;
+                block[(ik*nrc_y + iy)*2 + 1] = y[iy][kb*tile_k + 2*ik + 1].bits;
+            }
+        }
+    }
+
+    alignas(64) float result[tile_m*nrc_y];
+    int configured_m = 0;
+    for (int ix0 = 0; ix0 < nrc_x; ix0 += tile_m) {
+        const int this_m = std::min(tile_m, nrc_x - ix0);
+        if (this_m != configured_m) {
+            alignas(64) amx_tile_config config = {};
+            config.palette_id = 1;
+            config.rows[0] = this_m;
+            config.colsb[0] = nrc_y * sizeof(float);       // C: M x N FP32
+            config.rows[1] = this_m;
+            config.colsb[1] = tile_k * sizeof(uint16_t);  // A: M x K BF16
+            config.rows[2] = b_rows;
+            config.colsb[2] = nrc_y * 2*sizeof(uint16_t); // B: K/2 x N BF16 pairs
+            _tile_loadconfig(&config);
+            configured_m = this_m;
+        }
+
+        _tile_zero(0);
+        for (int kb = 0; kb < n_k_blocks; ++kb) {
+            const char * a = static_cast<const char *>(vx) +
+                static_cast<size_t>(ix0)*bx + static_cast<size_t>(kb*tile_k)*sizeof(ggml_bf16_t);
+            const uint16_t * b = packed_b.data() + static_cast<size_t>(kb) * packed_block_size;
+            _tile_loadd(1, a, bx);
+            _tile_loadd(2, b, nrc_y * 2*sizeof(uint16_t));
+            _tile_dpbf16ps(0, 1, 2);
+        }
+        _tile_stored(0, result, nrc_y*sizeof(float));
+
+        for (int iy = 0; iy < nrc_y; ++iy) {
+            for (int ix = 0; ix < this_m; ++ix) {
+                info.store(ix0 + ix, iy, result[ix*nrc_y + iy]);
+            }
+        }
+    }
+    _tile_release();
+}
+
+void set_mul_mat_bf16_amx(std::array<mul_mat_t, IQK_MAX_NY>& funcs) {
+    IQK_SET_MUL_MAT_FUNCTIONS(mul_mat_bf16_amx, funcs);
+}
+
+#endif
+
 
 template <typename FloatX, typename FloatY>
 void set_mul_mat_f(std::array<mul_mat_t, IQK_MAX_NY>& funcs) {
@@ -610,17 +753,25 @@ bool iqk_set_kernels_float(int ne00, int typeA, int typeB, std::array<mul_mat_t,
     if (typeA == GGML_TYPE_BF16) {
         if (ne00 % 8) return false;
         switch (typeB) {
-#ifdef __AVX512BF16__
             case GGML_TYPE_BF16: {
+#if defined(GGML_AMX_BF16) && defined(__AMX_TILE__) && defined(__AMX_BF16__)
+                if (ne00 % 32 == 0 && amx_bf16_runtime_available()) {
+                    set_mul_mat_bf16_amx(kernels);
+                    break;
+                }
+#endif
+#ifdef __AVX512BF16__
                 if (ne00 % 16 == 0) {
                     set_mul_mat_bf16(kernels);
                 } else {
                     set_mul_mat_bf16x8(kernels);
                 }
-            } break;
 #else
-            case GGML_TYPE_BF16: set_mul_mat_f<ggml_bf16_t, ggml_bf16_t>(kernels); break;
-            case GGML_TYPE_F32:  set_mul_mat_f<ggml_bf16_t, float>(kernels);       break;
+                set_mul_mat_f<ggml_bf16_t, ggml_bf16_t>(kernels);
+#endif
+            } break;
+#ifndef __AVX512BF16__
+            case GGML_TYPE_F32: set_mul_mat_f<ggml_bf16_t, float>(kernels); break;
 #endif
             default: return false;
         }
