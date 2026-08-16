@@ -3888,6 +3888,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                 case GGML_UNARY_OP_NEG:
                     ggml_cuda_op_neg(ctx, dst);
                     break;
+                case GGML_UNARY_OP_ABS:
+                    ggml_cuda_op_abs(ctx, dst);
+                    break;
                 case GGML_UNARY_OP_SIGMOID:
                     if (fusion && i + 5 < cgraph->n_nodes &&
                         cgraph->nodes[i+1]->op == GGML_OP_RESHAPE &&
@@ -4883,6 +4886,7 @@ GGML_CALL static bool ggml_backend_cuda_supports_op(ggml_backend_t backend, cons
                 case GGML_UNARY_OP_SOFTPLUS:
                 case GGML_UNARY_OP_SQRT_SOFTPLUS:
                 case GGML_UNARY_OP_NEG:
+                case GGML_UNARY_OP_ABS:
                     return ggml_is_contiguous(op->src[0]);
                 default:
                     return false;
