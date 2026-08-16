@@ -251,6 +251,7 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
                             bool          return_stats,
                             int           numa_shards,
                             int           numa_cold_capacity,
+                            bool          numa_return_partials,
                             float       * qkv,      // v*softmax(scale*(k*q))
                             [[maybe_unused]] void * work_buffer_in, [[maybe_unused]] barrier_t barrier, [[maybe_unused]] void * barrier_data,
                             int ith, int nth, int n_swa, [[maybe_unused]] ggml_tensor * indexer) {
@@ -499,33 +500,65 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
                 }
                 barrier(barrier_data);
 
-                for (int output = ith; output < n_heads*n_queries; output += nth) {
-                    const int slot = output/n_queries;
-                    const int packed_row = output - slot*n_queries;
-                    const int iq1 = packed_row/rk2;
-                    const int il = packed_row - iq1*rk2;
-                    const int ik02 = head_first + slot;
-                    const int iq2 = ik02*rk2 + il;
-                    float * Racc = (float *) ((char *) qkv + (iq2 + (int64_t) iq1*ne1)*nb1);
-                    float M = -INFINITY;
-                    float S = 0.0f;
-                    for (int inode = 0; inode < numa_shards; ++inode) {
+                if (numa_return_partials) {
+                    const size_t shard_stride = (size_t) ne1*ne2*nb1;
+                    for (int output = local_ith; output < n_heads*n_queries; output += local_nth) {
+                        const int slot = output/n_queries;
+                        const int packed_row = output - slot*n_queries;
+                        const int iq1 = packed_row/rk2;
+                        const int il = packed_row - iq1*rk2;
+                        const int ik02 = head_first + slot;
+                        const int iq2 = ik02*rk2 + il;
+                        float * Racc = (float *) ((char *) qkv + (size_t) node*shard_stride +
+                                (iq2 + (int64_t) iq1*ne1)*nb1);
+                        float M = -INFINITY;
+                        float S = 0.0f;
+                        std::memset(Racc, 0, Dv*sizeof(float));
                         for (int ichunk = 0; ichunk < n_chunks; ++ichunk) {
                             int chunk_first, chunk_last;
-                            chunk_bounds(inode, ichunk, chunk_first, chunk_last);
+                            chunk_bounds(node, ichunk, chunk_first, chunk_last);
                             if (chunk_last <= chunk_first) {
                                 continue;
                             }
-                            const int thread = ichunk*numa_shards + inode;
+                            const int thread = ichunk*numa_shards + node;
                             const float * part = partial_ptrs[thread] + slot*result_stride;
                             const float * R = part + packed_row*Dv;
                             const float * Mj = part + Dv*n_queries;
                             const float * Sj = Mj + n_queries;
                             accumulate_qkv(Dv, M, S, Mj[packed_row], Sj[packed_row], Racc, R);
                         }
+                        Racc[Dv + 0] = pack_softmax_max(M);
+                        Racc[Dv + 1] = S;
                     }
-                    Racc[Dv + 0] = pack_softmax_max(M);
-                    Racc[Dv + 1] = S;
+                } else {
+                    for (int output = ith; output < n_heads*n_queries; output += nth) {
+                        const int slot = output/n_queries;
+                        const int packed_row = output - slot*n_queries;
+                        const int iq1 = packed_row/rk2;
+                        const int il = packed_row - iq1*rk2;
+                        const int ik02 = head_first + slot;
+                        const int iq2 = ik02*rk2 + il;
+                        float * Racc = (float *) ((char *) qkv + (iq2 + (int64_t) iq1*ne1)*nb1);
+                        float M = -INFINITY;
+                        float S = 0.0f;
+                        for (int inode = 0; inode < numa_shards; ++inode) {
+                            for (int ichunk = 0; ichunk < n_chunks; ++ichunk) {
+                                int chunk_first, chunk_last;
+                                chunk_bounds(inode, ichunk, chunk_first, chunk_last);
+                                if (chunk_last <= chunk_first) {
+                                    continue;
+                                }
+                                const int thread = ichunk*numa_shards + inode;
+                                const float * part = partial_ptrs[thread] + slot*result_stride;
+                                const float * R = part + packed_row*Dv;
+                                const float * Mj = part + Dv*n_queries;
+                                const float * Sj = Mj + n_queries;
+                                accumulate_qkv(Dv, M, S, Mj[packed_row], Sj[packed_row], Racc, R);
+                            }
+                        }
+                        Racc[Dv + 0] = pack_softmax_max(M);
+                        Racc[Dv + 1] = S;
+                    }
                 }
                 barrier(barrier_data);
             }
@@ -580,31 +613,61 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
 
         barrier(barrier_data);
 
-        for (int output = ith; output < neq1*neq2; output += nth) {
-            const int iq1 = output/neq2;
-            const int iq2 = output - iq1*neq2;
-            const int ik02 = iq2/rk2;
-            const int il = iq2 - ik02*rk2;
-            const int pair = ik02*neq1 + iq1;
-            float * Racc = (float *) ((char *) qkv + (iq2 + (int64_t) iq1*ne1)*nb1);
-            float M = -INFINITY;
-            float S = 0.0f;
-            for (int inode = 0; inode < numa_shards; ++inode) {
+        if (numa_return_partials) {
+            const size_t shard_stride = (size_t) ne1*ne2*nb1;
+            for (int output = local_ith; output < neq1*neq2; output += local_nth) {
+                const int iq1 = output/neq2;
+                const int iq2 = output - iq1*neq2;
+                const int ik02 = iq2/rk2;
+                const int il = iq2 - ik02*rk2;
+                const int pair = ik02*neq1 + iq1;
+                float * Racc = (float *) ((char *) qkv + (size_t) node*shard_stride +
+                        (iq2 + (int64_t) iq1*ne1)*nb1);
+                float M = -INFINITY;
+                float S = 0.0f;
+                std::memset(Racc, 0, Dv*sizeof(float));
                 for (int ichunk = 0; ichunk < n_chunks; ++ichunk) {
                     int first, last;
-                    chunk_bounds(inode, ichunk, first, last);
+                    chunk_bounds(node, ichunk, first, last);
                     if (last <= first) {
                         continue;
                     }
-                    const float * part = partial(inode, pair, ichunk);
+                    const float * part = partial(node, pair, ichunk);
                     const float * R = part + il*Dv;
                     const float * Mj = part + Dv*rk2;
                     const float * Sj = Mj + rk2;
                     accumulate_qkv(Dv, M, S, Mj[il], Sj[il], Racc, R);
                 }
+                Racc[Dv + 0] = pack_softmax_max(M);
+                Racc[Dv + 1] = S;
             }
-            Racc[Dv + 0] = pack_softmax_max(M);
-            Racc[Dv + 1] = S;
+        } else {
+            for (int output = ith; output < neq1*neq2; output += nth) {
+                const int iq1 = output/neq2;
+                const int iq2 = output - iq1*neq2;
+                const int ik02 = iq2/rk2;
+                const int il = iq2 - ik02*rk2;
+                const int pair = ik02*neq1 + iq1;
+                float * Racc = (float *) ((char *) qkv + (iq2 + (int64_t) iq1*ne1)*nb1);
+                float M = -INFINITY;
+                float S = 0.0f;
+                for (int inode = 0; inode < numa_shards; ++inode) {
+                    for (int ichunk = 0; ichunk < n_chunks; ++ichunk) {
+                        int first, last;
+                        chunk_bounds(inode, ichunk, first, last);
+                        if (last <= first) {
+                            continue;
+                        }
+                        const float * part = partial(inode, pair, ichunk);
+                        const float * R = part + il*Dv;
+                        const float * Mj = part + Dv*rk2;
+                        const float * Sj = Mj + rk2;
+                        accumulate_qkv(Dv, M, S, Mj[il], Sj[il], Racc, R);
+                    }
+                }
+                Racc[Dv + 0] = pack_softmax_max(M);
+                Racc[Dv + 1] = S;
+            }
         }
         return true;
     }
@@ -989,6 +1052,7 @@ bool iqk_flash_attn_noalibi([[maybe_unused]] int type_q, [[maybe_unused]] int ty
                             [[maybe_unused]] bool          return_stats,
                             [[maybe_unused]] int           numa_shards,
                             [[maybe_unused]] int           numa_cold_capacity,
+                            [[maybe_unused]] bool          numa_return_partials,
                             [[maybe_unused]] float       * qkv,      // v*softmax(scale*(k*q))
                             [[maybe_unused]] void * work_buffer, [[maybe_unused]] barrier_t barrier, [[maybe_unused]] void * barrier_data,
                             [[maybe_unused]] int ith, [[maybe_unused]] int nth, [[maybe_unused]] int n_swa, [[maybe_unused]] ggml_tensor * indexer) {

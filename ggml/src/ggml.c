@@ -10859,13 +10859,19 @@ void ggml_flash_attn_ext_set_prec(
 void ggml_flash_attn_ext_set_numa_shards(
         struct ggml_tensor * a,
         int32_t              n_shards,
-        int32_t              cold_capacity) {
+        int32_t              cold_capacity,
+        bool                 return_partials) {
     GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
     GGML_ASSERT(ggml_get_op_params_i32(a, 5) != 0);
     GGML_ASSERT(n_shards >= 0 && cold_capacity >= 0);
 
     ggml_set_op_params_i32(a, 6, n_shards);
     ggml_set_op_params_i32(a, 7, cold_capacity);
+    ggml_set_op_params_i32(a, 8, return_partials ? 1 : 0);
+    if (return_partials) {
+        GGML_ASSERT(a->ne[3] == 1);
+        a->ne[3] = n_shards;
+    }
 }
 
 void ggml_flash_attn_ext_add_sinks(
@@ -23080,9 +23086,11 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     const bool return_stats = ggml_get_op_params_i32(dst, 5) != 0;
     const int numa_shards = ggml_get_op_params_i32(dst, 6);
     const int numa_cold_capacity = ggml_get_op_params_i32(dst, 7);
+    const bool numa_return_partials = ggml_get_op_params_i32(dst, 8) != 0;
 
     GGML_ASSERT(ne0 == Dv + (return_stats ? 2 : 0));
     GGML_ASSERT(ne2 == N);
+    GGML_ASSERT(!numa_return_partials || (numa_shards >= 2 && ne3 == numa_shards));
     GGML_ASSERT(!return_stats || sinks == NULL);
 
     // input tensor rows must be contiguous
@@ -23146,9 +23154,12 @@ static void ggml_compute_forward_flash_attn_ext_f16(
                 k->type, v->type,
                 Dk, Dv, neq1, nek1, q->nb[1], k->nb[1], v->nb[1], mask ? mask->nb[1] : 0,
                 q->data, k->data, v->data, mask ? mask->data : NULL, sinks ? sinks->data : NULL,
-                scale, softcap, return_stats, numa_shards, numa_cold_capacity, (float *)dst->data,
+                scale, softcap, return_stats, numa_shards, numa_cold_capacity, numa_return_partials,
+                (float *)dst->data,
                 params->wdata, (barrier_t)ggml_barrier, (void *)params->shared, ith, nth, dst->op_params[4],
                 return_stats ? NULL : dst->src[5])) return;
+
+    GGML_ASSERT(!numa_return_partials && "NUMA partial attention requires the IQK kernel");
 
 //    if (max_bias <= 0.0f && q->type == GGML_TYPE_F32 && mask && mask->type == GGML_TYPE_F16) {
 //        //if (ith == 0) printf("k: %ld x %ld x %ld, q: %ld x %ld x %ld, v: %ld x %ld x %ld mask: %ld x %ld x %ld\n",

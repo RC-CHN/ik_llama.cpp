@@ -2529,7 +2529,8 @@ extern "C" {
     GGML_API void ggml_flash_attn_ext_set_numa_shards(
             struct ggml_tensor * a,
             int32_t              n_shards,
-            int32_t              cold_capacity);
+            int32_t              cold_capacity,
+            bool                 return_partials);
 
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,

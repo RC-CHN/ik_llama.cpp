@@ -2144,14 +2144,17 @@ static ggml_tensor * llm_build_kqv(
         auto merge_stats = [&](ggml_tensor * a, ggml_tensor * b, bool normalize) -> ggml_tensor * {
             auto av = split_stats(a);
             auto bv = split_stats(b);
-            auto m = ggml_scale(ctx,
-                    ggml_add(ctx, ggml_add(ctx, av.m, bv.m), ggml_abs(ctx, ggml_sub(ctx, av.m, bv.m))),
-                    0.5f);
-            auto wa = ggml_exp(ctx, ggml_sub(ctx, av.m, m));
-            auto wb = ggml_exp(ctx, ggml_sub(ctx, bv.m, m));
+            auto delta = ggml_sub(ctx, av.m, bv.m);
+            // Visit b before a throughout the merge.  For the final cold/hot
+            // merge b is the hot branch; this graph order lets the scheduler
+            // launch it before reaching the cold-ready boundary.
+            auto m = ggml_add(ctx, bv.m,
+                    ggml_scale(ctx, ggml_add(ctx, delta, ggml_abs(ctx, delta)), 0.5f));
+            auto wa = ggml_exp(ctx, ggml_neg(ctx, ggml_sub(ctx, m, av.m)));
+            auto wb = ggml_exp(ctx, ggml_neg(ctx, ggml_sub(ctx, m, bv.m)));
             auto r = ggml_add(ctx,
-                    ggml_mul(ctx, av.r, ggml_repeat(ctx, wa, av.r)),
-                    ggml_mul(ctx, bv.r, ggml_repeat(ctx, wb, bv.r)));
+                    ggml_mul(ctx, ggml_repeat(ctx, wa, av.r), av.r),
+                    ggml_mul(ctx, ggml_repeat(ctx, wb, bv.r), bv.r));
             auto s = ggml_add(ctx, ggml_mul(ctx, av.s, wa), ggml_mul(ctx, bv.s, wb));
             if (normalize) {
                 return ggml_div(ctx, r, ggml_repeat(ctx, s, r));
@@ -2179,7 +2182,7 @@ static ggml_tensor * llm_build_kqv(
             if (cold && kv.hybrid_numa_shards > 1) {
                 GGML_ASSERT((uint32_t) count <= kv.hybrid_numa_cold_capacity);
                 ggml_flash_attn_ext_set_numa_shards(
-                        stats, kv.hybrid_numa_shards, kv.hybrid_numa_cold_capacity);
+                        stats, kv.hybrid_numa_shards, kv.hybrid_numa_cold_capacity, true);
             }
             if (!cold) {
                 // Cache writes mutate persistent tensors and are otherwise invisible
@@ -2220,21 +2223,57 @@ static ggml_tensor * llm_build_kqv(
                     hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
             cb(cur, "hybrid_kv_hot_fa", il);
         } else {
-            std::vector<ggml_tensor *> parts;
-            parts.reserve(3);
-            parts.push_back(make_stats(k_cache, v_cache, 0, 0, cold_n, true));
-            parts.push_back(make_stats(kv.k_hot_l[kv_layer], kv.v_hot_l[kv_layer],
+            auto cold_raw = make_stats(k_cache, v_cache, 0, 0, cold_n, true);
+
+            std::vector<ggml_tensor *> hot_parts;
+            hot_parts.reserve(2);
+            hot_parts.push_back(make_stats(kv.k_hot_l[kv_layer], kv.v_hot_l[kv_layer],
                     hot_physical, cold_n, hot_first, false));
             if (hot_second > 0) {
-                parts.push_back(make_stats(kv.k_hot_l[kv_layer], kv.v_hot_l[kv_layer],
+                hot_parts.push_back(make_stats(kv.k_hot_l[kv_layer], kv.v_hot_l[kv_layer],
                         0, cold_n + hot_first, hot_second, false));
             }
 
-            ggml_tensor * merged = parts[0];
-            for (size_t i = 1; i < parts.size(); ++i) {
-                merged = merge_stats(merged, parts[i], i + 1 == parts.size());
+            // Make the CPU cold node visible before either hot node without
+            // turning it into a data input of the hot CUDA split. src[5] is an
+            // existing dependency-only leaf for raw-statistics FA.
+            for (auto * hot : hot_parts) {
+                GGML_ASSERT(hot->src[5] != nullptr);
+                int dep = 0;
+                while (dep < GGML_MAX_SRC && hot->src[5]->src[dep] != nullptr) {
+                    ++dep;
+                }
+                GGML_ASSERT(dep < GGML_MAX_SRC);
+                hot->src[5]->src[dep] = cold_raw;
             }
-            cur = merged;
+
+            // This contiguous copy is the single cold H2D boundary. The raw
+            // tensor has already been visited through the dependency above, so
+            // graph order is CPU cold -> CUDA hot -> cold-ready -> GPU merge.
+            auto cold_ready = ggml_cont(ctx, cold_raw);
+            cold_ready->op_params[GGML_MAX_OP_PARAMS/sizeof(int32_t) - 1] = 0xff;
+            cb(cold_ready, "hybrid_kv_cold_ready", il);
+
+            auto stats_shard = [&](int shard) {
+                GGML_ASSERT(shard >= 0 && shard < cold_ready->ne[3]);
+                return ggml_view_4d(ctx, cold_ready,
+                        cold_ready->ne[0], cold_ready->ne[1], cold_ready->ne[2], 1,
+                        cold_ready->nb[1], cold_ready->nb[2], cold_ready->nb[3],
+                        (size_t) shard*cold_ready->nb[3]);
+            };
+
+            ggml_tensor * cold_merged = stats_shard(0);
+            for (int shard = 1; shard < cold_ready->ne[3]; ++shard) {
+                cold_merged = merge_stats(cold_merged, stats_shard(shard), false);
+            }
+            cb(cold_merged, "hybrid_kv_cold_merged", il);
+
+            ggml_tensor * hot_merged = hot_parts[0];
+            for (size_t i = 1; i < hot_parts.size(); ++i) {
+                hot_merged = merge_stats(hot_merged, hot_parts[i], false);
+            }
+
+            cur = merge_stats(cold_merged, hot_merged, true);
             cb(cur, "hybrid_kv_merge", il);
         }
 
@@ -2891,6 +2930,8 @@ ggml_cgraph * llm_build_context::llama_build_graph(
 
         if (strcmp(name, "hybrid_kv_hot_fa") == 0 ||
                 strcmp(name, "hybrid_kv_hot_stats") == 0 ||
+                strcmp(name, "hybrid_kv_cold_ready") == 0 ||
+                strcmp(name, "hybrid_kv_cold_merged") == 0 ||
                 strcmp(name, "hybrid_kv_merge") == 0) {
             for (auto * backend : lctx.backends) {
                 if (!ggml_backend_is_cpu(backend) &&

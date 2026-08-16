@@ -16,6 +16,9 @@
 #include <array>
 #include <chrono>
 #include <barrier>
+#include <condition_variable>
+#include <functional>
+#include <mutex>
 #include <thread>
 #ifdef GGML_USE_OPENMP
 #include <omp.h>
@@ -1142,6 +1145,67 @@ struct ggml_backend_sched_split {
     struct ggml_cgraph graph;
 };
 
+// A single coordinator is sufficient for hybrid attention: at most one CPU
+// cold split can be in flight because the next layer depends on the merged
+// attention result.  Keeping the thread alive avoids paying thread creation
+// and teardown once per full-attention layer.
+struct ggml_backend_sched_hybrid_worker {
+    std::mutex mutex;
+    std::condition_variable wake;
+    std::condition_variable done;
+    std::function<ggml_status()> task;
+    std::thread thread;
+    ggml_status status = GGML_STATUS_SUCCESS;
+    bool pending = false;
+    bool complete = true;
+    bool stopping = false;
+
+    ggml_backend_sched_hybrid_worker() : thread([this] {
+        std::unique_lock<std::mutex> lock(mutex);
+        while (true) {
+            wake.wait(lock, [this] { return pending || stopping; });
+            if (stopping && !pending) {
+                return;
+            }
+
+            auto fn = std::move(task);
+            pending = false;
+            lock.unlock();
+            const ggml_status result = fn();
+            lock.lock();
+            status = result;
+            complete = true;
+            done.notify_one();
+        }
+    }) {}
+
+    ~ggml_backend_sched_hybrid_worker() {
+        wait();
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            stopping = true;
+        }
+        wake.notify_one();
+        thread.join();
+    }
+
+    void submit(std::function<ggml_status()> fn) {
+        std::lock_guard<std::mutex> lock(mutex);
+        GGML_ASSERT(complete && !pending);
+        task = std::move(fn);
+        status = GGML_STATUS_SUCCESS;
+        complete = false;
+        pending = true;
+        wake.notify_one();
+    }
+
+    ggml_status wait() {
+        std::unique_lock<std::mutex> lock(mutex);
+        done.wait(lock, [this] { return complete; });
+        return status;
+    }
+};
+
 struct ggml_backend_sched {
     bool is_reset; // true if the scheduler has been reset since the last graph split
     bool is_alloc;
@@ -1197,6 +1261,8 @@ struct ggml_backend_sched {
     std::vector<std::vector<ggml_backend_sched_split*>> backend_splits;
     std::array<bool, GGML_SCHED_MAX_BACKENDS> needs_sync;
     std::array<bool, GGML_SCHED_MAX_BACKENDS> own_cpy;
+
+    ggml_backend_sched_hybrid_worker * hybrid_worker = nullptr;
 
     bool only_active_experts;
     bool split_mode_graph;
@@ -2205,6 +2271,78 @@ static ggml_status ggml_backend_sched_eval(ggml_backend_sched_t sched, ggml_back
     return GGML_STATUS_SUCCESS;
 }
 
+static bool ggml_backend_sched_hybrid_async_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("GGML_HYBRID_ATTN_ASYNC");
+        return value == nullptr || value[0] == '\0' ||
+            (std::strcmp(value, "0") != 0 && std::strcmp(value, "false") != 0 &&
+             std::strcmp(value, "off") != 0);
+    }();
+    return enabled;
+}
+
+static int64_t ggml_backend_sched_hybrid_async_min_cold() {
+    static const int64_t min_cold = [] {
+        const char * value = std::getenv("GGML_HYBRID_ATTN_ASYNC_MIN_COLD");
+        return value && value[0] != '\0' ? std::max<int64_t>(0, std::atoll(value)) : 8192;
+    }();
+    return min_cold;
+}
+
+static bool ggml_backend_sched_name_starts_with(const char * name, const char * prefix) {
+    return std::strncmp(name, prefix, std::strlen(prefix)) == 0;
+}
+
+static bool ggml_backend_sched_split_has_name(
+        const ggml_backend_sched_split * split, const char * prefix) {
+    for (int i = 0; i < split->graph.n_nodes; ++i) {
+        if (ggml_backend_sched_name_starts_with(split->graph.nodes[i]->name, prefix)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static int64_t ggml_backend_sched_hybrid_cold_tokens(const ggml_backend_sched_split * split) {
+    for (int i = 0; i < split->graph.n_nodes; ++i) {
+        const ggml_tensor * node = split->graph.nodes[i];
+        if (ggml_backend_sched_name_starts_with(node->name, "hybrid_kv_cold_stats") && node->src[1]) {
+            return node->src[1]->ne[1];
+        }
+    }
+    return 0;
+}
+
+// The cold stats are complete before this is called.  Queue their H2D copy on
+// the destination backend stream, after the already-submitted hot attention.
+// This ordering is important: using the CUDA buffer copy path would use
+// cudaStreamPerThread and could overwrite graph-allocator storage still in use
+// by the hot split.
+static bool ggml_backend_sched_copy_hybrid_cold_ready(
+        ggml_backend_sched_t sched, ggml_backend_sched_split * split) {
+    if (split->n_inputs == 0 || ggml_backend_is_cpu(sched->backends[split->backend_id])) {
+        return false;
+    }
+
+    for (int i = 0; i < split->n_inputs; ++i) {
+        ggml_tensor * input = split->inputs[i];
+        if (!ggml_backend_sched_name_starts_with(input->name, "hybrid_kv_cold_stats") ||
+                !input->buffer || !ggml_backend_buffer_is_host(input->buffer) ||
+                (input->flags & GGML_TENSOR_FLAG_INPUT)) {
+            return false;
+        }
+    }
+
+    ggml_backend_t backend = sched->backends[split->backend_id];
+    for (int i = 0; i < split->n_inputs; ++i) {
+        ggml_tensor * input = split->inputs[i];
+        ggml_tensor * input_cpy = tensor_copy(input, split->backend_id, sched->cur_copy);
+        ggml_backend_tensor_set_async(backend, input_cpy, input->data, 0, ggml_nbytes(input));
+    }
+    sched->needs_sync[split->backend_id] = false;
+    return true;
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
 
     for (auto & item : sched->needs_sync) item = true;
@@ -2471,6 +2609,29 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     size_t moe_next  = 0; // first moe_infos entry with split >= current split
     size_t moe_enq   = 0; // moe_infos entries already enqueued for lookahead
 
+    bool hybrid_pending = false;
+    auto mark_split_inputs_in_use = [sched](ggml_backend_sched_split * split) {
+        const int backend_id = split->backend_id;
+        if (split->n_inputs > 0 && !sched->own_cpy[backend_id]) {
+            sched->needs_sync[backend_id] = true;
+        } else {
+            for (int j = 0; j < split->n_inputs; ++j) {
+                if (ggml_backend_buffer_is_host(split->inputs[j]->buffer)) {
+                    sched->needs_sync[backend_id] = true;
+                }
+            }
+        }
+    };
+
+    auto wait_hybrid = [&]() -> ggml_status {
+        if (!hybrid_pending) {
+            return GGML_STATUS_SUCCESS;
+        }
+        hybrid_pending = false;
+        GGML_ASSERT(sched->hybrid_worker != nullptr);
+        return sched->hybrid_worker->wait();
+    };
+
     for (int i = 0; i < sched->n_splits; i++) {
 #if IK_PRINT_TIMING
         int64_t tim1 = ggml_time_us();
@@ -2478,6 +2639,17 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         struct ggml_backend_sched_split * split = &splits[i];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+        const bool hybrid_cold = ggml_backend_sched_split_has_name(split, "hybrid_kv_cold_stats");
+        const bool hybrid_ready = ggml_backend_sched_split_has_name(split, "hybrid_kv_cold_ready");
+
+        bool hybrid_ready_copy = false;
+        if (hybrid_pending && (hybrid_ready || ggml_backend_is_cpu(split_backend))) {
+            const ggml_status status = wait_hybrid();
+            if (status != GGML_STATUS_SUCCESS) {
+                return status;
+            }
+            hybrid_ready_copy = hybrid_ready;
+        }
 
         if (moe_prefetch && !moe_infos.empty()) {
             while (moe_next < moe_infos.size() && moe_infos[moe_next].split < i) {
@@ -2495,8 +2667,28 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
-        // copy the input tensors to the split backend
-        ggml_backend_sched_copy_inputs(sched, split, sched->needs_sync, ids, unique_ids, last_ids_tensor);
+        bool start_hybrid = false;
+        if (!hybrid_pending && hybrid_cold && ggml_backend_sched_hybrid_async_enabled() &&
+                ggml_backend_sched_hybrid_cold_tokens(split) >= ggml_backend_sched_hybrid_async_min_cold()) {
+            // Only detach a cold split when a matching GPU merge boundary occurs
+            // before any other CPU work.  Otherwise use the ordinary serial path.
+            for (int j = i + 1; j < sched->n_splits; ++j) {
+                ggml_backend_sched_split * next = &splits[j];
+                if (ggml_backend_sched_split_has_name(next, "hybrid_kv_cold_ready")) {
+                    start_hybrid = true;
+                    break;
+                }
+                if (ggml_backend_is_cpu(sched->backends[next->backend_id])) {
+                    break;
+                }
+            }
+        }
+
+        // copy the input tensors to the split backend.  At the merge boundary,
+        // keep the cold H2D transfer on the same stream as hot attention.
+        if (!hybrid_ready_copy || !ggml_backend_sched_copy_hybrid_cold_ready(sched, split)) {
+            ggml_backend_sched_copy_inputs(sched, split, sched->needs_sync, ids, unique_ids, last_ids_tensor);
+        }
 
         // ids are now final and host-visible; enqueue the selected expert
         // slices of this split's host-computed MoE matmuls (up/gate and down
@@ -2507,17 +2699,24 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
-        if (split->n_inputs > 0 && !sched->own_cpy[split_backend_id]) {
-            sched->needs_sync[split_backend_id] = true;
-        } else {
-            for (int j = 0; j < split->n_inputs; ++j) {
-                if (ggml_backend_buffer_is_host(split->inputs[j]->buffer)) {
-                    sched->needs_sync[split_backend_id] = true;
-                }
+        mark_split_inputs_in_use(split);
+
+        if (start_hybrid) {
+            if (sched->hybrid_worker == nullptr) {
+                sched->hybrid_worker = new ggml_backend_sched_hybrid_worker();
+                fprintf(stderr, "ggml_backend_sched: hybrid CPU cold / GPU hot attention overlap enabled\n");
             }
+            sched->hybrid_worker->submit([sched, split_backend, split] {
+                return ggml_backend_sched_eval(sched, split_backend, split);
+            });
+            hybrid_pending = true;
+            continue;
         }
+
         auto ec = ggml_backend_sched_eval(sched, split_backend, split);
         if (ec != GGML_STATUS_SUCCESS) {
+            const ggml_status hybrid_status = wait_hybrid();
+            GGML_UNUSED(hybrid_status);
             return ec;
         }
 
@@ -2536,6 +2735,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy]);
             }
         }
+    }
+
+    const ggml_status hybrid_status = wait_hybrid();
+    if (hybrid_status != GGML_STATUS_SUCCESS) {
+        return hybrid_status;
     }
 
     sched->cur_copy = (sched->cur_copy + 1) % sched->n_copies;
@@ -2606,6 +2810,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;
     }
+    delete sched->hybrid_worker;
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
             ggml_backend_event_free(sched->events[b][c]);
