@@ -5032,9 +5032,24 @@ void server_context::update_slots() {
         slot.prompt_batch_i1 = -1;
     }
 
+    // A Qwen3.5 recurrent per-step checkpoint must be produced by one
+    // sequence-major verification rectangle. Do not mix that rectangle with
+    // prompt admission for a newly recycled slot: the decoder has to split
+    // such a batch, and a later prompt/verification ubatch can replace the
+    // shared checkpoint layout before every old slot has restored from it.
+    // Admission gets one prompt-only turn; established generations resume in
+    // the next turn, once the new slot is ready to join their rectangle.
+    const bool isolate_parallel_mtp_prompt =
+        params_base.hybrid_kv && server_speculative_is_pure_mtp(params_base.speculative) &&
+        std::any_of(slots.begin(), slots.end(), [](const server_slot & slot) {
+            return slot.state == SLOT_STATE_IDLE && slot.command == SLOT_COMMAND_LOAD_PROMPT;
+        });
+
     // first, add sampled tokens from any ongoing sequences
-    add_sampled_tokens(); // Prepare batch for inference
-    align_parallel_mtp_drafts();
+    if (!isolate_parallel_mtp_prompt) {
+        add_sampled_tokens(); // Prepare batch for inference
+        align_parallel_mtp_drafts();
+    }
 
     // process in chunks of params.n_batch
     int32_t n_batch = llama_n_batch(ctx);

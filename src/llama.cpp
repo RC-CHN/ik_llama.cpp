@@ -2563,12 +2563,26 @@ static void restore_recurrent_cache_tensors(int ssm_slot, int conv_slot, llama_s
 bool llama_kv_cache::per_step_restore(const llama_model & model, ggml_backend_sched_t sched,
         int step, llama_seq_id seq_id) {
     if (ckpt.per_step_ssm.empty() || step < 0) {
+        LLAMA_LOG_ERROR("%s: unavailable checkpoint storage for seq_id=%d step=%d (layers=%zu)\n",
+                __func__, (int) seq_id, step, ckpt.per_step_ssm.size());
         return false;
     }
 
     const auto seq_it = std::find(ckpt.per_step_seq_ids.begin(), ckpt.per_step_seq_ids.end(), seq_id);
     if (seq_it == ckpt.per_step_seq_ids.end() || ckpt.per_step_n_seqs <= 0 ||
             ckpt.per_step_n_tokens <= 0 || step >= ckpt.per_step_n_tokens - 1) {
+        std::string seq_ids;
+        for (llama_seq_id saved_seq_id : ckpt.per_step_seq_ids) {
+            if (!seq_ids.empty()) {
+                seq_ids += ',';
+            }
+            seq_ids += std::to_string(saved_seq_id);
+        }
+        LLAMA_LOG_ERROR("%s: checkpoint layout does not cover seq_id=%d step=%d "
+                "(seq_ids=[%s], n_seqs=%d, n_tokens=%d, max_seqs=%d, max_tokens=%d)\n",
+                __func__, (int) seq_id, step, seq_ids.c_str(), ckpt.per_step_n_seqs,
+                ckpt.per_step_n_tokens, ckpt.per_step_max_seqs_allocated,
+                ckpt.per_step_max_allocated);
         return false;
     }
     const int seq_index = (int)std::distance(ckpt.per_step_seq_ids.begin(), seq_it);
@@ -6228,6 +6242,66 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
                 data[j*n_state_slots + i] = i == 0 ? local_seq : -1;
             }
         }
+
+        // The graph may have been built for a different contiguous slot range
+        // (for example [seq0, seq1]) and then reused for [seq1, seq2]. Refresh
+        // the restore layout from the current batch; keeping this metadata only
+        // in delta_net's graph constructor makes the checkpoint payload correct
+        // but leaves later slot IDs pointing at the old rows.
+        auto & ckpt = lctx.kv_self.ckpt;
+        const bool all_output_rows = batch.logits != nullptr &&
+            std::all_of(batch.logits, batch.logits + n_tokens,
+                    [](int8_t output) { return output != 0; });
+        auto capture_allowed = [&](llama_seq_id seq_id) {
+            return !ckpt.per_step_capture_filter_active ||
+                std::find(ckpt.per_step_capture_seq_ids.begin(),
+                          ckpt.per_step_capture_seq_ids.end(), seq_id) !=
+                    ckpt.per_step_capture_seq_ids.end();
+        };
+
+        std::vector<llama_seq_id> checkpoint_seq_ids;
+        int32_t checkpoint_tokens_per_seq = 0;
+        if (kv_self.save_per_step_ssm && all_output_rows && n_tokens > 1) {
+            if (n_state_slots == 1) {
+                GGML_ASSERT(batch.n_seq_id[0] == 1);
+                const llama_seq_id seq_id = batch.seq_id[0][0];
+                bool same_seq = capture_allowed(seq_id);
+                for (int64_t j = 1; same_seq && j < n_tokens; ++j) {
+                    same_seq = batch.n_seq_id[j] == 1 && batch.seq_id[j][0] == seq_id;
+                }
+                if (same_seq) {
+                    checkpoint_seq_ids.push_back(seq_id);
+                    checkpoint_tokens_per_seq = (int32_t) n_tokens;
+                }
+            } else if (n_tokens % n_state_slots == 0) {
+                const int32_t run_tokens = (int32_t) (n_tokens/n_state_slots);
+                bool rectangular = run_tokens > 1;
+                for (int64_t iseq = 0; rectangular && iseq < n_state_slots; ++iseq) {
+                    const int64_t first = iseq*run_tokens;
+                    GGML_ASSERT(batch.n_seq_id[first] == 1);
+                    const llama_seq_id seq_id = batch.seq_id[first][0];
+                    rectangular = seq_id == state_seq_base + iseq && capture_allowed(seq_id);
+                    for (int32_t it = 1; rectangular && it < run_tokens; ++it) {
+                        rectangular = batch.n_seq_id[first + it] == 1 &&
+                            batch.seq_id[first + it][0] == seq_id;
+                    }
+                    checkpoint_seq_ids.push_back(seq_id);
+                }
+                if (rectangular) {
+                    checkpoint_tokens_per_seq = run_tokens;
+                } else {
+                    checkpoint_seq_ids.clear();
+                }
+            }
+        }
+
+        if (!checkpoint_seq_ids.empty()) {
+            GGML_ASSERT(checkpoint_tokens_per_seq <= ckpt.per_step_max_allocated);
+            GGML_ASSERT((int32_t) checkpoint_seq_ids.size() <= ckpt.per_step_max_seqs_allocated);
+            ckpt.per_step_seq_ids = std::move(checkpoint_seq_ids);
+            ckpt.per_step_n_tokens = checkpoint_tokens_per_seq;
+            ckpt.per_step_n_seqs = (int32_t) ckpt.per_step_seq_ids.size();
+        }
     }
 
     if (lctx.inp_pos_bucket) {
@@ -6666,9 +6740,24 @@ static int llama_decode_internal(
                     seen.insert(first_seq);
                     uint32_t unique_tokens = 1;
                     for (; unique_tokens < n_tokens; ++unique_tokens) {
-                        if (!token_seq(unique_tokens, seq) || !seen.insert(seq).second) {
+                        if (!token_seq(unique_tokens, seq) || seen.find(seq) != seen.end()) {
                             break;
                         }
+
+                        // Do not consume the root row of the speculative
+                        // rectangle that follows a root-only prefix. For
+                        // example, [seq0][seq1 x 5][seq2 x 5] must split as
+                        // [seq0] + [seq1 x 5][seq2 x 5], not as
+                        // [seq0][seq1] + [seq1 x 4] + [seq2 x 5]. The latter
+                        // produces multiple checkpoint-writing ubatches and
+                        // the final one no longer covers seq1.
+                        llama_seq_id next_seq = -1;
+                        const uint32_t next = unique_tokens + 1;
+                        const uint32_t remaining = n_tokens_all - cur_token;
+                        if (next < remaining && token_seq(next, next_seq) && next_seq == seq) {
+                            break;
+                        }
+                        seen.insert(seq);
                     }
                     n_tokens = unique_tokens;
                 }
@@ -9876,6 +9965,9 @@ void llama_spec_ckpt_begin_batch(struct llama_context * ctx) {
     auto & ckpt = ctx->kv_self.ckpt;
     ckpt.per_step_capture_filter_active = true;
     ckpt.per_step_capture_seq_ids.clear();
+    ckpt.per_step_seq_ids.clear();
+    ckpt.per_step_n_tokens = 0;
+    ckpt.per_step_n_seqs = 0;
 }
 
 int llama_spec_ckpt_init(struct llama_context * ctx, int mode, int max_tokens) {
