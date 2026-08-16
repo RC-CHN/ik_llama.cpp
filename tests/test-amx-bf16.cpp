@@ -11,6 +11,12 @@
 #include <thread>
 #include <vector>
 
+bool iqk_fa_256_256(int int_type_k, int int_type_v, int nq, int nk,
+        int stride_q, int stride_k, int stride_v, int stride_m, int stride_qkv,
+        const float * q, const void * k, const void * v, const void * mask,
+        float scale, float softcap, float * qkv, const float * sinkf,
+        int sink_stride, float * M, float * S);
+
 namespace {
 
 struct matrix_case {
@@ -74,6 +80,88 @@ bool run_case(const matrix_case & tc, bool report = true) {
     return true;
 }
 
+bool run_fa_case(int nq, int nk) {
+    constexpr int d = 256;
+
+    std::vector<float> q(static_cast<size_t>(nq)*d);
+    std::vector<ggml_bf16_t> k(static_cast<size_t>(nk)*d);
+    std::vector<ggml_bf16_t> v(static_cast<size_t>(nk)*d);
+    std::vector<ggml_fp16_t> mask(static_cast<size_t>(nq)*nk);
+    for (size_t i = 0; i < q.size(); ++i) {
+        q[i] = 0.25f*std::sin(0.013f*static_cast<float>(i));
+    }
+    for (size_t i = 0; i < k.size(); ++i) {
+        k[i] = ggml_fp32_to_bf16(0.25f*std::cos(0.007f*static_cast<float>(i)));
+        v[i] = ggml_fp32_to_bf16(std::sin(0.009f*static_cast<float>(i)));
+    }
+    for (int iq = 0; iq < nq; ++iq) {
+        const int visible = nk - (nq - 1 - iq)%17;
+        for (int ik = 0; ik < nk; ++ik) {
+            mask[static_cast<size_t>(iq)*nk + ik] =
+                ggml_fp32_to_fp16(ik < visible ? 0.0f : -INFINITY);
+        }
+    }
+
+    std::vector<float> avx(static_cast<size_t>(nq)*d);
+    std::vector<float> amx(static_cast<size_t>(nq)*d);
+    std::vector<float> avx_m(nq), avx_s(nq), amx_m(nq), amx_s(nq);
+    bool avx_handled = false;
+
+    // AMX availability is cached per thread. Run the forced-AVX reference on
+    // a disposable thread, then let the main thread exercise AMX normally.
+    setenv("GGML_AMX_FA_QK", "0", 1);
+    std::thread avx_worker([&] {
+        avx_handled = iqk_fa_256_256(GGML_TYPE_BF16, GGML_TYPE_BF16, nq, nk,
+            d*sizeof(float), d*sizeof(ggml_bf16_t), d*sizeof(ggml_bf16_t),
+            nk*sizeof(ggml_fp16_t), d, q.data(), k.data(), v.data(), mask.data(),
+            1.0f/std::sqrt(static_cast<float>(d)), 0.0f, avx.data(), nullptr, 0,
+            avx_m.data(), avx_s.data());
+    });
+    avx_worker.join();
+    unsetenv("GGML_AMX_FA_QK");
+
+    const bool amx_handled = iqk_fa_256_256(GGML_TYPE_BF16, GGML_TYPE_BF16, nq, nk,
+        d*sizeof(float), d*sizeof(ggml_bf16_t), d*sizeof(ggml_bf16_t),
+        nk*sizeof(ggml_fp16_t), d, q.data(), k.data(), v.data(), mask.data(),
+        1.0f/std::sqrt(static_cast<float>(d)), 0.0f, amx.data(), nullptr, 0,
+        amx_m.data(), amx_s.data());
+    if (!avx_handled || !amx_handled) {
+        std::fprintf(stderr, "flash attention rejected nq=%d, nk=%d\n", nq, nk);
+        return false;
+    }
+
+    double squared_error = 0.0;
+    double squared_reference = 0.0;
+    float max_abs_error = 0.0f;
+    for (size_t i = 0; i < avx.size(); ++i) {
+        if (!std::isfinite(avx[i]) || !std::isfinite(amx[i])) {
+            std::fprintf(stderr, "non-finite flash attention result at %zu\n", i);
+            return false;
+        }
+        const float error = amx[i] - avx[i];
+        max_abs_error = std::max(max_abs_error, std::abs(error));
+        squared_error += static_cast<double>(error)*error;
+        squared_reference += static_cast<double>(avx[i])*avx[i];
+    }
+    const double relative_rms = std::sqrt(squared_error/std::max(1.0e-30, squared_reference));
+
+    float max_stats_error = 0.0f;
+    for (int i = 0; i < nq; ++i) {
+        max_stats_error = std::max(max_stats_error, std::abs(amx_m[i] - avx_m[i]));
+        max_stats_error = std::max(max_stats_error, std::abs(amx_s[i] - avx_s[i]));
+    }
+    if (max_abs_error > 0.08f || relative_rms > 0.04 || max_stats_error > 1.0e-3f) {
+        std::fprintf(stderr,
+            "AMX flash attention mismatch for nq=%d, nk=%d: max_abs=%g, rel_rms=%g, stats=%g\n",
+            nq, nk, max_abs_error, relative_rms, max_stats_error);
+        return false;
+    }
+
+    std::printf("PASS AMX FA nq=%d, nk=%d, max_abs=%g, rel_rms=%g, stats=%g\n",
+        nq, nk, max_abs_error, relative_rms, max_stats_error);
+    return true;
+}
+
 int run_benchmark() {
     constexpr matrix_case tc = { 512, 128, 4096, 1 };
     std::mt19937 rng(0x9470cu);
@@ -122,5 +210,7 @@ int main(int argc, char ** argv) {
     for (const matrix_case & tc : cases) {
         if (!run_case(tc)) return 1;
     }
+    if (!run_fa_case(12, 64)) return 1; // q_step=16, k_step=64
+    if (!run_fa_case(30, 96)) return 1; // q_step=32, k_step=32
     return 0;
 }

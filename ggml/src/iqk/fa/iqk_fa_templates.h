@@ -17,6 +17,13 @@
 #include <type_traits>
 #include <vector>
 
+#if defined(GGML_AMX_BF16) && defined(__AMX_TILE__) && defined(__AMX_BF16__) && defined(__x86_64__)
+#include <cpuid.h>
+#include <cstdlib>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
+
 #include "ggml-impl.h"
 #include "ggml-quants.h"
 #include "iqk/iqk_quantize.h"
@@ -31,6 +38,60 @@
 // clang-format off
 
 namespace {
+
+#if defined(GGML_AMX_BF16) && defined(__AMX_TILE__) && defined(__AMX_BF16__) && defined(__x86_64__)
+
+struct fa_amx_tile_config {
+    uint8_t  palette_id;
+    uint8_t  start_row;
+    uint8_t  reserved[14];
+    uint16_t colsb[16];
+    uint8_t  rows[16];
+};
+
+static_assert(sizeof(fa_amx_tile_config) == 64, "AMX tile configuration must be 64 bytes");
+
+// XTILEDATA permission is per thread on Linux. Every NUMA worker therefore
+// performs this check once before entering the AMX flash-attention path.
+static bool fa_amx_bf16_runtime_available() {
+    static thread_local int available = -1;
+    if (available >= 0) {
+        return available != 0;
+    }
+
+    const char * disabled = std::getenv("GGML_AMX_DISABLE");
+    const char * fa_qk = std::getenv("GGML_AMX_FA_QK");
+    if ((disabled && disabled[0] != '\0' && disabled[0] != '0') ||
+        (fa_qk && (fa_qk[0] == '0' || std::strcmp(fa_qk, "off") == 0 || std::strcmp(fa_qk, "false") == 0))) {
+        available = 0;
+        return false;
+    }
+
+    unsigned int eax, ebx, ecx, edx;
+    constexpr unsigned int cpuid_amx_bf16 = 1u << 22;
+    constexpr unsigned int cpuid_amx_tile = 1u << 24;
+    if (!__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx) ||
+        (edx & (cpuid_amx_bf16 | cpuid_amx_tile)) != (cpuid_amx_bf16 | cpuid_amx_tile)) {
+        available = 0;
+        return false;
+    }
+
+    constexpr unsigned long arch_req_xcomp_perm = 0x1023;
+    constexpr unsigned long xfeature_xtiledata = 18;
+    available = syscall(SYS_arch_prctl, arch_req_xcomp_perm, xfeature_xtiledata) == 0;
+    return available != 0;
+}
+
+static bool fa_amx_pv_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("GGML_AMX_FA_PV");
+        return value == nullptr || value[0] == '\0' ||
+            (value[0] != '0' && std::strcmp(value, "off") != 0 && std::strcmp(value, "false") != 0);
+    }();
+    return enabled;
+}
+
+#endif
 
 // Compute effective K boundary by scanning ALL query rows (union-of-masks).
 // The original early-termination scanned only the last row, which is correct
@@ -1017,6 +1078,96 @@ struct FlashQKV {
         for (int i = 0; i < D/F16::block_size; ++i) F16::store(qkv_cache + F16::block_size*i, vq[i]);
     }
 
+#if defined(GGML_AMX_BF16) && defined(__AMX_TILE__) && defined(__AMX_BF16__) && defined(__x86_64__)
+    // AMX computes the PV half of attention as [query, K] x [K, value].
+    // The online-softmax probabilities are packed to BF16 once per K block;
+    // V remains in the canonical token-major cache and is paired in a small
+    // L1 scratch tile, so this path adds no persistent KV mirror.
+    inline void prepare_qkv_amx(int nq) {
+        if (nq < q_step) {
+            std::memset(qkv_cache + D*nq, 0, (q_step - nq)*D*sizeof(float));
+        }
+    }
+
+    template <typename VHelper, typename FMS>
+    inline void accumulate_qkv_amx(int nq, const VHelper& vh, const FMS& fms) {
+        static_assert(D == 256);
+        static_assert(q_step >= 16 && q_step <= 32);
+        static_assert(k_step % 32 == 0);
+
+        for (int j = 0; j < nq; ++j) {
+            float * R = qkv_cache + D*j;
+            if (fms.need_scaling[j] == 2) {
+                std::memset(R, 0, D*sizeof(float));
+            } else if (fms.need_scaling[j] == 1) {
+                const __m512 scale = _mm512_set1_ps(fms.vms[j]);
+                for (int i = 0; i < D; i += 16) {
+                    _mm512_storeu_ps(R + i, _mm512_mul_ps(scale, _mm512_loadu_ps(R + i)));
+                }
+            }
+        }
+        alignas(64) uint16_t prob[q_step*k_step];
+        for (int j = 0; j < nq; ++j) {
+            for (int k0 = 0; k0 < k_step; k0 += 32) {
+                const float * src = fms.cache + j*k_step + k0;
+                const __m512 lo = _mm512_loadu_ps(src + 0);
+                const __m512 hi = _mm512_loadu_ps(src + 16);
+                _mm512_store_si512((__m512i *) (prob + j*k_step + k0),
+                    (__m512i) _mm512_cvtne2ps_pbh(hi, lo));
+            }
+        }
+        if (nq < q_step) {
+            std::memset(prob + nq*k_step, 0, (q_step - nq)*k_step*sizeof(uint16_t));
+        }
+
+        constexpr int value_cols = 32;
+        alignas(64) uint16_t value_pairs[16*value_cols*2];
+        const bool have_q1 = nq > 16;
+        constexpr int c_stride = D*sizeof(float);
+        constexpr int a_stride = k_step*sizeof(uint16_t);
+        constexpr int b_stride = value_cols*2*sizeof(uint16_t);
+
+        for (int d0 = 0; d0 < D; d0 += value_cols) {
+            _tile_loadd(0, qkv_cache + d0, c_stride);
+            _tile_loadd(1, qkv_cache + d0 + 16, c_stride);
+            if (have_q1) {
+                _tile_loadd(2, qkv_cache + 16*D + d0, c_stride);
+                _tile_loadd(3, qkv_cache + 16*D + d0 + 16, c_stride);
+            }
+
+            for (int k0 = 0; k0 < k_step; k0 += 32) {
+                for (int kp = 0; kp < 16; ++kp) {
+                    const uint16_t * v0 = (const uint16_t *) (vh.block + (k0 + 2*kp + 0)*vh.stride) + d0;
+                    const uint16_t * v1 = (const uint16_t *) (vh.block + (k0 + 2*kp + 1)*vh.stride) + d0;
+                    uint16_t * dst = value_pairs + kp*value_cols*2;
+                    for (int d = 0; d < value_cols; ++d) {
+                        dst[2*d + 0] = v0[d];
+                        dst[2*d + 1] = v1[d];
+                    }
+                }
+
+                _tile_loadd(4, prob + k0, a_stride);
+                _tile_loadd(6, value_pairs, b_stride);
+                _tile_loadd(7, value_pairs + 16*2, b_stride);
+                _tile_dpbf16ps(0, 4, 6);
+                _tile_dpbf16ps(1, 4, 7);
+                if (have_q1) {
+                    _tile_loadd(5, prob + 16*k_step + k0, a_stride);
+                    _tile_dpbf16ps(2, 5, 6);
+                    _tile_dpbf16ps(3, 5, 7);
+                }
+            }
+
+            _tile_stored(0, qkv_cache + d0, c_stride);
+            _tile_stored(1, qkv_cache + d0 + 16, c_stride);
+            if (have_q1) {
+                _tile_stored(2, qkv_cache + 16*D + d0, c_stride);
+                _tile_stored(3, qkv_cache + 16*D + d0 + 16, c_stride);
+            }
+        }
+    }
+#endif
+
     // This fails for head sizes of 80 and 112 as D/16 is odd, so we cannot do steps of 2
     // Hence, for now, we will not handle head sizes of 80 and 112
     template <typename VHelper, typename FMS>
@@ -1572,7 +1723,7 @@ struct FlashAttn {
                     if constexpr (std::is_same_v<KHelper, HelperQ80>) {
 #if FA_TIMING
                         auto t1 = Perf::cur_time();
-                        HelperQ80R8<Dk, k_step> khr4(nk1, kh);
+                        HelperQ80R8<Dk> khr4(nk1, kh);
                         Perf::instance().accum(4, t1);
 #else
                         HelperQ80R8<Dk> khr4(nk1, kh);
@@ -1586,7 +1737,7 @@ struct FlashAttn {
                     if constexpr (std::is_same_v<KHelper, HelperQ8KV<Dk>>) {
 #if FA_TIMING
                         auto t1 = Perf::cur_time();
-                        HelperQ8KVR8<Dk, k_step> khr4(nk1, kh);
+                        HelperQ8KVR8<Dk> khr4(nk1, kh);
                         Perf::instance().accum(4, t1);
 #else
                         HelperQ8KVR8<Dk> khr4(nk1, kh);
@@ -1660,6 +1811,119 @@ struct FlashQKbf16 {
     static_assert(D%32 == 0 && D <= 576);
     static_assert(k_step%32 == 0);
     static_assert(q_step <= 4 || q_step%4 == 0);
+
+#if defined(GGML_AMX_BF16) && defined(__AMX_TILE__) && defined(__AMX_BF16__) && defined(__x86_64__)
+    constexpr static int amx_m = 16;
+    constexpr static int amx_n = 16;
+    constexpr static int amx_k = 32;
+    constexpr static int amx_b_rows = amx_k/2;
+    constexpr static int amx_q_groups = (q_step + amx_n - 1)/amx_n;
+    constexpr static int amx_k_groups = D/amx_k;
+    constexpr static int amx_b_block_u16 = amx_b_rows*amx_n*2;
+
+    struct amx_q_storage {
+        // B is stored in AMX BF16 pair order: [K/2][N][2]. Keeping a
+        // fixed 16-column stride lets partial query groups reuse one config.
+        alignas(64) uint16_t data[amx_q_groups*amx_k_groups*amx_b_block_u16];
+    };
+
+    static bool amx_begin(int nq, const ggml_bf16_t * q, amx_q_storage& packed) {
+        // The fused Qwen MTP/GQA path has 12--30 rows. Larger prefill tiles
+        // need a different register schedule and remain on AVX-512 BF16.
+        if constexpr (D != 256 || q_step < 16) {
+            return false;
+        }
+        if (nq < 8 || nq > 32 || !fa_amx_bf16_runtime_available()) {
+            return false;
+        }
+
+        std::memset(packed.data, 0, sizeof(packed.data));
+        const int n_groups = (nq + amx_n - 1)/amx_n;
+        for (int ng = 0; ng < n_groups; ++ng) {
+            const int this_n = std::min(amx_n, nq - ng*amx_n);
+            for (int kb = 0; kb < amx_k_groups; ++kb) {
+                uint16_t * block = packed.data +
+                    (ng*amx_k_groups + kb)*amx_b_block_u16;
+                for (int ik = 0; ik < amx_b_rows; ++ik) {
+                    for (int in = 0; in < this_n; ++in) {
+                        const ggml_bf16_t * qr = q + (ng*amx_n + in)*D + kb*amx_k;
+                        block[(ik*amx_n + in)*2 + 0] = qr[2*ik + 0].bits;
+                        block[(ik*amx_n + in)*2 + 1] = qr[2*ik + 1].bits;
+                    }
+                }
+            }
+        }
+
+        alignas(64) fa_amx_tile_config config = {};
+        config.palette_id = 1;
+        for (int tile = 0; tile < 8; ++tile) {
+            config.rows[tile] = amx_m;
+            config.colsb[tile] = 64;
+        }
+        _tile_loadconfig(&config);
+        return true;
+    }
+
+    template <typename KHelper>
+    static inline void multiply_mask_kq_amx(const KHelper& kh, int nq, int stride_m,
+            const amx_q_storage& packed, const char * mask, FlashMS<q_step, k_step>& fms) {
+        alignas(64) float result[32*32];
+        const bool have_n1 = nq > amx_n;
+
+        for (int m0 = 0; m0 < k_step; m0 += 2*amx_m) {
+            _tile_zero(0);
+            _tile_zero(2);
+            if (have_n1) {
+                _tile_zero(1);
+                _tile_zero(3);
+            }
+
+            for (int kb = 0; kb < amx_k_groups; ++kb) {
+                const char * a0 = kh.block + static_cast<size_t>(m0 + 0)*kh.stride +
+                    static_cast<size_t>(kb*amx_k)*sizeof(uint16_t);
+                const char * a1 = kh.block + static_cast<size_t>(m0 + amx_m)*kh.stride +
+                    static_cast<size_t>(kb*amx_k)*sizeof(uint16_t);
+                const uint16_t * b0 = packed.data + kb*amx_b_block_u16;
+                _tile_loadd(4, a0, kh.stride);
+                _tile_loadd(5, a1, kh.stride);
+                _tile_loadd(6, b0, amx_n*2*sizeof(uint16_t));
+                _tile_dpbf16ps(0, 4, 6);
+                _tile_dpbf16ps(2, 5, 6);
+                if (have_n1) {
+                    const uint16_t * b1 = packed.data +
+                        amx_k_groups*amx_b_block_u16 + kb*amx_b_block_u16;
+                    _tile_loadd(7, b1, amx_n*2*sizeof(uint16_t));
+                    _tile_dpbf16ps(1, 4, 7);
+                    _tile_dpbf16ps(3, 5, 7);
+                }
+            }
+
+            _tile_stored(0, result + 0*32 + 0, 32*sizeof(float));
+            _tile_stored(2, result + amx_m*32 + 0, 32*sizeof(float));
+            if (have_n1) {
+                _tile_stored(1, result + 0*32 + amx_n, 32*sizeof(float));
+                _tile_stored(3, result + amx_m*32 + amx_n, 32*sizeof(float));
+            }
+
+            // AMX produces [K token][query], while FlashMS is query-major.
+            // This is only a 32x(<=32) L1-resident transpose per K block.
+            for (int j = 0; j < nq; ++j) {
+                for (int l = 0; l < 2*amx_m; ++l) {
+                    fms.cache[j*k_step + m0 + l] = result[l*32 + j];
+                }
+            }
+        }
+
+        F16::Data vk[k_step/F16::block_size];
+        for (int j = 0; j < nq; ++j) {
+            fms.update_M_S(j, vk, mask + stride_m*j);
+        }
+    }
+
+    static inline void amx_end() {
+        _tile_release();
+    }
+#endif
 
     static inline void mult_mask_kq_one(int l1, int m1, int stride_q, int stride_m, const float * q, const char * mask,
             __m512bh * qv, const __m512bh * vkh, FlashMS<q_step, k_step>& fms) {
@@ -1980,6 +2244,9 @@ struct FlashAttnBF16 {
     void compute(KHelper& kh, VHelper& vh, int nq1, int nk1, int stride_q, int stride_m, int stride_qkv,
             const float * q, const char * mask, float * qkv, [[maybe_unused]] float * M, [[maybe_unused]] float * S) {
         ggml_bf16_t q_bf16[q_step*Dk];
+#if defined(GGML_AMX_BF16) && defined(__AMX_TILE__) && defined(__AMX_BF16__) && defined(__x86_64__)
+        typename FlashQKbf16<Dk, q_step, k_step>::amx_q_storage q_amx;
+#endif
 #if FA_TIMING
         Perf perf(false);
 #endif
@@ -1991,27 +2258,68 @@ struct FlashAttnBF16 {
             kh.reset_block();
             vh.reset_block();
             FlashQKbf16<Dk, q_step, k_step>::convert(stride_q, q, q_bf16);
+#if defined(GGML_AMX_BF16) && defined(__AMX_TILE__) && defined(__AMX_BF16__) && defined(__x86_64__)
+            const bool use_amx = FlashQKbf16<Dk, q_step, k_step>::amx_begin(q_step, q_bf16, q_amx);
+            bool use_amx_pv = false;
+            if constexpr (Dk == 256 && Dv == 256 && q_step >= 16 && q_step <= 32) {
+                use_amx_pv = use_amx && fa_amx_pv_enabled();
+                if (use_amx_pv) {
+                    fqkv.prepare_qkv_amx(q_step);
+                }
+            }
+#endif
 #if FA_TIMING
             perf.accum_nolock(0, t1);
 #endif
             auto mr = mask;
             int nk1_eff = mask_effective_nk1(mr, q_step, stride_m, nk1, k_step);
             for (int k1 = 0; k1 < nk1_eff/k_step; ++k1) {
+#if defined(GGML_AMX_BF16) && defined(__AMX_TILE__) && defined(__AMX_BF16__) && defined(__x86_64__)
+                if (use_amx) {
 #if FA_TIMING
-                //t1 = Perf::cur_time();
-                FlashQKbf16<Dk, q_step, k_step>::multiply_mask_kq(kh, stride_m, q_bf16, mr, fms, perf);
-                //perf.accum_nolock(1, t1);
-                t1 = Perf::cur_time();
-                fqkv.accumulate_qkv(vh, fms);
-                perf.accum_nolock(3, t1);
+                    t1 = Perf::cur_time();
+#endif
+                    FlashQKbf16<Dk, q_step, k_step>::multiply_mask_kq_amx(
+                        kh, q_step, stride_m, q_amx, mr, fms);
+#if FA_TIMING
+                    perf.accum_nolock(1, t1);
+#endif
+                } else
+#endif
+                {
+#if FA_TIMING
+                    FlashQKbf16<Dk, q_step, k_step>::multiply_mask_kq(kh, stride_m, q_bf16, mr, fms, perf);
 #else
-                FlashQKbf16<Dk, q_step, k_step>::multiply_mask_kq(kh, stride_m, q_bf16, mr, fms);
-                fqkv.accumulate_qkv(vh, fms);
+                    FlashQKbf16<Dk, q_step, k_step>::multiply_mask_kq(kh, stride_m, q_bf16, mr, fms);
+#endif
+                }
+#if FA_TIMING
+                t1 = Perf::cur_time();
+#endif
+#if defined(GGML_AMX_BF16) && defined(__AMX_TILE__) && defined(__AMX_BF16__) && defined(__x86_64__)
+                if constexpr (Dk == 256 && Dv == 256 && q_step >= 16 && q_step <= 32) {
+                    if (use_amx_pv) {
+                        fqkv.accumulate_qkv_amx(q_step, vh, fms);
+                    } else {
+                        fqkv.accumulate_qkv(vh, fms);
+                    }
+                } else
+#endif
+                {
+                    fqkv.accumulate_qkv(vh, fms);
+                }
+#if FA_TIMING
+                perf.accum_nolock(3, t1);
 #endif
                 kh.next_block(k_step);
                 vh.next_block(k_step);
                 mr += k_step*sizeof(ggml_half);
             }
+#if defined(GGML_AMX_BF16) && defined(__AMX_TILE__) && defined(__AMX_BF16__) && defined(__x86_64__)
+            if (use_amx) {
+                FlashQKbf16<Dk, q_step, k_step>::amx_end();
+            }
+#endif
 #if FA_TIMING
             t1 = Perf::cur_time();
 #endif
@@ -2032,14 +2340,48 @@ struct FlashAttnBF16 {
             kh.reset_block();
             vh.reset_block();
             FlashQKbf16<Dk, q_step, k_step>::convert(n_left, stride_q, q, q_bf16);
+#if defined(GGML_AMX_BF16) && defined(__AMX_TILE__) && defined(__AMX_BF16__) && defined(__x86_64__)
+            const bool use_amx = FlashQKbf16<Dk, q_step, k_step>::amx_begin(n_left, q_bf16, q_amx);
+            bool use_amx_pv = false;
+            if constexpr (Dk == 256 && Dv == 256 && q_step >= 16 && q_step <= 32) {
+                use_amx_pv = use_amx && fa_amx_pv_enabled();
+                if (use_amx_pv) {
+                    fqkv.prepare_qkv_amx(n_left);
+                }
+            }
+#endif
             auto mr = mask;
             for (int k1 = 0; k1 < nk1/k_step; ++k1) {
+#if defined(GGML_AMX_BF16) && defined(__AMX_TILE__) && defined(__AMX_BF16__) && defined(__x86_64__)
+                if (use_amx) {
+                    FlashQKbf16<Dk, q_step, k_step>::multiply_mask_kq_amx(
+                        kh, n_left, stride_m, q_amx, mr, fms);
+                } else
+#endif
+                {
                 FlashQKbf16<Dk, q_step, k_step>::multiply_mask_kq(n_left, kh, stride_m, q_bf16, mr, fms);
-                fqkv.accumulate_qkv(n_left, vh, fms);
+                }
+#if defined(GGML_AMX_BF16) && defined(__AMX_TILE__) && defined(__AMX_BF16__) && defined(__x86_64__)
+                if constexpr (Dk == 256 && Dv == 256 && q_step >= 16 && q_step <= 32) {
+                    if (use_amx_pv) {
+                        fqkv.accumulate_qkv_amx(n_left, vh, fms);
+                    } else {
+                        fqkv.accumulate_qkv(n_left, vh, fms);
+                    }
+                } else
+#endif
+                {
+                    fqkv.accumulate_qkv(n_left, vh, fms);
+                }
                 kh.next_block(k_step);
                 vh.next_block(k_step);
                 mr += k_step*sizeof(ggml_half);
             }
+#if defined(GGML_AMX_BF16) && defined(__AMX_TILE__) && defined(__AMX_BF16__) && defined(__x86_64__)
+            if (use_amx) {
+                FlashQKbf16<Dk, q_step, k_step>::amx_end();
+            }
+#endif
             fqkv.normalize_and_store(fms, n_left, stride_qkv, qkv, sinkf, sink_stride, M, S);
         }
 #if FA_TIMING

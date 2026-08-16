@@ -99,7 +99,7 @@ inline bool numa_fa_batch_queries_eligible(const ggml_tensor * dst, int nth) {
     const int n_queries = dst->src[0]->ne[1];
     const int gqa = Q->ne[2]/K->ne[2];
     return numa_fa_eligible(dst, nth) && numa_fa_batch_queries_enabled() &&
-        n_queries >= 2 && n_queries <= 5 && Q->ne[2] == 24 &&
+        n_queries >= 1 && n_queries <= 5 && Q->ne[2] == 24 &&
         K->ne[2] == 4 && gqa == 6;
 }
 
@@ -435,12 +435,12 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
             last  = std::min(last,  nek1);
         };
 
-        // MTP verifies 2--5 query tokens at once. Pack the six GQA queries for
-        // each KV head next to one another, then let every node-local worker
-        // scan one thirteenth of that node's K/V exactly once. The cold range
-        // precedes every query token, so all packed queries share the same
-        // unmasked cold-mask row.
-        if (numa_fa_batch_queries_enabled() && neq1 >= 2 && neq1 <= 5 &&
+        // Pack the six GQA queries for single-token decode or a 2--5 token MTP
+        // verification batch next to one another, then let every node-local
+        // worker scan one thirteenth of that node's K/V exactly once. The cold
+        // range precedes every query token, so all packed queries share the
+        // same unmasked cold-mask row.
+        if (numa_fa_batch_queries_enabled() && neq1 >= 1 && neq1 <= 5 &&
                 neq2 == 24 && nek2 == 4 && rk2 == 6) {
             const int n_queries = neq1*rk2;
             const int n_chunks = local_nth;

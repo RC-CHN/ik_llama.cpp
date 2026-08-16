@@ -1802,9 +1802,9 @@ static bool llama_kv_cache_init(
 
             if (hybrid_kv_cold && cache.hybrid_hot_size > 0) {
                 ggml_context * hot_ctx = ctx_map.at(model.buft_layer[i].buft);
-                ggml_tensor * k_hot = ggml_new_tensor_2d(hot_ctx, GGML_TYPE_F16,
+                ggml_tensor * k_hot = ggml_new_tensor_2d(hot_ctx, type_k,
                         n_embd_head_k, n_head_kv*cache.hybrid_hot_size);
-                ggml_tensor * v_hot = ggml_new_tensor_1d(hot_ctx, GGML_TYPE_F16,
+                ggml_tensor * v_hot = ggml_new_tensor_1d(hot_ctx, type_v,
                         int64_t(n_embd_v_row)*cache.hybrid_hot_size);
                 ggml_format_name(k_hot, "cache_k_hot_l%d", i);
                 ggml_format_name(v_hot, "cache_v_hot_l%d", i);
@@ -8576,8 +8576,8 @@ struct llama_context * llama_init_from_model(
         return nullptr;
 #endif
         const bool cache_types_supported =
-            (params.type_k == GGML_TYPE_F16 || params.type_k == GGML_TYPE_BF16) &&
-            (params.type_v == GGML_TYPE_F16 || params.type_v == GGML_TYPE_BF16);
+            (params.type_k == GGML_TYPE_F16 || params.type_k == GGML_TYPE_BF16 || params.type_k == GGML_TYPE_Q8_0) &&
+            (params.type_v == GGML_TYPE_F16 || params.type_v == GGML_TYPE_BF16 || params.type_v == GGML_TYPE_Q8_0);
         if (model->arch != LLM_ARCH_QWEN35) {
             LLAMA_LOG_ERROR("%s: --hybrid-kv currently supports only Qwen3.5 dense models\n", __func__);
             llama_free(ctx);
@@ -8600,7 +8600,16 @@ struct llama_context * llama_init_from_model(
             return nullptr;
         }
         if (!cache_types_supported) {
-            LLAMA_LOG_ERROR("%s: --hybrid-kv currently requires f16 or bf16 K/V cache types\n", __func__);
+            LLAMA_LOG_ERROR("%s: --hybrid-kv currently requires f16, bf16, or q8_0 K/V cache types\n", __func__);
+            llama_free(ctx);
+            return nullptr;
+        }
+        const uint32_t numa_shards = ggml_numa_node_count();
+        if (ggml_numa_row_shard_enabled() && ggml_numa_exact_pin_enabled() && numa_shards > 1 &&
+                (cparams.n_threads % numa_shards != 0 || cparams.n_threads_batch % numa_shards != 0)) {
+            LLAMA_LOG_ERROR("%s: row-sharded --hybrid-kv requires generation and batch thread counts "
+                    "to be multiples of the %u NUMA shards (requested %u/%u)\n", __func__, numa_shards,
+                    cparams.n_threads, cparams.n_threads_batch);
             llama_free(ctx);
             return nullptr;
         }
