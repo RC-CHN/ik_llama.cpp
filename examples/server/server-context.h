@@ -366,6 +366,8 @@ struct server_context {
 
     void add_sampled_tokens();
 
+    void align_parallel_mtp_drafts();
+
     void batch_pending_prompt(const int32_t n_ubatch, const int32_t n_batch,  int32_t & batch_type);
 
     void process_batch_tokens(int32_t & n_batch);

@@ -80,6 +80,11 @@ static bool server_speculative_requires_single_slot(const common_params_speculat
     return spec.has_stage_chain();
 }
 
+static bool server_speculative_is_pure_mtp(const common_params_speculative & spec) {
+    const auto stages = spec.get_resolved_stages();
+    return stages.size() == 1 && stages.front().type == COMMON_SPECULATIVE_TYPE_MTP;
+}
+
 static bool server_speculative_same_stage_types(
         const common_params_speculative & lhs,
         const common_params_speculative & rhs) {
@@ -215,9 +220,17 @@ bool server_context::load_model(const gpt_params& params_) {
     add_bos_token = llama_should_add_bos_token(model);
     has_eos_token = llama_add_eos_token(model) != 1;
 
-    common_speculative_prepare_startup(params_base, false);
+    // Qwen3.5 hybrid KV uses per-sequence recurrent state and the rectangular
+    // sequence x MTP-depth verification path. Keep other speculative chains
+    // behind the existing single-slot guard until they have equivalent state
+    // isolation guarantees.
+    const bool allow_parallel_mtp = params_base.hybrid_kv &&
+        server_speculative_is_pure_mtp(params_base.speculative);
+    common_speculative_prepare_startup(params_base, allow_parallel_mtp);
 
-    if (server_speculative_requires_single_slot(params_base.speculative) && params_base.n_parallel > 1) {
+    if (!allow_parallel_mtp &&
+            server_speculative_requires_single_slot(params_base.speculative) &&
+            params_base.n_parallel > 1) {
         LOG_ERROR("Speculative decoding is currently limited to a single server slot (-np 1).\n", {
             {"n_parallel", params_base.n_parallel},
         });
@@ -3607,6 +3620,138 @@ void server_context::add_sampled_tokens() {
     }
 }
 
+void server_context::align_parallel_mtp_drafts() {
+    if (!params_base.hybrid_kv || !server_speculative_is_pure_mtp(params_base.speculative)) {
+        return;
+    }
+
+    // Per-step recurrent checkpoints are captured by one sequence-major
+    // rectangle. Per-slot MTP autotuning can otherwise produce runs such as
+    // [seq0 x 3][seq1 x 5], which the decoder must split and whose second
+    // graph would overwrite the first graph's checkpoint rows.
+    std::vector<size_t> active;
+    active.reserve(slots.size());
+    for (size_t i = 0; i < slots.size(); ++i) {
+        const auto & slot = slots[i];
+        if (slot.state == SLOT_STATE_PROCESSING && !slot.drafted.empty() &&
+                slot.i_batch_dft.size() == slot.drafted.size() + 1) {
+            active.push_back(i);
+        }
+    }
+
+    if (active.size() < 2) {
+        return;
+    }
+
+    // A rectangular recurrent graph views one contiguous range of state
+    // rows. Pick the largest contiguous active-slot run. Slots outside that
+    // run remain speculative root-only for this iteration, so their MTP
+    // hidden state is still committed from the target output.
+    size_t best_begin = 0;
+    size_t best_end = 1;
+    size_t best_min_depth = slots[active[0]].drafted.size();
+    for (size_t begin = 0; begin < active.size();) {
+        size_t end = begin + 1;
+        size_t min_depth = slots[active[begin]].drafted.size();
+        while (end < active.size() &&
+                slots[active[end]].id == slots[active[end - 1]].id + 1) {
+            min_depth = std::min(min_depth, slots[active[end]].drafted.size());
+            ++end;
+        }
+
+        const size_t run_size = end - begin;
+        const size_t best_size = best_end - best_begin;
+        if (run_size > best_size || (run_size == best_size && min_depth > best_min_depth)) {
+            best_begin = begin;
+            best_end = end;
+            best_min_depth = min_depth;
+        }
+        begin = end;
+    }
+
+    std::vector<size_t> desired_depth(slots.size(), 0);
+    for (size_t i = best_begin; i < best_end; ++i) {
+        desired_depth[active[i]] = best_min_depth;
+    }
+
+    const int32_t old_n_tokens = batch.n_tokens;
+    std::vector<uint8_t> remove(old_n_tokens, 0);
+    bool changed = false;
+
+    for (size_t i : active) {
+        auto & slot = slots[i];
+        const size_t old_depth = slot.drafted.size();
+        const size_t keep_depth = desired_depth[i];
+        if (keep_depth >= old_depth) {
+            continue;
+        }
+
+        changed = true;
+        for (size_t depth = keep_depth; depth < old_depth; ++depth) {
+            const int32_t index = slot.i_batch_dft[depth + 1];
+            if (index >= 0 && index < old_n_tokens) {
+                remove[index] = 1;
+            }
+            if (depth < slot.n_draft_by_depth.size()) {
+                GGML_ASSERT(slot.n_draft_by_depth[depth] > 0);
+                --slot.n_draft_by_depth[depth];
+            }
+        }
+
+        const int32_t n_removed = (int32_t) (old_depth - keep_depth);
+        GGML_ASSERT(slot.n_draft_total >= n_removed);
+        slot.n_draft_total -= n_removed;
+        slot.cache_tokens.keep_first(slot.cache_tokens.n_tokens() - n_removed);
+        slot.drafted.resize(keep_depth);
+        slot.i_batch_dft.resize(keep_depth + 1);
+        slot.n_past = slot.cache_tokens.n_tokens();
+        SLT_DBG(slot, "parallel MTP rectangle aligned draft depth %d -> %d\n",
+                (int) old_depth, (int) keep_depth);
+    }
+
+    if (!changed) {
+        return;
+    }
+
+    GGML_ASSERT(batch.token != nullptr);
+    std::vector<int32_t> remap(old_n_tokens, -1);
+    int32_t write = 0;
+    for (int32_t read = 0; read < old_n_tokens; ++read) {
+        if (remove[read]) {
+            continue;
+        }
+        if (write != read) {
+            batch.token[write] = batch.token[read];
+            if (batch.pos != nullptr) {
+                batch.pos[write] = batch.pos[read];
+            }
+            if (batch.n_seq_id != nullptr) {
+                batch.n_seq_id[write] = batch.n_seq_id[read];
+            }
+            if (batch.seq_id != nullptr) {
+                for (int32_t seq = 0; seq < batch.n_seq_id[read]; ++seq) {
+                    batch.seq_id[write][seq] = batch.seq_id[read][seq];
+                }
+            }
+            if (batch.logits != nullptr) {
+                batch.logits[write] = batch.logits[read];
+            }
+        }
+        remap[read] = write++;
+    }
+    batch.n_tokens = write;
+
+    for (auto & slot : slots) {
+        if (slot.i_batch >= 0 && slot.i_batch < old_n_tokens) {
+            slot.i_batch = remap[slot.i_batch];
+        }
+        for (int32_t & index : slot.i_batch_dft) {
+            GGML_ASSERT(index >= 0 && index < old_n_tokens && remap[index] >= 0);
+            index = remap[index];
+        }
+    }
+}
+
 // Verifies that a restored checkpoint reaches the expected cache position.
 // Logs via SLT_ERR with an optional label prefix (e.g. "DSV4 ").
 // Returns true if the position matches.
@@ -4889,6 +5034,7 @@ void server_context::update_slots() {
 
     // first, add sampled tokens from any ongoing sequences
     add_sampled_tokens(); // Prepare batch for inference
+    align_parallel_mtp_drafts();
 
     // process in chunks of params.n_batch
     int32_t n_batch = llama_n_batch(ctx);
@@ -4916,6 +5062,7 @@ void server_context::update_slots() {
 
     if (common_speculative_needs_checkpoint(model)) {
         const int ckpt_mode = params_base.speculative.spec_ckpt_mode;
+        llama_spec_ckpt_begin_batch(ctx);
 
         // Remove draft rows if checkpoint setup fails, otherwise rejection is unsafe.
         auto make_root_only = [&](server_slot & slot) {
@@ -4924,6 +5071,7 @@ void server_context::update_slots() {
             }
 
             const int32_t root_index = slot.i_batch_dft.front();
+            const int32_t n_removed = (int32_t) slot.drafted.size();
             const int32_t old_n_tokens = batch.n_tokens;
             std::vector<uint8_t> remove(old_n_tokens, 0);
             for (size_t i = 1; i < slot.i_batch_dft.size(); ++i) {
@@ -4933,6 +5081,19 @@ void server_context::update_slots() {
                 }
             }
 
+            GGML_ASSERT(slot.n_draft_total >= n_removed);
+            slot.n_draft_total -= n_removed;
+            for (size_t depth = 0; depth < slot.drafted.size(); ++depth) {
+                GGML_ASSERT(depth < slot.n_draft_by_depth.size());
+                GGML_ASSERT(slot.n_draft_by_depth[depth] > 0);
+                --slot.n_draft_by_depth[depth];
+            }
+
+            slot.cache_tokens.keep_first(slot.cache_tokens.n_tokens() - n_removed);
+            slot.drafted.clear();
+            slot.i_batch_dft.clear();
+            slot.i_batch = root_index;
+
             std::vector<int32_t> remap(old_n_tokens, -1);
             int32_t write = 0;
             for (int32_t read = 0; read < old_n_tokens; ++read) {
@@ -4941,23 +5102,36 @@ void server_context::update_slots() {
                 }
                 if (write != read) {
                     batch.token[write] = batch.token[read];
-                    batch.pos[write] = batch.pos[read];
-                    batch.n_seq_id[write] = batch.n_seq_id[read];
-                    for (size_t seq = 0; seq < batch.n_seq_id[read]; ++seq) {
-                        batch.seq_id[write][seq] = batch.seq_id[read][seq];
+                    if (batch.pos != nullptr) {
+                        batch.pos[write] = batch.pos[read];
                     }
-                    batch.logits[write] = batch.logits[read];
+                    if (batch.n_seq_id != nullptr) {
+                        batch.n_seq_id[write] = batch.n_seq_id[read];
+                    }
+                    if (batch.seq_id != nullptr) {
+                        for (int32_t seq = 0; seq < batch.n_seq_id[read]; ++seq) {
+                            batch.seq_id[write][seq] = batch.seq_id[read][seq];
+                        }
+                    }
+                    if (batch.logits != nullptr) {
+                        batch.logits[write] = batch.logits[read];
+                    }
                 }
                 remap[read] = write++;
             }
             batch.n_tokens = write;
 
-            if (root_index >= 0 && root_index < old_n_tokens) {
-                slot.i_batch = remap[root_index];
+            for (auto & remap_slot : slots) {
+                if (remap_slot.i_batch >= 0 && remap_slot.i_batch < old_n_tokens) {
+                    GGML_ASSERT(remap[remap_slot.i_batch] >= 0);
+                    remap_slot.i_batch = remap[remap_slot.i_batch];
+                }
+                for (int32_t & index : remap_slot.i_batch_dft) {
+                    GGML_ASSERT(index >= 0 && index < old_n_tokens && remap[index] >= 0);
+                    index = remap[index];
+                }
             }
-            slot.cache_tokens.keep_first(slot.cache_tokens.n_tokens() - (int32_t) slot.drafted.size());
-            slot.drafted.clear();
-            slot.i_batch_dft.clear();
+
             slot.n_past = slot.cache_tokens.n_tokens();
             slot.spec_target_only = false;
             SLT_WRN(slot, "%s", "spec checkpoint unavailable; removed draft rows and continuing root-only\n");

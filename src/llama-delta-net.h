@@ -8,6 +8,10 @@ struct delta_net {
     delta_net(llama_context & lctx, const llama_batch & batch);
     ~delta_net();
 
+    int32_t batch_recurrent_state_slots() const {
+        return rectangular_n_seqs > 1 ? rectangular_n_seqs : 1;
+    }
+
     // Used for speculative decoding to enable per-step state checkpoint restoration.
     bool save_per_step_states = false;
 
@@ -19,7 +23,8 @@ struct delta_net {
 
     ggml_tensor * build_layer_attn_linear_core(ggml_context * ctx0, ggml_cgraph * gf,
             ggml_tensor * cur, ggml_tensor * inp_s_seq_qnext, ggml_tensor * inp_out_ids,
-            uint32_t state_seq_id_local, bool reset_state_local, int il, const llm_build_cb & cb) const;
+            uint32_t state_seq_id_local, bool reset_state_local, int64_t n_seqs_local,
+            int il, const llm_build_cb & cb) const;
 
     ggml_tensor * build_layer_attn_linear(ggml_context * ctx0, ggml_cgraph * gf,
             ggml_tensor * cur, ggml_tensor * inp_out_ids, int il, const llm_build_cb & cb) const;
@@ -34,6 +39,9 @@ private:
     std::vector<llama_seq_id> token_seq_ids;
     bool all_same_seq;
     bool has_unique_seq_ids;
+    int32_t rectangular_n_seqs = 0;
+    int32_t rectangular_tokens_per_seq = 0;
+    llama_seq_id rectangular_first_seq = 0;
 
     static std::pair<ggml_tensor *, ggml_tensor *> build_qkvz(llama_context & lctx, ggml_context * ctx0,
             ggml_tensor * wqkv, ggml_tensor * wqkv_gate, ggml_tensor * input, int il, const llm_build_cb & cb,

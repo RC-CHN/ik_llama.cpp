@@ -866,6 +866,10 @@ extern "C" {
     // Initialise the checkpoint system for the upcoming speculation window.
     LLAMA_API int llama_spec_ckpt_init(struct llama_context * ctx, int mode, int max_tokens);
 
+    // Start a decode batch and restrict per-step checkpoint capture to
+    // sequences subsequently registered by llama_spec_ckpt_save().
+    LLAMA_API void llama_spec_ckpt_begin_batch(struct llama_context * ctx);
+
     // Save the current recurrent state as a speculative checkpoint.
     LLAMA_API bool llama_spec_ckpt_save(struct llama_context * ctx, llama_seq_id seq_id);
 

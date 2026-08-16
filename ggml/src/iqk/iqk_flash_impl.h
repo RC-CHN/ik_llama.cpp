@@ -17,7 +17,7 @@ bool iqk_flash_attn_impl(int type_k,             // type of k
                          int stride_q,           // distance between q columns in bytes
                          int stride_k,           // distance between k rows in bytes
                          int stride_v,           // distance between v rows in bytes
-                         int stride_m,           // distance between mask rows (in bytes
+                         int stride_m,           // distance between mask rows in bytes; negative repeats each row for six GQA queries
                          int stride_qkv,         // distance between rows in mask (in bytes)
                          const float * q,        // q matrix.
                          const void  * k,        // k matrix. Assumed to be fp16, nq x nk elements

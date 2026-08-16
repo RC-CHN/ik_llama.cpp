@@ -2484,6 +2484,13 @@ bool common_speculative_checkpoint_restore(
     }
 
     const int step = (int) ids.size() - 1;
+    if (ckpt.mode == LLAMA_SPEC_CKPT_PER_STEP &&
+            llama_spec_ckpt_init(ctx, ckpt.mode, n_draft + 1) == LLAMA_SPEC_CKPT_NONE) {
+        LOG_ERR("%s: seq_id=%d failed to reselect per-step checkpoint storage\n",
+                __func__, (int) seq_id);
+        common_speculative_checkpoint_discard(ckpt, ctx);
+        return false;
+    }
     const enum llama_spec_ckpt_restore_result restore_result = llama_spec_ckpt_restore_ex(
             ctx, seq_id, ckpt.n_past, ckpt.mode == LLAMA_SPEC_CKPT_PER_STEP ? step : 0);
     if (restore_result == LLAMA_SPEC_CKPT_RESTORE_FAILED) {

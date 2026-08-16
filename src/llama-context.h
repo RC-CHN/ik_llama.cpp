@@ -180,7 +180,12 @@ struct llama_kv_cache {
         std::vector<std::vector<ggml_tensor *>> per_step_conv;
 
         int32_t per_step_n_tokens = 0;
+        int32_t per_step_n_seqs = 0;
+        std::vector<llama_seq_id> per_step_seq_ids;
+        bool per_step_capture_filter_active = false;
+        std::vector<llama_seq_id> per_step_capture_seq_ids;
         int32_t per_step_max_allocated = 0;
+        int32_t per_step_max_seqs_allocated = 0;
         int64_t per_step_ssm_state_size = 0;
         int64_t per_step_conv_state_dim = 0;
         int64_t per_step_conv_dim = 0;
@@ -260,7 +265,13 @@ struct llama_kv_cache {
             per_step_bufs.clear();
             per_step_ssm.clear();
             per_step_conv.clear();
+            per_step_seq_ids.clear();
+            per_step_capture_seq_ids.clear();
+            per_step_capture_filter_active = false;
+            per_step_n_tokens = 0;
+            per_step_n_seqs = 0;
             per_step_max_allocated = 0;
+            per_step_max_seqs_allocated = 0;
         }
 
         ~gpu_checkpoint() {
@@ -277,8 +288,9 @@ struct llama_kv_cache {
     void checkpoint_delete();
 
     // Per-step checkpoint: allocate, restore step k's full state (SSM + conv) to cache
-    bool per_step_alloc(const llama_model & model, int max_tokens);
-    bool per_step_restore(const llama_model & model, ggml_backend_sched_t sched, int step);
+    bool per_step_alloc(const llama_model & model, int max_tokens, int max_seqs);
+    bool per_step_restore(const llama_model & model, ggml_backend_sched_t sched,
+            int step, llama_seq_id seq_id);
 
     ~llama_kv_cache() {
         for (struct ggml_context * ctx : ctxs) {
@@ -664,6 +676,10 @@ struct llama_context {
     struct CacheCopy {
         ggml_tensor * cpy = nullptr;
         size_t        step = 0;
+        // Source-token offset used by split hybrid-hot copies. Graph reuse can
+        // patch the destination address, but a different source slice requires
+        // rebuilding the graph.
+        int32_t       src_token = 0;
     };
     std::vector<CacheCopy> cache_copies;
     std::vector<CacheCopy> hybrid_cache_copies;

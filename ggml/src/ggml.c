@@ -11035,7 +11035,6 @@ struct ggml_tensor * ggml_ssm_conv(
     GGML_ASSERT(sq->ne[1] == n_tokens);
 
     if (saved_steps) {
-        GGML_ASSERT(n_kv == 1);
         GGML_ASSERT(saved_steps->type == GGML_TYPE_F32);
         GGML_ASSERT(ggml_nelements(saved_steps) >= (d_conv - 1)*d_inner*n_tokens);
     }
@@ -23735,7 +23734,6 @@ static int ggml_compute_forward_ssm_conv_f32(
     const int n_kv = src0->ne[2]; // max number of sequences in the batch
 
     if (src4) {
-        GGML_ASSERT(n_kv == 1);
         GGML_ASSERT(src4->type == GGML_TYPE_F32);
         GGML_ASSERT(ggml_nelements(src4) >= (nc - 1)*nr*n_t);
     }

@@ -99,12 +99,18 @@ inline bool numa_fa_batch_queries_eligible(const ggml_tensor * dst, int nth) {
     const int n_queries = dst->src[0]->ne[1];
     const int gqa = Q->ne[2]/K->ne[2];
     return numa_fa_eligible(dst, nth) && numa_fa_batch_queries_enabled() &&
-        n_queries >= 1 && n_queries <= 5 && Q->ne[2] == 24 &&
+        n_queries >= 1 && n_queries <= 16 && Q->ne[2] == 24 &&
         K->ne[2] == 4 && gqa == 6;
 }
 
 inline size_t numa_fa_align64(size_t size) {
     return (size + 63) & ~(size_t) 63;
+}
+
+constexpr int numa_fa_max_query_group_tokens = 5;
+
+inline size_t numa_fa_group_plan_size(int n_tokens) {
+    return numa_fa_align64((1 + 2*(size_t) n_tokens)*sizeof(int32_t));
 }
 }
 
@@ -116,9 +122,11 @@ size_t iqk_fa_work_buffer_size(const struct ggml_tensor * dst, int nth) {
         const int n_shards = fa_param_i32(dst, 6);
         if (numa_fa_batch_queries_eligible(dst, nth)) {
             const int local_nth = nth/n_shards;
+            const size_t group_plan_size = numa_fa_group_plan_size(Q->ne[1]);
             const size_t packed_q_size = numa_fa_align64(
-                    (size_t) Q->ne[1]*Q->ne[2]*Q->ne[0]*sizeof(float));
-            return packed_q_size +
+                    (size_t) std::min<int64_t>(Q->ne[1], numa_fa_max_query_group_tokens)*
+                    Q->ne[2]*Q->ne[0]*sizeof(float));
+            return group_plan_size + packed_q_size +
                 (size_t) n_shards*local_nth*sizeof(float *);
         }
         const int n_pairs = K->ne[2]*Q->ne[1];
@@ -435,23 +443,41 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
             last  = std::min(last,  nek1);
         };
 
-        // Pack the six GQA queries for single-token decode or a 2--5 token MTP
-        // verification batch next to one another, then let every node-local
-        // worker scan one thirteenth of that node's K/V exactly once. The cold
-        // range precedes every query token, so all packed queries share the
-        // same unmasked cold-mask row.
-        if (numa_fa_batch_queries_enabled() && neq1 >= 1 && neq1 <= 5 &&
+        // Pack up to five token rows (six GQA query heads each) together. The
+        // BF16 kernel's negative-stride convention repeats each input mask row
+        // for its six heads, so independent slots keep their own masks while
+        // sharing one K/V traversal. This covers both continuous batching and
+        // one MTP verification depth across several slots.
+        if (numa_fa_batch_queries_enabled() && neq1 >= 1 && neq1 <= 16 &&
                 neq2 == 24 && nek2 == 4 && rk2 == 6) {
-            const int n_queries = neq1*rk2;
             const int n_chunks = local_nth;
+            const size_t group_plan_size = numa_fa_group_plan_size(neq1);
             const size_t packed_q_size = numa_fa_align64(
-                    (size_t) neq1*neq2*Dk*sizeof(float));
-            float * packed_q = (float *) work_buffer_in;
-            float ** partial_ptrs = (float **) ((char *) work_buffer_in + packed_q_size);
+                    (size_t) std::min(neq1, numa_fa_max_query_group_tokens)*neq2*Dk*sizeof(float));
+            int32_t * group_plan = (int32_t *) work_buffer_in;
+            float * packed_q = (float *) ((char *) work_buffer_in + group_plan_size);
+            float ** partial_ptrs = (float **) ((char *) packed_q + packed_q_size);
 
-            constexpr int max_queries = 5*6;
+            constexpr int max_queries = numa_fa_max_query_group_tokens*6;
             constexpr int result_stride = (256 + 16)*max_queries;
             alignas(64) float local_results[2][result_stride];
+
+            if (ith == 0) {
+                const int n_groups = (neq1 + numa_fa_max_query_group_tokens - 1)/
+                    numa_fa_max_query_group_tokens;
+                const int group_tokens = neq1/n_groups;
+                const int n_larger = neq1 % n_groups;
+                int first = 0;
+                for (int group = 0; group < n_groups; ++group) {
+                    const int count = group_tokens + (group < n_larger ? 1 : 0);
+                    group_plan[1 + 2*group + 0] = first;
+                    group_plan[1 + 2*group + 1] = count;
+                    first += count;
+                }
+                group_plan[0] = n_groups;
+            }
+            partial_ptrs[ith] = local_results[0];
+            barrier(barrier_data);
 
             auto chunk_bounds = [&](int inode, int ichunk, int & first, int & last) {
                 int node_first, node_last;
@@ -460,107 +486,116 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
                 first = node_first + 32*((int64_t) n_blocks*ichunk/n_chunks);
                 last  = node_first + 32*((int64_t) n_blocks*(ichunk + 1)/n_chunks);
             };
-            for (int row = ith; row < neq1*neq2; row += nth) {
-                const int iq1 = row/neq2;
-                const int iq2 = row - iq1*neq2;
-                const int ik02 = iq2/rk2;
-                const int il = iq2 - ik02*rk2;
-                const int packed_row = ik02*n_queries + iq1*rk2 + il;
-                const float * src = (const float *) ((const char *) q +
-                        (int64_t) iq1*stride_q + (int64_t) iq2*nbq2);
-                std::memcpy(packed_q + (size_t) packed_row*Dk, src, Dk*sizeof(float));
-            }
-            partial_ptrs[ith] = local_results[0];
-            barrier(barrier_data);
 
             int first, last;
             chunk_bounds(node, local_ith, first, last);
-            for (int head_first = 0; head_first < nek2; head_first += 2) {
-                const int n_heads = std::min(2, nek2 - head_first);
-                if (last > first) {
-                    const char * this_m = mask ? (const char *) mask +
-                            (int64_t) first*sizeof(uint16_t) : nullptr;
-                    for (int slot = 0; slot < n_heads; ++slot) {
-                        const int ik02 = head_first + slot;
-                        const float * this_q = packed_q + (size_t) ik02*n_queries*Dk;
-                        const char * this_k = (const char *) k +
-                                (int64_t) ik02*nbk2 + (int64_t) first*stride_k;
-                        const char * this_v = (const char *) v +
-                                (int64_t) ik02*nbv2 + (int64_t) first*stride_v;
-                        float * out = local_results[slot];
-                        if (!iqk_flash_attn_impl(int_type_k_in, int_type_v,
-                                Dk, Dv, n_queries, last - first, Dk*sizeof(float),
-                                stride_k, stride_v, 0, Dv,
-                                this_q, this_k, this_v, this_m, nullptr, 0,
-                                scale, softcap, out, out + Dv*n_queries,
-                                out + (Dv + 1)*n_queries)) {
-                            return false;
-                        }
-                    }
+            const int n_groups = group_plan[0];
+            for (int group = 0; group < n_groups; ++group) {
+                const int group_first = group_plan[1 + 2*group + 0];
+                const int group_tokens = group_plan[1 + 2*group + 1];
+                const int n_queries = group_tokens*rk2;
+
+                for (int row = ith; row < group_tokens*neq2; row += nth) {
+                    const int local_iq1 = row/neq2;
+                    const int iq2 = row - local_iq1*neq2;
+                    const int ik02 = iq2/rk2;
+                    const int il = iq2 - ik02*rk2;
+                    const int packed_row = ik02*n_queries + local_iq1*rk2 + il;
+                    const float * src = (const float *) ((const char *) q +
+                            (int64_t) (group_first + local_iq1)*stride_q + (int64_t) iq2*nbq2);
+                    std::memcpy(packed_q + (size_t) packed_row*Dk, src, Dk*sizeof(float));
                 }
                 barrier(barrier_data);
 
-                if (numa_return_partials) {
-                    const size_t shard_stride = (size_t) ne1*ne2*nb1;
-                    for (int output = local_ith; output < n_heads*n_queries; output += local_nth) {
-                        const int slot = output/n_queries;
-                        const int packed_row = output - slot*n_queries;
-                        const int iq1 = packed_row/rk2;
-                        const int il = packed_row - iq1*rk2;
-                        const int ik02 = head_first + slot;
-                        const int iq2 = ik02*rk2 + il;
-                        float * Racc = (float *) ((char *) qkv + (size_t) node*shard_stride +
-                                (iq2 + (int64_t) iq1*ne1)*nb1);
-                        float M = -INFINITY;
-                        float S = 0.0f;
-                        std::memset(Racc, 0, Dv*sizeof(float));
-                        for (int ichunk = 0; ichunk < n_chunks; ++ichunk) {
-                            int chunk_first, chunk_last;
-                            chunk_bounds(node, ichunk, chunk_first, chunk_last);
-                            if (chunk_last <= chunk_first) {
-                                continue;
+                for (int head_first = 0; head_first < nek2; head_first += 2) {
+                    const int n_heads = std::min(2, nek2 - head_first);
+                    if (last > first) {
+                        const char * this_m = mask ? (const char *) mask +
+                                (int64_t) group_first*stride_m + (int64_t) first*sizeof(uint16_t) : nullptr;
+                        for (int slot = 0; slot < n_heads; ++slot) {
+                            const int ik02 = head_first + slot;
+                            const float * this_q = packed_q + (size_t) ik02*n_queries*Dk;
+                            const char * this_k = (const char *) k +
+                                    (int64_t) ik02*nbk2 + (int64_t) first*stride_k;
+                            const char * this_v = (const char *) v +
+                                    (int64_t) ik02*nbv2 + (int64_t) first*stride_v;
+                            float * out = local_results[slot];
+                            if (!iqk_flash_attn_impl(int_type_k_in, int_type_v,
+                                    Dk, Dv, n_queries, last - first, Dk*sizeof(float),
+                                    stride_k, stride_v, mask ? -stride_m : 0, Dv,
+                                    this_q, this_k, this_v, this_m, nullptr, 0,
+                                    scale, softcap, out, out + Dv*n_queries,
+                                    out + (Dv + 1)*n_queries)) {
+                                return false;
                             }
-                            const int thread = ichunk*numa_shards + node;
-                            const float * part = partial_ptrs[thread] + slot*result_stride;
-                            const float * R = part + packed_row*Dv;
-                            const float * Mj = part + Dv*n_queries;
-                            const float * Sj = Mj + n_queries;
-                            accumulate_qkv(Dv, M, S, Mj[packed_row], Sj[packed_row], Racc, R);
                         }
-                        Racc[Dv + 0] = pack_softmax_max(M);
-                        Racc[Dv + 1] = S;
                     }
-                } else {
-                    for (int output = ith; output < n_heads*n_queries; output += nth) {
-                        const int slot = output/n_queries;
-                        const int packed_row = output - slot*n_queries;
-                        const int iq1 = packed_row/rk2;
-                        const int il = packed_row - iq1*rk2;
-                        const int ik02 = head_first + slot;
-                        const int iq2 = ik02*rk2 + il;
-                        float * Racc = (float *) ((char *) qkv + (iq2 + (int64_t) iq1*ne1)*nb1);
-                        float M = -INFINITY;
-                        float S = 0.0f;
-                        for (int inode = 0; inode < numa_shards; ++inode) {
+                    barrier(barrier_data);
+
+                    if (numa_return_partials) {
+                        const size_t shard_stride = (size_t) ne1*ne2*nb1;
+                        for (int output = local_ith; output < n_heads*n_queries; output += local_nth) {
+                            const int slot = output/n_queries;
+                            const int packed_row = output - slot*n_queries;
+                            const int local_iq1 = packed_row/rk2;
+                            const int il = packed_row - local_iq1*rk2;
+                            const int iq1 = group_first + local_iq1;
+                            const int ik02 = head_first + slot;
+                            const int iq2 = ik02*rk2 + il;
+                            float * Racc = (float *) ((char *) qkv + (size_t) node*shard_stride +
+                                    (iq2 + (int64_t) iq1*ne1)*nb1);
+                            float M = -INFINITY;
+                            float S = 0.0f;
+                            std::memset(Racc, 0, Dv*sizeof(float));
                             for (int ichunk = 0; ichunk < n_chunks; ++ichunk) {
                                 int chunk_first, chunk_last;
-                                chunk_bounds(inode, ichunk, chunk_first, chunk_last);
+                                chunk_bounds(node, ichunk, chunk_first, chunk_last);
                                 if (chunk_last <= chunk_first) {
                                     continue;
                                 }
-                                const int thread = ichunk*numa_shards + inode;
+                                const int thread = ichunk*numa_shards + node;
                                 const float * part = partial_ptrs[thread] + slot*result_stride;
                                 const float * R = part + packed_row*Dv;
                                 const float * Mj = part + Dv*n_queries;
                                 const float * Sj = Mj + n_queries;
                                 accumulate_qkv(Dv, M, S, Mj[packed_row], Sj[packed_row], Racc, R);
                             }
+                            Racc[Dv + 0] = pack_softmax_max(M);
+                            Racc[Dv + 1] = S;
                         }
-                        Racc[Dv + 0] = pack_softmax_max(M);
-                        Racc[Dv + 1] = S;
+                    } else {
+                        for (int output = ith; output < n_heads*n_queries; output += nth) {
+                            const int slot = output/n_queries;
+                            const int packed_row = output - slot*n_queries;
+                            const int local_iq1 = packed_row/rk2;
+                            const int il = packed_row - local_iq1*rk2;
+                            const int iq1 = group_first + local_iq1;
+                            const int ik02 = head_first + slot;
+                            const int iq2 = ik02*rk2 + il;
+                            float * Racc = (float *) ((char *) qkv + (iq2 + (int64_t) iq1*ne1)*nb1);
+                            float M = -INFINITY;
+                            float S = 0.0f;
+                            for (int inode = 0; inode < numa_shards; ++inode) {
+                                for (int ichunk = 0; ichunk < n_chunks; ++ichunk) {
+                                    int chunk_first, chunk_last;
+                                    chunk_bounds(inode, ichunk, chunk_first, chunk_last);
+                                    if (chunk_last <= chunk_first) {
+                                        continue;
+                                    }
+                                    const int thread = ichunk*numa_shards + inode;
+                                    const float * part = partial_ptrs[thread] + slot*result_stride;
+                                    const float * R = part + packed_row*Dv;
+                                    const float * Mj = part + Dv*n_queries;
+                                    const float * Sj = Mj + n_queries;
+                                    accumulate_qkv(Dv, M, S, Mj[packed_row], Sj[packed_row], Racc, R);
+                                }
+                            }
+                            Racc[Dv + 0] = pack_softmax_max(M);
+                            Racc[Dv + 1] = S;
+                        }
                     }
+                    barrier(barrier_data);
                 }
-                barrier(barrier_data);
             }
             return true;
         }

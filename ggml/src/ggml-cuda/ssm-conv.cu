@@ -317,6 +317,7 @@ static __global__ void ssm_conv_f32_kernel(
         const int32_t * fast_path_ok,
         float * dst_x,
         float * dst_state,
+        float * saved,
         int nc,
         int nr,
         int n_t,
@@ -355,6 +356,13 @@ static __global__ void ssm_conv_f32_kernel(
         }
         state_row[nc - 1] = src1[row + (size_t) t * src1_nb1];
 
+        if (saved != nullptr) {
+            float * saved_row = saved + ((size_t)t*nr + row)*(nc - 1);
+            for (int i0 = 0; i0 < nc - 1; ++i0) {
+                saved_row[i0] = state_row[i0 + 1];
+            }
+        }
+
         for (int i3 = 1; i3 < n_kv; ++i3) {
             const int seq = sq[i3];
             if (seq < 0 || seq >= n_kv) {
@@ -384,6 +392,7 @@ static __global__ void ssm_conv_f32_kernel_nc4(
         const int32_t * fast_path_ok,
         float * dst_x,
         float * dst_state,
+        float * saved,
         int nr,
         int n_t,
         int n_kv,
@@ -430,6 +439,13 @@ static __global__ void ssm_conv_f32_kernel_nc4(
         state_row[1] = s1;
         state_row[2] = s2;
         state_row[3] = x;
+
+        if (saved != nullptr) {
+            float * saved_row = saved + 3*((size_t)t*nr + row);
+            saved_row[0] = s1;
+            saved_row[1] = s2;
+            saved_row[2] = x;
+        }
 
         if constexpr (has_multi_seq) {
             for (int i3 = 1; i3 < n_kv; ++i3) {
@@ -485,7 +501,6 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(src3->ne[1] == src1->ne[1]);
 
     if (src4) {
-        GGML_ASSERT(n_kv == 1);
         GGML_ASSERT(src4->type == GGML_TYPE_F32);
         GGML_ASSERT(ggml_nelements(src4) >= (nc - 1)*nr*n_t);
     }
@@ -496,6 +511,10 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     const dim3 block_dims(CUDA_SSM_CONV_BLOCK_SIZE, 1, 1);
     const dim3 row_grid((nr + CUDA_SSM_CONV_BLOCK_SIZE - 1) / CUDA_SSM_CONV_BLOCK_SIZE, 1, 1);
+    // VMM pool allocations must be released in strict reverse order. Keep all
+    // three multi-sequence scratch owners in allocation order in this scope.
+    ggml_cuda_pool_alloc<int32_t> seq_ids_d(ctx.pool());
+    ggml_cuda_pool_alloc<int32_t> seq_seen_d(ctx.pool());
     ggml_cuda_pool_alloc<int32_t> fast_path_ok_d(ctx.pool());
     const int32_t * multi_seq_fast_path_ok = nullptr;
 
@@ -574,20 +593,20 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
         // Fast path for multi-sequence decode-like batches:
         // one token per unique sequence, no copy-to-multiple-sequences routing.
-        ggml_cuda_pool_alloc<int32_t> seq_ids(ctx.pool(), n_t);
-        ggml_cuda_pool_alloc<int32_t> seq_seen(ctx.pool(), n_kv);
+        seq_ids_d.alloc(n_t);
+        seq_seen_d.alloc(n_kv);
         int32_t fast_path_ok = 1;
         fast_path_ok_d.alloc(1);
 
-        CUDA_CHECK(cudaMemsetAsync(seq_seen.get(), 0, n_kv * sizeof(int32_t), ctx.stream()));
+        CUDA_CHECK(cudaMemsetAsync(seq_seen_d.get(), 0, n_kv * sizeof(int32_t), ctx.stream()));
         CUDA_CHECK(cudaMemcpyAsync(fast_path_ok_d.get(), &fast_path_ok, sizeof(int32_t), cudaMemcpyHostToDevice, ctx.stream()));
 
         constexpr int seq_map_block_size = 256;
         const dim3 seq_map_grid((n_t + seq_map_block_size - 1) / seq_map_block_size, 1, 1);
         ssm_conv_validate_unique_seq_map<<<seq_map_grid, seq_map_block_size, 0, ctx.stream()>>>(
             (const int32_t *) src3->data,
-            seq_ids.get(),
-            seq_seen.get(),
+            seq_ids_d.get(),
+            seq_seen_d.get(),
             fast_path_ok_d.get(),
             n_t,
             n_kv,
@@ -601,7 +620,7 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
                 (const float *) src0->data,
                 (const float *) src1->data,
                 (const float *) src2->data,
-                seq_ids.get(),
+                seq_ids_d.get(),
                 multi_seq_fast_path_ok,
                 dst_x,
                 dst_state,
@@ -612,7 +631,7 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
                 (const float *) src0->data,
                 (const float *) src1->data,
                 (const float *) src2->data,
-                seq_ids.get(),
+                seq_ids_d.get(),
                 multi_seq_fast_path_ok,
                 dst_x,
                 dst_state,
@@ -631,6 +650,7 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
                 multi_seq_fast_path_ok,
                 dst_x,
                 dst_state,
+                src4 ? (float *) src4->data : nullptr,
                 nr, n_t, n_kv,
                 src1->nb[1] / sizeof(float),
                 src3->nb[1] / sizeof(int32_t));
@@ -643,6 +663,7 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
                 nullptr,
                 dst_x,
                 dst_state,
+                src4 ? (float *) src4->data : nullptr,
                 nr, n_t, n_kv,
                 src1->nb[1] / sizeof(float),
                 src3->nb[1] / sizeof(int32_t));
@@ -656,6 +677,7 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
             multi_seq_fast_path_ok,
             dst_x,
             dst_state,
+            src4 ? (float *) src4->data : nullptr,
             nc, nr, n_t, n_kv,
             src1->nb[1] / sizeof(float),
             src3->nb[1] / sizeof(int32_t));

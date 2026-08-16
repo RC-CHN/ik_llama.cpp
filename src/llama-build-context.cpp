@@ -946,10 +946,16 @@ void llm_build_context::llm_build_kv_store(
         if ((size_t) il < kv.k_hot_l.size() && kv.k_hot_l[il]) {
             lctx.hybrid_cache_copies[4*il + 0] = {};
             lctx.hybrid_cache_copies[4*il + 1] = {};
-            const uint32_t hot_head = kv_head % kv.hybrid_hot_size;
-            const int32_t n_first = std::min<int32_t>(n_tokens, kv.hybrid_hot_size - hot_head);
-            const int32_t n_second = n_tokens - n_first;
-            GGML_ASSERT(n_tokens <= (int32_t) kv.hybrid_hot_size);
+            // The GPU ring mirrors only physical rows [kv.n - hot_size, kv.n).
+            // Continuous batching may reuse an older hole in the cold prefix;
+            // do not let that write evict an unrelated live hot row.
+            const int32_t hot_start = std::max<int32_t>(0, (int32_t) kv.n - (int32_t) kv.hybrid_hot_size);
+            const int32_t hot_src_token = std::clamp<int32_t>(hot_start - kv_head, 0, n_tokens);
+            const int32_t n_hot = n_tokens - hot_src_token;
+            const uint32_t hot_head = (kv_head + hot_src_token) % kv.hybrid_hot_size;
+            const int32_t n_first = std::min<int32_t>(n_hot, kv.hybrid_hot_size - hot_head);
+            const int32_t n_second = n_hot - n_first;
+            GGML_ASSERT(n_hot <= (int32_t) kv.hybrid_hot_size);
 
             auto add_hot_k_copy = [&](int slot, int32_t count, int32_t src_token, uint32_t dst_token) {
                 if (count == 0) return;
@@ -962,10 +968,11 @@ void llm_build_context::llm_build_kv_store(
                 auto & copy = lctx.hybrid_cache_copies[4*il + slot];
                 copy.cpy = ggml_cpy(ctx, src, dst);
                 copy.step = n_head_kv*hot_row;
+                copy.src_token = src_token;
                 ggml_build_forward_expand(graph, copy.cpy);
             };
-            add_hot_k_copy(0, n_first,  0,       hot_head);
-            add_hot_k_copy(1, n_second, n_first, 0);
+            add_hot_k_copy(0, n_first,  hot_src_token,           hot_head);
+            add_hot_k_copy(1, n_second, hot_src_token + n_first, 0);
         }
     }
 
@@ -993,10 +1000,13 @@ void llm_build_context::llm_build_kv_store(
             lctx.hybrid_cache_copies[4*il + 2] = {};
             lctx.hybrid_cache_copies[4*il + 3] = {};
             GGML_ASSERT(!kv.v_trans);
-            const uint32_t hot_head = kv_head % kv.hybrid_hot_size;
-            const int32_t n_first = std::min<int32_t>(n_tokens, kv.hybrid_hot_size - hot_head);
-            const int32_t n_second = n_tokens - n_first;
-            GGML_ASSERT(n_tokens <= (int32_t) kv.hybrid_hot_size);
+            const int32_t hot_start = std::max<int32_t>(0, (int32_t) kv.n - (int32_t) kv.hybrid_hot_size);
+            const int32_t hot_src_token = std::clamp<int32_t>(hot_start - kv_head, 0, n_tokens);
+            const int32_t n_hot = n_tokens - hot_src_token;
+            const uint32_t hot_head = (kv_head + hot_src_token) % kv.hybrid_hot_size;
+            const int32_t n_first = std::min<int32_t>(n_hot, kv.hybrid_hot_size - hot_head);
+            const int32_t n_second = n_hot - n_first;
+            GGML_ASSERT(n_hot <= (int32_t) kv.hybrid_hot_size);
 
             auto add_hot_v_copy = [&](int slot, int32_t count, int32_t src_token, uint32_t dst_token) {
                 if (count == 0) return;
@@ -1009,10 +1019,11 @@ void llm_build_context::llm_build_kv_store(
                 auto & copy = lctx.hybrid_cache_copies[4*il + slot];
                 copy.cpy = ggml_cpy(ctx, src, dst);
                 copy.step = hot_row;
+                copy.src_token = src_token;
                 ggml_build_forward_expand(graph, copy.cpy);
             };
-            add_hot_v_copy(2, n_first,  0,       hot_head);
-            add_hot_v_copy(3, n_second, n_first, 0);
+            add_hot_v_copy(2, n_first,  hot_src_token,           hot_head);
+            add_hot_v_copy(3, n_second, hot_src_token + n_first, 0);
         }
     }
 }

@@ -1812,6 +1812,17 @@ struct FlashQKbf16 {
     static_assert(k_step%32 == 0);
     static_assert(q_step <= 4 || q_step%4 == 0);
 
+    // A negative mask stride is an internal fused-GQA convention: one source
+    // mask row is reused by six adjacent query-head rows. This lets independent
+    // server slots share a K/V traversal without materializing a many-megabyte
+    // expanded mask for every attention layer.
+    static inline const char * mask_row(const char * mask, int stride_m, int query) {
+        if (stride_m >= 0) {
+            return mask + (size_t) query*stride_m;
+        }
+        return mask + (size_t) (query/6)*(-stride_m);
+    }
+
 #if defined(GGML_AMX_BF16) && defined(__AMX_TILE__) && defined(__AMX_BF16__) && defined(__x86_64__)
     constexpr static int amx_m = 16;
     constexpr static int amx_n = 16;
@@ -1828,12 +1839,13 @@ struct FlashQKbf16 {
     };
 
     static bool amx_begin(int nq, const ggml_bf16_t * q, amx_q_storage& packed) {
-        // The fused Qwen MTP/GQA path has 12--30 rows. Larger prefill tiles
-        // need a different register schedule and remain on AVX-512 BF16.
+        // The fused Qwen GQA path has 6--30 rows per mask-compatible query
+        // group. Larger prefill tiles need a different register schedule and
+        // remain on AVX-512 BF16.
         if constexpr (D != 256 || q_step < 16) {
             return false;
         }
-        if (nq < 8 || nq > 32 || !fa_amx_bf16_runtime_available()) {
+        if (nq < 6 || nq > 32 || !fa_amx_bf16_runtime_available()) {
             return false;
         }
 
@@ -1916,7 +1928,7 @@ struct FlashQKbf16 {
 
         F16::Data vk[k_step/F16::block_size];
         for (int j = 0; j < nq; ++j) {
-            fms.update_M_S(j, vk, mask + stride_m*j);
+            fms.update_M_S(j, vk, mask_row(mask, stride_m, j));
         }
     }
 
@@ -2151,7 +2163,7 @@ struct FlashQKbf16 {
 #endif
         F16::Data vk[k_step/16];
         for (int j = 0; j < q_step; ++j) {
-            fms.update_M_S(j, vk, mask + stride_m*j);
+            fms.update_M_S(j, vk, mask_row(mask, stride_m, j));
         }
 #if FA_TIMING
         perf.accum_nolock(2, t1);
@@ -2179,7 +2191,7 @@ struct FlashQKbf16 {
         }
         F16::Data vk[k_step/16];
         for (int j = 0; j < nq; ++j) {
-            fms.update_M_S(j, vk, mask + stride_m*j);
+            fms.update_M_S(j, vk, mask_row(mask, stride_m, j));
         }
     }
 

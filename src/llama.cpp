@@ -901,16 +901,23 @@ bool llama_context::update_cache_copies(int32_t n_tokens) {
     }
 
     if (kv_self.hybrid_hot_size > 0) {
-        const uint32_t hot_head = kv_self.head % kv_self.hybrid_hot_size;
-        const int32_t n_first = std::min<int32_t>(n_tokens, kv_self.hybrid_hot_size - hot_head);
-        const int32_t n_second = n_tokens - n_first;
+        const int32_t hot_start = std::max<int32_t>(0,
+                (int32_t) kv_self.n - (int32_t) kv_self.hybrid_hot_size);
+        const int32_t hot_src_token = std::clamp<int32_t>(
+                hot_start - (int32_t) kv_self.head, 0, n_tokens);
+        const int32_t n_hot = n_tokens - hot_src_token;
+        const uint32_t hot_head = (kv_self.head + hot_src_token) % kv_self.hybrid_hot_size;
+        const int32_t n_first = std::min<int32_t>(n_hot, kv_self.hybrid_hot_size - hot_head);
+        const int32_t n_second = n_hot - n_first;
 
         auto patch_hot = [&](llama_context::CacheCopy & c, ggml_tensor * base,
-                             int32_t expected_tokens, uint32_t offset, int64_t rows_per_token) -> bool {
+                             int32_t expected_tokens, int32_t expected_src_token,
+                             uint32_t offset, int64_t rows_per_token) -> bool {
             if (expected_tokens == 0) {
                 return c.cpy == nullptr;
             }
             if (!c.cpy || c.cpy->op != GGML_OP_CPY || c.cpy->view_src != base ||
+                    c.src_token != expected_src_token ||
                     ggml_nelements(c.cpy->src[1]) != expected_tokens*rows_per_token) {
                 return false;
             }
@@ -928,10 +935,14 @@ bool llama_context::update_cache_copies(int32_t n_tokens) {
             const int64_t n_embd_head_k = model.hparams.n_embd_head_k(il);
             const int64_t n_embd_v_gqa = model.hparams.n_embd_v_gqa(il);
             const size_t idx = 4*(size_t) il;
-            if (!patch_hot(hybrid_cache_copies[idx + 0], kv_self.k_hot_l[il], n_first,  hot_head, n_head_kv*n_embd_head_k) ||
-                !patch_hot(hybrid_cache_copies[idx + 1], kv_self.k_hot_l[il], n_second, 0,        n_head_kv*n_embd_head_k) ||
-                !patch_hot(hybrid_cache_copies[idx + 2], kv_self.v_hot_l[il], n_first,  hot_head, n_embd_v_gqa) ||
-                !patch_hot(hybrid_cache_copies[idx + 3], kv_self.v_hot_l[il], n_second, 0,        n_embd_v_gqa)) {
+            if (!patch_hot(hybrid_cache_copies[idx + 0], kv_self.k_hot_l[il], n_first,
+                        hot_src_token, hot_head, n_head_kv*n_embd_head_k) ||
+                !patch_hot(hybrid_cache_copies[idx + 1], kv_self.k_hot_l[il], n_second,
+                        hot_src_token + n_first, 0, n_head_kv*n_embd_head_k) ||
+                !patch_hot(hybrid_cache_copies[idx + 2], kv_self.v_hot_l[il], n_first,
+                        hot_src_token, hot_head, n_embd_v_gqa) ||
+                !patch_hot(hybrid_cache_copies[idx + 3], kv_self.v_hot_l[il], n_second,
+                        hot_src_token + n_first, 0, n_embd_v_gqa)) {
                 return false;
             }
         }
@@ -2378,8 +2389,9 @@ void llama_kv_cache::checkpoint_delete() {
     ckpt.saved = false;
 }
 
-bool llama_kv_cache::per_step_alloc(const llama_model & model, int max_tokens) {
-    if (ckpt.per_step_max_allocated >= max_tokens) {
+bool llama_kv_cache::per_step_alloc(const llama_model & model, int max_tokens, int max_seqs) {
+    if (ckpt.per_step_max_allocated >= max_tokens &&
+            ckpt.per_step_max_seqs_allocated >= max_seqs) {
         return true;
     }
 
@@ -2395,6 +2407,7 @@ bool llama_kv_cache::per_step_alloc(const llama_model & model, int max_tokens) {
         ckpt.per_step_ssm.clear();
         ckpt.per_step_conv.clear();
         ckpt.per_step_max_allocated = 0;
+        ckpt.per_step_max_seqs_allocated = 0;
     }
 
     const uint32_t n_layer = (uint32_t)s_l.size();
@@ -2453,13 +2466,15 @@ bool llama_kv_cache::per_step_alloc(const llama_model & model, int max_tokens) {
                 if (max_tokens > 1) {
                     GGML_ASSERT(ckpt.per_step_ssm[il].empty());
                     GGML_ASSERT(ckpt.per_step_conv[il].empty());
-                    ggml_tensor * t_ssm = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (int64_t)(max_tokens - 1) * ssm_state_dim);
+                    ggml_tensor * t_ssm = ggml_new_tensor_1d(ctx, GGML_TYPE_F32,
+                            (int64_t)(max_tokens - 1) * max_seqs * ssm_state_dim);
                     ggml_format_name(t_ssm, "per_step_ssm_l%d", il);
                     ckpt.per_step_ssm[il].push_back(t_ssm);
                 }
 
                 // Conv features (qkv_mixed): max_tokens * conv_dim
-                ggml_tensor * t_qkv = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (int64_t)max_tokens * conv_state_dim);
+                ggml_tensor * t_qkv = ggml_new_tensor_1d(ctx, GGML_TYPE_F32,
+                        (int64_t)max_tokens * max_seqs * conv_state_dim);
                 ggml_format_name(t_qkv, "per_step_qkv_l%d", il);
                 ckpt.per_step_conv[il].push_back(t_qkv);
             } else {
@@ -2481,12 +2496,14 @@ bool llama_kv_cache::per_step_alloc(const llama_model & model, int max_tokens) {
                 auto [this_conv_dim, this_ssm_dim] = model.hparams.n_embd_v_s_dims(nv);
 
                 if (max_tokens > 1) {
-                    auto t_ssm = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (int64_t)(max_tokens - 1) * this_ssm_dim);
+                    auto t_ssm = ggml_new_tensor_1d(ctx, GGML_TYPE_F32,
+                            (int64_t)(max_tokens - 1) * max_seqs * this_ssm_dim);
                     ggml_format_name(t_ssm, "per_step_ssm_l%d_%d", il, id);
                     ckpt.per_step_ssm[il][id] = t_ssm;
                 }
 
-                auto t_qkv = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (int64_t)max_tokens * this_conv_dim * (d_conv - 1));
+                auto t_qkv = ggml_new_tensor_1d(ctx, GGML_TYPE_F32,
+                        (int64_t)max_tokens * max_seqs * this_conv_dim * (d_conv - 1));
                 ggml_format_name(t_qkv, "per_step_qkv_l%d_%d", il, id);
                 ckpt.per_step_conv[il][id] = t_qkv;
             }
@@ -2499,41 +2516,64 @@ bool llama_kv_cache::per_step_alloc(const llama_model & model, int max_tokens) {
             return false;
         }
         ggml_backend_buffer_clear(buf, 0);
-        LLAMA_LOG_INFO("%s: %10s per-step buffer = %8.2f MiB (max_tokens=%d)\n", __func__,
-                       ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf) / 1024.0 / 1024.0, max_tokens);
+        LLAMA_LOG_INFO("%s: %10s per-step buffer = %8.2f MiB (max_tokens=%d, max_seqs=%d)\n", __func__,
+                       ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf) / 1024.0 / 1024.0,
+                       max_tokens, max_seqs);
         ckpt.per_step_ctxs.push_back(ctx);
         ckpt.per_step_bufs.push_back(buf);
     }
 
     ckpt.per_step_max_allocated = max_tokens;
+    ckpt.per_step_max_seqs_allocated = max_seqs;
     return true;
 }
 
-static void restore_recurrent_cache_tensors(int step, ggml_backend_sched_t sched,
+static void restore_recurrent_cache_tensors(int ssm_slot, int conv_slot, llama_seq_id seq_id,
+        ggml_backend_sched_t sched,
         size_t ssm_bytes, size_t conv_bytes,
         ggml_tensor * s_l, ggml_tensor * per_step_ssm, ggml_tensor * per_step_conv,
         std::unordered_set<ggml_backend_t> & backends_to_sync) {
     auto dst_backend = ggml_backend_sched_get_tensor_backend(sched, s_l);
+    const size_t state_row_stride = s_l->nb[1];
+
+    auto make_row_view = [](ggml_tensor & view, size_t nbytes) {
+        view.ne[0] = nbytes/sizeof(float);
+        view.ne[1] = view.ne[2] = view.ne[3] = 1;
+        view.nb[0] = sizeof(float);
+        view.nb[1] = view.nb[2] = view.nb[3] = nbytes;
+    };
+
     auto dst = *s_l;
-    dst.ne[0] = ssm_bytes/sizeof(float);
-    dst.nb[1] = dst.nb[2] = dst.nb[3] = ssm_bytes + conv_bytes;
-    dst.data  = (char *)s_l->data + conv_bytes;
-    auto src = dst;
-    src.data = (char *)per_step_ssm->data + (size_t)step * ssm_bytes;
+    auto src = *per_step_ssm;
+    make_row_view(dst, ssm_bytes);
+    make_row_view(src, ssm_bytes);
+    dst.data  = (char *)s_l->data + (size_t)seq_id*state_row_stride + conv_bytes;
+    src.data = (char *)per_step_ssm->data + (size_t)ssm_slot * ssm_bytes;
     ggml_backend_tensor_copy_async(dst_backend, dst_backend, &src, &dst);
     backends_to_sync.insert(dst_backend);
 
-    dst.data  = (char *)s_l->data;
-    dst.ne[0] = conv_bytes/sizeof(float);
-    src = dst;
-    src.data = (char *)per_step_conv->data + (size_t)step * conv_bytes;
+    src = *per_step_conv;
+    make_row_view(dst, conv_bytes);
+    make_row_view(src, conv_bytes);
+    dst.data  = (char *)s_l->data + (size_t)seq_id*state_row_stride;
+    src.data = (char *)per_step_conv->data + (size_t)conv_slot * conv_bytes;
     ggml_backend_tensor_copy_async(dst_backend, dst_backend, &src, &dst);
 }
 
-bool llama_kv_cache::per_step_restore(const llama_model & model, ggml_backend_sched_t sched, int step) {
+bool llama_kv_cache::per_step_restore(const llama_model & model, ggml_backend_sched_t sched,
+        int step, llama_seq_id seq_id) {
     if (ckpt.per_step_ssm.empty() || step < 0) {
         return false;
     }
+
+    const auto seq_it = std::find(ckpt.per_step_seq_ids.begin(), ckpt.per_step_seq_ids.end(), seq_id);
+    if (seq_it == ckpt.per_step_seq_ids.end() || ckpt.per_step_n_seqs <= 0 ||
+            ckpt.per_step_n_tokens <= 0 || step >= ckpt.per_step_n_tokens - 1) {
+        return false;
+    }
+    const int seq_index = (int)std::distance(ckpt.per_step_seq_ids.begin(), seq_it);
+    const int ssm_slot = step*ckpt.per_step_n_seqs + seq_index;
+    const int conv_slot = seq_index*ckpt.per_step_n_tokens + step;
 
     std::unordered_set<ggml_backend_t> backends_to_sync;
 
@@ -2554,7 +2594,7 @@ bool llama_kv_cache::per_step_restore(const llama_model & model, ggml_backend_sc
         if (s_l[il] == nullptr || ckpt.per_step_ssm[il].empty()) continue;
 
         if (!s_l[il]->extra) {
-            restore_recurrent_cache_tensors(step, sched, ssm_bytes, conv_bytes,
+            restore_recurrent_cache_tensors(ssm_slot, conv_slot, seq_id, sched, ssm_bytes, conv_bytes,
                 s_l[il], ckpt.per_step_ssm[il].front(), ckpt.per_step_conv[il].front(),
                 backends_to_sync);
         } else {
@@ -2568,7 +2608,8 @@ bool llama_kv_cache::per_step_restore(const llama_model & model, ggml_backend_sc
                 int nv = split->ne[0] / head_v_dim; // number of heads handled by this device
                 auto [this_conv_dim, this_ssm_dim] = model.hparams.n_embd_v_s_dims(nv);
                 auto this_conv_bytes = (d_conv - 1) * this_conv_dim * sizeof(float);
-                restore_recurrent_cache_tensors(step, sched, this_ssm_dim * sizeof(float), this_conv_bytes,
+                restore_recurrent_cache_tensors(ssm_slot, conv_slot, seq_id, sched,
+                    this_ssm_dim * sizeof(float), this_conv_bytes,
                     split_sl->splits[id], ckpt.per_step_ssm[il][id], ckpt.per_step_conv[il][id],
                     backends_to_sync);
             }
@@ -2591,6 +2632,7 @@ static void llama_kv_cache_clear(struct llama_kv_cache & cache) {
     }
     cache.head = 0;
     cache.used = 0;
+    cache.n    = 0;
     cache.head_swa     = cache.sink_rows;
     cache.pos_base_swa = 0;
 
@@ -6162,13 +6204,29 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
 
     if (lctx.inp_s_seq_qnext) {
         const int64_t n_tokens = batch.n_tokens;
+        const int64_t n_state_slots = lctx.inp_s_seq_qnext->ne[0];
 
         GGML_ASSERT(ggml_backend_buffer_is_host(lctx.inp_s_seq_qnext->buffer));
         int32_t * data = (int32_t *) lctx.inp_s_seq_qnext->data;
 
+        llama_seq_id state_seq_base = 0;
+        if (n_state_slots > 1) {
+            GGML_ASSERT(batch.n_seq_id[0] == 1);
+            state_seq_base = batch.seq_id[0][0];
+        }
+
         for (int64_t j = 0; j < n_tokens; ++j) {
-            // qwen3next and openPangu use a single local recurrent state slot.
-            data[j] = 0;
+            if (n_state_slots == 1) {
+                // Single-sequence graphs view one local recurrent state row.
+                data[j] = 0;
+                continue;
+            }
+            GGML_ASSERT(batch.n_seq_id[j] == 1);
+            const llama_seq_id local_seq = batch.seq_id[j][0] - state_seq_base;
+            GGML_ASSERT(local_seq >= 0 && local_seq < n_state_slots);
+            for (int64_t i = 0; i < n_state_slots; ++i) {
+                data[j*n_state_slots + i] = i == 0 ? local_seq : -1;
+            }
         }
     }
 
@@ -6531,7 +6589,7 @@ static int llama_decode_internal(
         }
     }
 
-    bool warned_qnext_mixed_repeat = false;
+    bool warned_qnext_irregular_batch = false;
     for (uint32_t cur_token = 0; cur_token < n_tokens_all; ) {
 #if IK_PRINT_TIMING
         auto tim1 = ggml_time_us();
@@ -6541,38 +6599,86 @@ static int llama_decode_internal(
                 n_tokens > 1 &&
                 batch_all.n_seq_id != nullptr &&
                 batch_all.seq_id != nullptr) {
-            bool can_check = true;
-            bool any_diff = false;
-            bool has_dup = false;
-            llama_seq_id first_seq_id = 0;
-            std::unordered_set<llama_seq_id> seen_seq_ids;
-            seen_seq_ids.reserve(n_tokens);
-
-            for (uint32_t i = 0; i < n_tokens; ++i) {
+            auto token_seq = [&](uint32_t i, llama_seq_id & seq) {
                 const uint32_t idx = cur_token + i;
-                if (batch_all.n_seq_id[idx] <= 0 || batch_all.seq_id[idx] == nullptr) {
-                    can_check = false;
-                    break;
+                if (batch_all.n_seq_id[idx] != 1 || batch_all.seq_id[idx] == nullptr) {
+                    return false;
+                }
+                seq = batch_all.seq_id[idx][0];
+                return true;
+            };
+            auto same_output_flag = [&](uint32_t lhs, uint32_t rhs) {
+                return batch_all.logits == nullptr ||
+                    batch_all.logits[cur_token + lhs] == batch_all.logits[cur_token + rhs];
+            };
+
+            llama_seq_id first_seq = 0;
+            if (token_seq(0, first_seq)) {
+                uint32_t run_tokens = 1;
+                llama_seq_id seq = first_seq;
+                while (run_tokens < n_tokens && token_seq(run_tokens, seq) && seq == first_seq) {
+                    ++run_tokens;
                 }
 
-                const llama_seq_id seq_id_i = batch_all.seq_id[idx][0];
-                if (i == 0) {
-                    first_seq_id = seq_id_i;
-                } else if (seq_id_i != first_seq_id) {
-                    any_diff = true;
+                if (run_tokens > 1) {
+                    // A speculative target batch is sequence-major:
+                    //   [slot 0: root,draft...][slot 1: root,draft...]...
+                    // Keep equal-depth, consecutively numbered slot runs in one
+                    // rectangular recurrent graph.  An incomplete/irregular
+                    // suffix is decoded as a safe single-sequence chunk next.
+                    uint32_t rectangular_seqs = 1;
+                    if (run_tokens < n_tokens) {
+                        for (uint32_t off = run_tokens; off + run_tokens <= n_tokens; off += run_tokens) {
+                            const llama_seq_id expected = first_seq + (llama_seq_id) rectangular_seqs;
+                            bool same_run = true;
+                            for (uint32_t j = 0; j < run_tokens; ++j) {
+                                if (!token_seq(off + j, seq) || seq != expected ||
+                                        !same_output_flag(j, off + j) ||
+                                        (batch_all.pos != nullptr &&
+                                         (batch_all.pos[cur_token + j] == 0) !=
+                                         (batch_all.pos[cur_token + off + j] == 0))) {
+                                    same_run = false;
+                                    break;
+                                }
+                            }
+                            // Do not mistake the first run_tokens rows of a
+                            // longer prompt for an equal-depth speculative
+                            // run. Look through the logical batch, even when
+                            // the next row lies past this ubatch boundary.
+                            const uint32_t next = off + run_tokens;
+                            const uint32_t remaining = n_tokens_all - cur_token;
+                            if (same_run && next < remaining &&
+                                    token_seq(next, seq) && seq == expected) {
+                                same_run = false;
+                            }
+                            if (!same_run) {
+                                break;
+                            }
+                            ++rectangular_seqs;
+                        }
+                    }
+                    n_tokens = run_tokens*rectangular_seqs;
+                } else {
+                    // Ordinary continuous batching has one token per slot.  It
+                    // is safe to fuse the longest prefix with unique seq IDs.
+                    std::unordered_set<llama_seq_id> seen;
+                    seen.reserve(n_tokens);
+                    seen.insert(first_seq);
+                    uint32_t unique_tokens = 1;
+                    for (; unique_tokens < n_tokens; ++unique_tokens) {
+                        if (!token_seq(unique_tokens, seq) || !seen.insert(seq).second) {
+                            break;
+                        }
+                    }
+                    n_tokens = unique_tokens;
                 }
-
-                if (!seen_seq_ids.insert(seq_id_i).second) {
-                    has_dup = true;
-                }
+            } else {
+                n_tokens = 1;
             }
 
-            if (can_check && any_diff && has_dup) {
-                n_tokens = 1;
-                if (!warned_qnext_mixed_repeat) {
-                    LLAMA_LOG_WARN("%s: qwen3next mixed-sequence batch contains repeated seq_id values; falling back to single-token chunking\n", __func__);
-                    warned_qnext_mixed_repeat = true;
-                }
+            if (n_tokens == 1 && !warned_qnext_irregular_batch) {
+                LLAMA_LOG_WARN("%s: qwen3next encountered an irregular mixed-sequence batch; falling back to a single-token chunk\n", __func__);
+                warned_qnext_irregular_batch = true;
             }
         }
 
@@ -6690,6 +6796,13 @@ static int llama_decode_internal(
                 return ret;
             }
 
+            // Keep the physical cold/hot boundary monotonic while any sequence
+            // remains live. A slot rollback can lower cell_max(), but moving the
+            // boundary backwards would expose rows whose modulo ring entries have
+            // since been overwritten. A completely empty cache starts fresh.
+            const uint32_t hybrid_n_highwater =
+                kv_self.hybrid_hot_size > 0 && kv_self.used > 0 ? kv_self.n : 0;
+
             // if we have enough unused cells before the current head ->
             //   better to start searching from the beginning of the cache, hoping to fill it
             if (kv_self.head > kv_self.used + 2*n_tokens) {
@@ -6706,7 +6819,10 @@ static int llama_decode_internal(
                 // if we start defragmenting the cache, the benefit from this will be more important
                 const uint32_t pad = llama_kv_cache::get_padding(cparams.flash_attn);
                 auto max_cell = llama_kv_cache_cell_max(kv_self, pad);
-                kv_self.n = std::min(kv_self.size, std::max(pad, GGML_PAD(max_cell, pad)));
+                const uint32_t next_n = std::min(kv_self.size, std::max(pad, GGML_PAD(max_cell, pad)));
+                kv_self.n = kv_self.hybrid_hot_size > 0
+                    ? std::max(hybrid_n_highwater, next_n)
+                    : next_n;
             }
 
             // must run before can_reuse_graph()
@@ -8593,12 +8709,10 @@ struct llama_context * llama_init_from_model(
             llama_free(ctx);
             return nullptr;
         }
-        if (cparams.n_seq_max != 1) {
-            LLAMA_LOG_ERROR("%s: --hybrid-kv currently supports exactly one sequence (requested %u)\n",
-                    __func__, cparams.n_seq_max);
-            llama_free(ctx);
-            return nullptr;
-        }
+        // Multiple synchronized sequences can share the hybrid cache. The
+        // hot ring mirrors physical KV rows, while the attention mask keeps
+        // each sequence isolated. General slot churn is validated below by
+        // the hybrid cache-copy bookkeeping.
         if (!cache_types_supported) {
             LLAMA_LOG_ERROR("%s: --hybrid-kv currently requires f16, bf16, or q8_0 K/V cache types\n", __func__);
             llama_free(ctx);
@@ -9676,7 +9790,13 @@ static bool spec_ckpt_try_per_step(llama_kv_cache & kv, const llama_model & mode
         kv.ckpt.per_step_d_conv         = hp.ssm_d_conv;
     }
 
-    if (!kv.per_step_alloc(model, max_tokens)) {
+    int max_seqs = 1;
+    for (const auto * sl : kv.s_l) {
+        if (sl != nullptr) {
+            max_seqs = std::max(max_seqs, (int) sl->ne[1]);
+        }
+    }
+    if (!kv.per_step_alloc(model, max_tokens, max_seqs)) {
         kv.save_per_step_ssm = false;
         return false;
     }
@@ -9750,6 +9870,12 @@ static const char * llama_spec_ckpt_mode_name(int mode) {
         default:
             return "none";
     }
+}
+
+void llama_spec_ckpt_begin_batch(struct llama_context * ctx) {
+    auto & ckpt = ctx->kv_self.ckpt;
+    ckpt.per_step_capture_filter_active = true;
+    ckpt.per_step_capture_seq_ids.clear();
 }
 
 int llama_spec_ckpt_init(struct llama_context * ctx, int mode, int max_tokens) {
@@ -9859,6 +9985,12 @@ bool llama_spec_ckpt_save(struct llama_context * ctx, llama_seq_id seq_id) {
             if (ctx->model.arch == LLM_ARCH_DEEPSEEK4) {
                 return llama_dsv4_spec_ckpt_save(ctx, true);
             }
+            if (kv.ckpt.per_step_capture_filter_active &&
+                    std::find(kv.ckpt.per_step_capture_seq_ids.begin(),
+                              kv.ckpt.per_step_capture_seq_ids.end(), seq_id) ==
+                        kv.ckpt.per_step_capture_seq_ids.end()) {
+                kv.ckpt.per_step_capture_seq_ids.push_back(seq_id);
+            }
             kv.save_per_step_ssm = true;
             return true;
 
@@ -9897,7 +10029,7 @@ enum llama_spec_ckpt_restore_result llama_spec_ckpt_restore_ex(
                 llama_kv_cache_seq_rm(kv, seq_id, accepted_pos + 1, -1);
                 return llama_dsv4_spec_ckpt_restore(ctx, true, accepted_step);
             }
-            if (!kv.per_step_restore(ctx->model, ctx->sched, accepted_step)) {
+            if (!kv.per_step_restore(ctx->model, ctx->sched, accepted_step, seq_id)) {
                 return LLAMA_SPEC_CKPT_RESTORE_FAILED;
             }
             const llama_pos accepted_pos = n_past + accepted_step;
@@ -9975,6 +10107,10 @@ bool llama_kv_cache_seq_rm(struct llama_context * ctx, llama_seq_id seq_id, llam
         return false;
     }
     const bool result = llama_kv_cache_seq_rm(ctx->kv_self, seq_id, p0, p1);
+    if (result && ctx->kv_self.hybrid_hot_size > 0 && ctx->kv_self.used == 0) {
+        ctx->kv_self.head = 0;
+        ctx->kv_self.n    = 0;
+    }
     if (result && ctx->model.arch == LLM_ARCH_DEEPSEEK4 && p0 <= 0 && p1 < 0) {
         llama_reset_dsv4_state(ctx, seq_id);
     }
@@ -9985,10 +10121,9 @@ void llama_kv_cache_seq_cp(struct llama_context * ctx, llama_seq_id seq_id_src, 
     if (seq_id_src == seq_id_dst) {
         return;
     }
-    if (ctx->kv_self.hybrid_hot_size > 0) {
-        LLAMA_LOG_ERROR("%s: sequence copy is not supported with --hybrid-kv\n", __func__);
-        return;
-    }
+    // Sequence copy only aliases the existing physical KV rows and copies the
+    // recurrent-state source index. The hybrid GPU ring mirrors those same
+    // physical rows, so no K/V payload copy is required here.
     llama_kv_cache_seq_cp(ctx->kv_self, seq_id_src, seq_id_dst, p0, p1);
 }
 

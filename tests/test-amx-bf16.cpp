@@ -162,6 +162,75 @@ bool run_fa_case(int nq, int nk) {
     return true;
 }
 
+bool run_fa_repeated_mask_case(int n_tokens, int nk) {
+    constexpr int d = 256;
+    constexpr int gqa = 6;
+    const int nq = n_tokens*gqa;
+
+    std::vector<float> q(static_cast<size_t>(nq)*d);
+    std::vector<ggml_bf16_t> k(static_cast<size_t>(nk)*d);
+    std::vector<ggml_bf16_t> v(static_cast<size_t>(nk)*d);
+    std::vector<ggml_fp16_t> compact_mask(static_cast<size_t>(n_tokens)*nk);
+    std::vector<ggml_fp16_t> expanded_mask(static_cast<size_t>(nq)*nk);
+    for (size_t i = 0; i < q.size(); ++i) {
+        q[i] = 0.25f*std::sin(0.011f*static_cast<float>(i));
+    }
+    for (size_t i = 0; i < k.size(); ++i) {
+        k[i] = ggml_fp32_to_bf16(0.25f*std::cos(0.005f*static_cast<float>(i)));
+        v[i] = ggml_fp32_to_bf16(std::sin(0.017f*static_cast<float>(i)));
+    }
+    for (int token = 0; token < n_tokens; ++token) {
+        const int visible = nk - 3*token;
+        for (int ik = 0; ik < nk; ++ik) {
+            const ggml_fp16_t value = ggml_fp32_to_fp16(ik < visible ? 0.0f : -INFINITY);
+            compact_mask[static_cast<size_t>(token)*nk + ik] = value;
+            for (int head = 0; head < gqa; ++head) {
+                expanded_mask[static_cast<size_t>(token*gqa + head)*nk + ik] = value;
+            }
+        }
+    }
+
+    std::vector<float> expanded(static_cast<size_t>(nq)*d);
+    std::vector<float> repeated(static_cast<size_t>(nq)*d);
+    std::vector<float> expanded_m(nq), expanded_s(nq), repeated_m(nq), repeated_s(nq);
+    const int mask_stride = nk*sizeof(ggml_fp16_t);
+    const bool expanded_handled = iqk_fa_256_256(
+        GGML_TYPE_BF16, GGML_TYPE_BF16, nq, nk,
+        d*sizeof(float), d*sizeof(ggml_bf16_t), d*sizeof(ggml_bf16_t),
+        mask_stride, d, q.data(), k.data(), v.data(), expanded_mask.data(),
+        1.0f/std::sqrt(static_cast<float>(d)), 0.0f, expanded.data(), nullptr, 0,
+        expanded_m.data(), expanded_s.data());
+    const bool repeated_handled = iqk_fa_256_256(
+        GGML_TYPE_BF16, GGML_TYPE_BF16, nq, nk,
+        d*sizeof(float), d*sizeof(ggml_bf16_t), d*sizeof(ggml_bf16_t),
+        -mask_stride, d, q.data(), k.data(), v.data(), compact_mask.data(),
+        1.0f/std::sqrt(static_cast<float>(d)), 0.0f, repeated.data(), nullptr, 0,
+        repeated_m.data(), repeated_s.data());
+    if (!expanded_handled || !repeated_handled) {
+        std::fprintf(stderr, "flash attention rejected repeated-mask case tokens=%d, nk=%d\n", n_tokens, nk);
+        return false;
+    }
+
+    float max_error = 0.0f;
+    for (size_t i = 0; i < expanded.size(); ++i) {
+        max_error = std::max(max_error, std::abs(expanded[i] - repeated[i]));
+    }
+    for (int i = 0; i < nq; ++i) {
+        max_error = std::max(max_error, std::abs(expanded_m[i] - repeated_m[i]));
+        max_error = std::max(max_error, std::abs(expanded_s[i] - repeated_s[i]));
+    }
+    if (max_error > 1.0e-6f) {
+        std::fprintf(stderr,
+            "repeated-mask flash attention mismatch for tokens=%d, nk=%d: max_error=%g\n",
+            n_tokens, nk, max_error);
+        return false;
+    }
+
+    std::printf("PASS AMX FA repeated masks tokens=%d, nq=%d, nk=%d, max_error=%g\n",
+        n_tokens, nq, nk, max_error);
+    return true;
+}
+
 int run_benchmark() {
     constexpr matrix_case tc = { 512, 128, 4096, 1 };
     std::mt19937 rng(0x9470cu);
@@ -210,7 +279,9 @@ int main(int argc, char ** argv) {
     for (const matrix_case & tc : cases) {
         if (!run_case(tc)) return 1;
     }
+    if (!run_fa_case( 6, 64)) return 1; // q_step=8,  k_step=64
     if (!run_fa_case(12, 64)) return 1; // q_step=16, k_step=64
     if (!run_fa_case(30, 96)) return 1; // q_step=32, k_step=32
+    if (!run_fa_repeated_mask_case(5, 96)) return 1;
     return 0;
 }
