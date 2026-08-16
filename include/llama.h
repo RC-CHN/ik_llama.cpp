@@ -479,11 +479,14 @@ extern "C" {
         int32_t n_k_last;
         int32_t n_v_first;
         int32_t n_v_last;
+        uint32_t hybrid_kv_hot;   // GPU hot-window capacity in tokens (0 = all-cold diagnostic path) [EXPERIMENTAL]
+        uint32_t hybrid_kv_block; // hot/cold migration block size in tokens [EXPERIMENTAL]
 
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool logits_all;  // the llama_decode() call computes all logits, not just the last one (DEPRECATED - set llama_batch.logits instead)
         bool embeddings;  // if true, extract embeddings (together with logits)
         bool offload_kqv; // whether to offload the KQV ops (including the KV cache) to GPU
+        bool hybrid_kv;   // keep Qwen3.5 dense attention KV in CPU HBM while recurrent/MTP state stays on GPU [EXPERIMENTAL]
         bool flash_attn;  // whether to use flash attention [EXPERIMENTAL]
         int  mla_attn;    // whether to use MLA attention [EXPERIMENTAL]
         int  attn_max_batch;    // maximum batch size for attention computations [EXPERIMENTAL]

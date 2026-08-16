@@ -2130,6 +2130,19 @@ inline void iqk_flash_helper_T(int nq1, int nk1, int stride_q, int stride_k, int
                         float scale, float softcap, float * qkv, const float * sinkf, int sink_stride, float * M, float * S) {
     HelperBF16<Dk, k_step> kh(k, stride_k);
     HelperBF16<Dv, k_step> vh(v, stride_v);
+    // A fused Qwen MTP/GQA batch contains 12, 18, 24, or 30 query rows.
+    // Pick a q_step that covers the complete batch so K/V is traversed once,
+    // even when each NUMA worker owns less than 4096 cache rows.
+    if (nq1 > 16 && nq1 <= 32) {
+        FlashAttnBF16<Dk, Dv, 32, k_step> fa(scale, softcap, sinkf, sink_stride);
+        fa.compute(kh, vh, nq1, nk1, stride_q, stride_m, stride_qkv, q, (const char *)mask, qkv, M, S);
+        return;
+    }
+    if (nq1 > 8 && nq1 <= 16) {
+        FlashAttnBF16<Dk, Dv, 16, k_step> fa(scale, softcap, sinkf, sink_stride);
+        fa.compute(kh, vh, nq1, nk1, stride_q, stride_m, stride_qkv, q, (const char *)mask, qkv, M, S);
+        return;
+    }
     if (nk1 >= 4096) {
         if (nq1 >= 64) {
             FlashAttnBF16<Dk, Dv, 64, k_step> fa(scale, softcap, sinkf, sink_stride);
@@ -2142,7 +2155,7 @@ inline void iqk_flash_helper_T(int nq1, int nk1, int stride_q, int stride_k, int
             return;
         }
     }
-    if (nq1 >= 8) {
+    if (nq1 >= 2) {
         FlashAttnBF16<Dk, Dv, 8, k_step> fa(scale, softcap, sinkf, sink_stride);
         fa.compute(kh, vh, nq1, nk1, stride_q, stride_m, stride_qkv, q, (const char *)mask, qkv, M, S);
     } else {
@@ -2267,4 +2280,3 @@ IQK_FA_CASE(iqk_fa_96_96);
 IQK_FA_CASE(iqk_fa_64_64);
 
 #endif
-

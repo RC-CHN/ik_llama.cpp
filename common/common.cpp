@@ -814,6 +814,7 @@ void gpt_params_parse_from_env(gpt_params & params) {
     get_env("LLAMA_ARG_ENDPOINT_SLOTS",   params.endpoint_slots);
     get_env("LLAMA_ARG_EMBEDDINGS",       params.embedding);
     get_env("LLAMA_ARG_FLASH_ATTN",       params.flash_attn);
+    get_env("LLAMA_ARG_HYBRID_KV",        params.hybrid_kv);
     get_env("LLAMA_ARG_DEFRAG_THOLD",     params.defrag_thold);
     get_env("LLAMA_ARG_CONT_BATCHING",    params.cont_batching);
     get_env("LLAMA_ARG_HOST",             params.hostname);
@@ -1829,6 +1830,20 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
     }
     if (arg == "-nkvo" || arg == "--no-kv-offload") {
         params.no_kv_offload = true;
+        return true;
+    }
+    if (arg == "--hybrid-kv") {
+        params.hybrid_kv = true;
+        return true;
+    }
+    if (arg == "--hybrid-kv-hot") {
+        CHECK_ARG
+        params.hybrid_kv_hot = std::stoul(argv[i]);
+        return true;
+    }
+    if (arg == "--hybrid-kv-block") {
+        CHECK_ARG
+        params.hybrid_kv_block = std::stoul(argv[i]);
         return true;
     }
     if (arg == "-ctk" || arg == "--cache-type-k") {
@@ -3260,6 +3275,9 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "-gaw,  --grp-attn-w N",         "group-attention width (default: %.1f)", (double)params.grp_attn_w });
     options.push_back({ "*",           "-dkvc, --dump-kv-cache",        "verbose print of the KV cache" });
     options.push_back({ "*",           "-nkvo, --no-kv-offload",        "disable KV offload" });
+    options.push_back({ "*",           "       --hybrid-kv",            "keep Qwen3.5 dense attention KV in CPU HBM; keep recurrent/MTP state on GPU (experimental)" });
+    options.push_back({ "*",           "       --hybrid-kv-hot N",      "GPU hot KV window in tokens (default: %u; 0 = all-cold diagnostic path)", params.hybrid_kv_hot });
+    options.push_back({ "*",           "       --hybrid-kv-block N",    "hot/cold KV block size in tokens (default: %u)", params.hybrid_kv_block });
     options.push_back({ "*",           "-ctk,  --cache-type-k TYPE",    "KV cache data type for K (default: %s)", params.cache_type_k.c_str() });
     options.push_back({ "*",           "-ictk, --indexer-cache-type-k TYPE", "indexer K-cache data type (default: %s)", params.indexer_cache_type_k.c_str() });
     options.push_back({ "*",           "-ctv,  --cache-type-v TYPE",    "KV cache data type for V (default: %s)", params.cache_type_v.c_str() });
@@ -4354,9 +4372,12 @@ struct llama_context_params common_context_params_to_llama(const gpt_params & pa
     cparams.pooling_type      = params.pooling_type;
     cparams.attention_type    = params.attention_type;
     cparams.defrag_thold      = params.defrag_thold;
+    cparams.hybrid_kv_hot     = params.hybrid_kv_hot;
+    cparams.hybrid_kv_block   = params.hybrid_kv_block;
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
     cparams.offload_kqv       = !params.no_kv_offload;
+    cparams.hybrid_kv         = params.hybrid_kv;
     cparams.flash_attn        = params.flash_attn;
     cparams.mla_attn          = params.mla_attn;
     cparams.attn_max_batch    = params.attn_max_batch;

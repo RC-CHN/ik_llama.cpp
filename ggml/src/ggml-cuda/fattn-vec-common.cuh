@@ -721,6 +721,59 @@ static __global__ void flash_attn_combine_results(
     dst[tid] = VKQ_numerator / VKQ_denominator;
 }
 
+template<int D> // D == head size
+#if !defined(GGML_USE_HIP)
+__launch_bounds__(D, 1)
+#endif // !(defined(GGML_USE_HIP)
+static __global__ void flash_attn_combine_results_stats(
+        const float  * __restrict__ VKQ_parts,
+        const float2 * __restrict__ VKQ_meta,
+        float * __restrict__ dst,
+        const int parallel_blocks) {
+    const int ne01 = gridDim.x;
+    const int ne02 = gridDim.y;
+
+    const int col      = blockIdx.x;
+    const int head     = blockIdx.y;
+    const int sequence = blockIdx.z;
+    const int row = (sequence*ne01 + col)*ne02 + head;
+
+    VKQ_parts += row*parallel_blocks*D;
+    VKQ_meta  += row*parallel_blocks;
+    dst       += row*(D + 2);
+
+    const int tid = threadIdx.x;
+    __builtin_assume(tid < D);
+
+    extern __shared__ float2 meta[];
+    for (int i = tid; i < 2*parallel_blocks; i += D) {
+        ((float *) meta)[i] = ((const float *) VKQ_meta)[i];
+    }
+    __syncthreads();
+
+    float kqmax = meta[0].x;
+    for (int l = 1; l < parallel_blocks; ++l) {
+        kqmax = max(kqmax, meta[l].x);
+    }
+
+    float numerator   = 0.0f;
+    float denominator = 0.0f;
+    for (int l = 0; l < parallel_blocks; ++l) {
+        const float diff = meta[l].x - kqmax;
+        float part_scale = expf(diff);
+        const uint32_t ftz_mask = 0xFFFFFFFF * (diff > SOFTMAX_FTZ_THRESHOLD);
+        *((uint32_t *) &part_scale) &= ftz_mask;
+        numerator   += part_scale*VKQ_parts[l*D + tid];
+        denominator += part_scale*meta[l].y;
+    }
+
+    dst[tid] = numerator;
+    if (tid == 0) {
+        dst[D + 0] = kqmax;
+        dst[D + 1] = denominator;
+    }
+}
+
 template<int width = WARP_SIZE>
 static __device__ __forceinline__ int warp_reduce_all(int x) {
     if constexpr (width == WARP_SIZE) { //ggml_cuda_get_physical_warp_size()) {
@@ -870,6 +923,7 @@ void launch_fattn(
     const ggml_tensor * sinks = dst->src[4];
 
     ggml_tensor * KQV = dst;
+    const bool return_stats = KQV->op_params[5] != 0;
 
     GGML_ASSERT(Q->type == GGML_TYPE_F32);
     GGML_ASSERT(KQV->type == GGML_TYPE_F32);
@@ -1032,12 +1086,20 @@ void launch_fattn(
         }
     }
 
+    // The vector kernels expose M/S only for partitioned execution. A second,
+    // empty partition is safe for a single KV tile and lets the stats path use
+    // the same combine code for every context length.
+    if (return_stats) {
+        GGML_ASSERT(!sinks && n_swa == 0);
+        parallel_blocks = std::max(parallel_blocks, 2);
+    }
+
     blocks_num.x = ntiles_x;
     blocks_num.y = parallel_blocks;
     blocks_num.z = Q->ne[2]*Q->ne[3];
 
     if (parallel_blocks > 1) {
-        dst_tmp.alloc(parallel_blocks*ggml_nelements(KQV));
+        dst_tmp.alloc(parallel_blocks*ggml_nrows(KQV)*DV);
         dst_tmp_meta.alloc(parallel_blocks*ggml_nrows(KQV));
     }
 
@@ -1077,7 +1139,15 @@ void launch_fattn(
     );
     CUDA_CHECK(cudaGetLastError());
 
-    if (parallel_blocks > 1) {
+    if (return_stats) {
+        const dim3 block_dim_combine(DV, 1, 1);
+        const dim3 blocks_num_combine(Q->ne[1], Q->ne[2], Q->ne[3]);
+        const size_t nbytes_shared_combine = parallel_blocks*sizeof(float2);
+
+        flash_attn_combine_results_stats<DV>
+            <<<blocks_num_combine, block_dim_combine, nbytes_shared_combine, main_stream>>>
+            (dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks);
+    } else if (parallel_blocks > 1) {
         const dim3 block_dim_combine(DV, 1, 1);
         const dim3 blocks_num_combine(Q->ne[1], Q->ne[2], Q->ne[3]);
         const size_t nbytes_shared_combine = parallel_blocks*sizeof(float2);

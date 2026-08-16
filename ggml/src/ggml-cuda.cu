@@ -77,6 +77,7 @@
 #include <memory>
 #include <mutex>
 #include <condition_variable>
+#include <cstring>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdarg.h>
@@ -86,7 +87,11 @@
 #include <sstream>
 
 #ifdef __linux__
+#include <cerrno>
+#include <linux/mempolicy.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 #endif
 
 #define IK_PRINT_TIMING 0
@@ -1424,6 +1429,10 @@ GGML_CALL static void ggml_backend_cuda_host_buffer_free_buffer(ggml_backend_buf
     munmap(buffer->context, buffer->size);
 }
 
+GGML_CALL static void ggml_backend_cuda_host_buffer_free_unregistered(ggml_backend_buffer_t buffer) {
+    munmap(buffer->context, buffer->size);
+}
+
 static void * ggml_cuda_host_malloc(size_t size) {
     if (getenv("GGML_CUDA_NO_PINNED") != nullptr) {
         return nullptr;
@@ -1553,6 +1562,75 @@ GGML_CALL ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
     };
 
     return &ggml_backend_cuda_buffer_type_host;
+}
+
+GGML_CALL bool ggml_backend_cuda_host_buffer_numa_rebind(
+        ggml_backend_buffer_t                    buffer,
+        const struct ggml_cuda_host_numa_range * ranges,
+        size_t                                   n_ranges) {
+#if defined(__linux__) && !defined(GGML_USE_HIPBLAS) && !defined(GGML_USE_MUSA)
+    if (buffer == nullptr || ranges == nullptr || n_ranges == 0 ||
+            buffer->buft != ggml_backend_cuda_host_buffer_type()) {
+        return false;
+    }
+
+    const long page_size_raw = sysconf(_SC_PAGESIZE);
+    if (page_size_raw <= 0) {
+        GGML_CUDA_LOG_WARN("%s: failed to query the Linux page size\n", __func__);
+        return false;
+    }
+    const size_t page_size = (size_t) page_size_raw;
+    for (size_t i = 0; i < n_ranges; ++i) {
+        const auto & range = ranges[i];
+        if (range.size == 0 || range.offset > buffer->size ||
+                range.size > buffer->size - range.offset ||
+                range.offset % page_size != 0 || range.size % page_size != 0 ||
+                range.node >= 8*sizeof(unsigned long)) {
+            GGML_CUDA_LOG_WARN("%s: invalid NUMA range %zu: offset=%zu, size=%zu, node=%u\n",
+                    __func__, i, range.offset, range.size, range.node);
+            return false;
+        }
+    }
+
+    void * base = ggml_backend_buffer_get_base(buffer);
+    cudaError_t err = cudaHostUnregister(base);
+    if (err != cudaSuccess) {
+        cudaGetLastError();
+        GGML_CUDA_LOG_WARN("%s: cudaHostUnregister failed: %s\n", __func__, cudaGetErrorString(err));
+        return false;
+    }
+
+    bool bound = true;
+    for (size_t i = 0; i < n_ranges; ++i) {
+        const auto & range = ranges[i];
+        const unsigned long mask = 1UL << range.node;
+        errno = 0;
+        const long rc = syscall(SYS_mbind, (char *) base + range.offset, range.size,
+                MPOL_BIND | MPOL_F_STATIC_NODES, &mask, 8*sizeof(mask), MPOL_MF_MOVE);
+        if (rc != 0) {
+            GGML_CUDA_LOG_WARN("%s: mbind failed for range %zu on node %u: %s\n",
+                    __func__, i, range.node, strerror(errno));
+            bound = false;
+        }
+    }
+
+    err = cudaHostRegister(base, buffer->size, cudaHostRegisterPortable);
+    if (err != cudaSuccess) {
+        cudaGetLastError();
+        GGML_CUDA_LOG_ERROR("%s: cudaHostRegister failed after NUMA rebinding: %s\n",
+                __func__, cudaGetErrorString(err));
+        // Keep destruction safe if CUDA cannot restore the registration. The
+        // caller will disable the NUMA-aware kernel and use the host fallback.
+        buffer->iface.free_buffer = ggml_backend_cuda_host_buffer_free_unregistered;
+        return false;
+    }
+    return bound;
+#else
+    GGML_UNUSED(buffer);
+    GGML_UNUSED(ranges);
+    GGML_UNUSED(n_ranges);
+    return false;
+#endif
 }
 
 //static bool ggml_backend_buffer_is_cuda_host(ggml_backend_buffer_t buffer) {

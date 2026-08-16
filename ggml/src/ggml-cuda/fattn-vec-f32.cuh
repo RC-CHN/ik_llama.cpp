@@ -221,7 +221,7 @@ static __global__ void flash_attn_vec_ext_f32(
         if (mask) {
 #pragma unroll
             for (int j = 0; j < ncols; ++j) {
-                maskf_shared[j*Dk + tid] = slope*__half2float(maskh[j*ne11 + tid]);
+                maskf_shared[j*Dk + tid] = slope*__half2float(maskh[j*(nb31/sizeof(half)) + tid]);
             }
             __syncthreads();
         }

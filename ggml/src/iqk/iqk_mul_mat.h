@@ -66,6 +66,9 @@ IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float max_bias,
                             const void  * sinks,    // mask. If not null, assumed to be fp16. nq x nk elements
                             float         scale,    // scale applied before softmax
                             float         softcap,  // if > 0, a "soft-cap" operation is applied before softmax
+                            bool          return_stats,
+                            int           numa_shards,
+                            int           numa_cold_capacity,
                             float       * qkv,      // v*softmax(scale*(k*q))
                             void * work_buffer, barrier_t barrier, void * barrier_data,
                             int ith, int nth, int n_swa, struct ggml_tensor * indexer);

@@ -12,6 +12,7 @@
 #if defined IQK_IMPLEMENT && defined GGML_IQK_FLASH_ATTENTION
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstdio>
 #include <vector>
 #include <cstdint>
@@ -45,12 +46,87 @@ inline void accumulate_qkv(int Dv, float& M, float& S, float Mj, float Sj, float
         for (int i = 0; i < Dv; ++i) Racc[i] += c*R[i];
     }
 }
+inline float pack_softmax_max(float M) {
+    return std::isfinite(M) ? M : -32752.0f;
+}
+
+inline int32_t fa_param_i32(const ggml_tensor * tensor, int index) {
+    int32_t value;
+    std::memcpy(&value, tensor->op_params + index*sizeof(value), sizeof(value));
+    return value;
+}
+
+inline bool numa_fa_eligible(const ggml_tensor * dst, int nth) {
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    const int n_shards = fa_param_i32(dst, 6);
+    const int cold_capacity = fa_param_i32(dst, 7);
+    if (fa_param_i32(dst, 5) == 0 || n_shards < 2 || nth % n_shards != 0 ||
+            Q->type != GGML_TYPE_F32 || K->type != GGML_TYPE_BF16 || V->type != GGML_TYPE_BF16 ||
+            Q->ne[3] != 1 || K->ne[3] != 1 || V->ne[3] != 1 ||
+            Q->ne[0] != 256 || V->ne[0] != 256 || Q->ne[0] != K->ne[0] ||
+            Q->ne[1] < 1 || Q->ne[1] > 16 || K->ne[1] != V->ne[1] ||
+            K->ne[1] < 32 || K->ne[1] % 32 != 0 ||
+            K->ne[2] < 1 || K->ne[2] != V->ne[2] || Q->ne[2] % K->ne[2] != 0 ||
+            cold_capacity < K->ne[1] || cold_capacity % (32*n_shards) != 0) {
+        return false;
+    }
+    const int gqa = Q->ne[2]/K->ne[2];
+    return gqa > 1 && gqa <= 256;
+}
+
+inline int numa_fa_chunks(const ggml_tensor * dst, int nth) {
+    const int n_shards = fa_param_i32(dst, 6);
+    const int n_pairs = dst->src[1]->ne[2]*dst->src[0]->ne[1];
+    const int local_nth = nth/n_shards;
+    return std::max(1, (local_nth + n_pairs - 1)/n_pairs);
+}
+
+inline bool numa_fa_batch_queries_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("GGML_NUMA_FA_BATCH_QUERIES");
+        return value == nullptr || value[0] == '\0' ||
+            (std::strcmp(value, "0") != 0 && std::strcmp(value, "false") != 0 &&
+             std::strcmp(value, "off") != 0);
+    }();
+    return enabled;
+}
+
+inline bool numa_fa_batch_queries_eligible(const ggml_tensor * dst, int nth) {
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const int n_queries = dst->src[0]->ne[1];
+    const int gqa = Q->ne[2]/K->ne[2];
+    return numa_fa_eligible(dst, nth) && numa_fa_batch_queries_enabled() &&
+        n_queries >= 2 && n_queries <= 5 && Q->ne[2] == 24 &&
+        K->ne[2] == 4 && gqa == 6;
+}
+
+inline size_t numa_fa_align64(size_t size) {
+    return (size + 63) & ~(size_t) 63;
+}
 }
 
 size_t iqk_fa_work_buffer_size(const struct ggml_tensor * dst, int nth) {
     auto Q = dst->src[0];
     auto K = dst->src[1];
     auto V = dst->src[2];
+    if (numa_fa_eligible(dst, nth)) {
+        const int n_shards = fa_param_i32(dst, 6);
+        if (numa_fa_batch_queries_eligible(dst, nth)) {
+            const int local_nth = nth/n_shards;
+            const size_t packed_q_size = numa_fa_align64(
+                    (size_t) Q->ne[1]*Q->ne[2]*Q->ne[0]*sizeof(float));
+            return packed_q_size +
+                (size_t) n_shards*local_nth*sizeof(float *);
+        }
+        const int n_pairs = K->ne[2]*Q->ne[1];
+        const int n_chunks = numa_fa_chunks(dst, nth);
+        const int gqa = Q->ne[2]/K->ne[2];
+        const size_t result_size = (V->ne[0] + 16)*gqa*sizeof(float);
+        return (size_t) n_shards*n_pairs*n_chunks*result_size;
+    }
     auto indexer = dst->src[5];
     if (indexer && indexer->type == GGML_TYPE_I32 && indexer->ne[0] < K->ne[1] &&
         Q->ne[3] == 1 && K->ne[3] == 1 && V->ne[3] == 1 && K->ne[2] == 1) {
@@ -172,11 +248,15 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
                             const void  * sinks,    // mask. If not null, assumed to be fp16. nq x nk elements
                             float         scale,    // scale applied before softmax
                             float         softcap,  // if > 0, a "soft-cap" operation is applied before softmax
+                            bool          return_stats,
+                            int           numa_shards,
+                            int           numa_cold_capacity,
                             float       * qkv,      // v*softmax(scale*(k*q))
                             [[maybe_unused]] void * work_buffer_in, [[maybe_unused]] barrier_t barrier, [[maybe_unused]] void * barrier_data,
                             int ith, int nth, int n_swa, [[maybe_unused]] ggml_tensor * indexer) {
 
     if (type_q != 0 || type_mask != 1 || max_bias > 0) return false;
+    if (return_stats && (indexer || sinks || n_swa > 0)) return false;
 
     if (indexer && indexer->type == GGML_TYPE_I32) {
         //if (indexer->ne[0] < nek1 && neq1 >= nth && neq3 == 1 && nek3 == 1 && nev3 == 1 && nek2 == 1) {
@@ -332,6 +412,203 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
     int rk3 = neq3/nek3;
     int rv3 = neq3/nev3;
 
+    // The hybrid Qwen3.5 cache places each quarter of its maximum cold token
+    // range on one HBM NUMA node. Exact worker pinning maps thread i to
+    // node i % numa_shards. Compute only node-local K/V ranges, retaining the
+    // raw online-softmax state for a stable cross-node merge.
+    if (return_stats && numa_shards >= 2 && nth % numa_shards == 0 &&
+            int_type_k_in == GGML_TYPE_BF16 && int_type_v == GGML_TYPE_BF16 &&
+            neq3 == 1 && nek3 == 1 && nev3 == 1 && Dk == 256 && Dv == 256 &&
+            neq1 >= 1 && neq1 <= 16 && nek1 >= 32 && nek1 % 32 == 0 && nek2 == nev2 &&
+            neq2 % nek2 == 0 && rk2 == rv2 && rk2 > 1 && rk2 <= 256 &&
+            numa_cold_capacity >= nek1 && numa_cold_capacity % (32*numa_shards) == 0 &&
+            work_buffer_in != nullptr) {
+        const int local_nth = nth/numa_shards;
+        const int node = ith % numa_shards;
+        const int local_ith = ith/numa_shards;
+
+        auto node_bounds = [&](int inode, int & first, int & last) {
+            first = (int) ((int64_t) numa_cold_capacity*inode/numa_shards);
+            last  = (int) ((int64_t) numa_cold_capacity*(inode + 1)/numa_shards);
+            first = std::min(first, nek1);
+            last  = std::min(last,  nek1);
+        };
+
+        // MTP verifies 2--5 query tokens at once. Pack the six GQA queries for
+        // each KV head next to one another, then let every node-local worker
+        // scan one thirteenth of that node's K/V exactly once. The cold range
+        // precedes every query token, so all packed queries share the same
+        // unmasked cold-mask row.
+        if (numa_fa_batch_queries_enabled() && neq1 >= 2 && neq1 <= 5 &&
+                neq2 == 24 && nek2 == 4 && rk2 == 6) {
+            const int n_queries = neq1*rk2;
+            const int n_chunks = local_nth;
+            const size_t packed_q_size = numa_fa_align64(
+                    (size_t) neq1*neq2*Dk*sizeof(float));
+            float * packed_q = (float *) work_buffer_in;
+            float ** partial_ptrs = (float **) ((char *) work_buffer_in + packed_q_size);
+
+            constexpr int max_queries = 5*6;
+            constexpr int result_stride = (256 + 16)*max_queries;
+            alignas(64) float local_results[2][result_stride];
+
+            auto chunk_bounds = [&](int inode, int ichunk, int & first, int & last) {
+                int node_first, node_last;
+                node_bounds(inode, node_first, node_last);
+                const int n_blocks = (node_last - node_first)/32;
+                first = node_first + 32*((int64_t) n_blocks*ichunk/n_chunks);
+                last  = node_first + 32*((int64_t) n_blocks*(ichunk + 1)/n_chunks);
+            };
+            for (int row = ith; row < neq1*neq2; row += nth) {
+                const int iq1 = row/neq2;
+                const int iq2 = row - iq1*neq2;
+                const int ik02 = iq2/rk2;
+                const int il = iq2 - ik02*rk2;
+                const int packed_row = ik02*n_queries + iq1*rk2 + il;
+                const float * src = (const float *) ((const char *) q +
+                        (int64_t) iq1*stride_q + (int64_t) iq2*nbq2);
+                std::memcpy(packed_q + (size_t) packed_row*Dk, src, Dk*sizeof(float));
+            }
+            partial_ptrs[ith] = local_results[0];
+            barrier(barrier_data);
+
+            int first, last;
+            chunk_bounds(node, local_ith, first, last);
+            for (int head_first = 0; head_first < nek2; head_first += 2) {
+                const int n_heads = std::min(2, nek2 - head_first);
+                if (last > first) {
+                    const char * this_m = mask ? (const char *) mask +
+                            (int64_t) first*sizeof(uint16_t) : nullptr;
+                    for (int slot = 0; slot < n_heads; ++slot) {
+                        const int ik02 = head_first + slot;
+                        const float * this_q = packed_q + (size_t) ik02*n_queries*Dk;
+                        const char * this_k = (const char *) k +
+                                (int64_t) ik02*nbk2 + (int64_t) first*stride_k;
+                        const char * this_v = (const char *) v +
+                                (int64_t) ik02*nbv2 + (int64_t) first*stride_v;
+                        float * out = local_results[slot];
+                        if (!iqk_flash_attn_impl(int_type_k_in, int_type_v,
+                                Dk, Dv, n_queries, last - first, Dk*sizeof(float),
+                                stride_k, stride_v, 0, Dv,
+                                this_q, this_k, this_v, this_m, nullptr, 0,
+                                scale, softcap, out, out + Dv*n_queries,
+                                out + (Dv + 1)*n_queries)) {
+                            return false;
+                        }
+                    }
+                }
+                barrier(barrier_data);
+
+                for (int output = ith; output < n_heads*n_queries; output += nth) {
+                    const int slot = output/n_queries;
+                    const int packed_row = output - slot*n_queries;
+                    const int iq1 = packed_row/rk2;
+                    const int il = packed_row - iq1*rk2;
+                    const int ik02 = head_first + slot;
+                    const int iq2 = ik02*rk2 + il;
+                    float * Racc = (float *) ((char *) qkv + (iq2 + (int64_t) iq1*ne1)*nb1);
+                    float M = -INFINITY;
+                    float S = 0.0f;
+                    for (int inode = 0; inode < numa_shards; ++inode) {
+                        for (int ichunk = 0; ichunk < n_chunks; ++ichunk) {
+                            int chunk_first, chunk_last;
+                            chunk_bounds(inode, ichunk, chunk_first, chunk_last);
+                            if (chunk_last <= chunk_first) {
+                                continue;
+                            }
+                            const int thread = ichunk*numa_shards + inode;
+                            const float * part = partial_ptrs[thread] + slot*result_stride;
+                            const float * R = part + packed_row*Dv;
+                            const float * Mj = part + Dv*n_queries;
+                            const float * Sj = Mj + n_queries;
+                            accumulate_qkv(Dv, M, S, Mj[packed_row], Sj[packed_row], Racc, R);
+                        }
+                    }
+                    Racc[Dv + 0] = pack_softmax_max(M);
+                    Racc[Dv + 1] = S;
+                }
+                barrier(barrier_data);
+            }
+            return true;
+        }
+
+        const int n_pairs = nek2*neq1;
+        const int n_chunks = std::max(1, (local_nth + n_pairs - 1)/n_pairs);
+        const size_t result_size = (Dv + 16)*rk2*sizeof(float);
+        char * result_buffer = (char *) work_buffer_in;
+
+        auto chunk_bounds = [&](int inode, int ichunk, int & first, int & last) {
+            int node_first, node_last;
+            node_bounds(inode, node_first, node_last);
+            const int n_blocks = (node_last - node_first)/32;
+            first = node_first + 32*((int64_t) n_blocks*ichunk/n_chunks);
+            last  = node_first + 32*((int64_t) n_blocks*(ichunk + 1)/n_chunks);
+        };
+        auto partial = [&](int inode, int pair, int ichunk) -> float * {
+            const size_t index = ((size_t) inode*n_pairs + pair)*n_chunks + ichunk;
+            return (float *) (result_buffer + index*result_size);
+        };
+
+        const int n_local_tasks = n_pairs*n_chunks;
+        for (int local_task = local_ith; local_task < n_local_tasks; local_task += local_nth) {
+            const int pair = local_task/n_chunks;
+            const int ichunk = local_task - pair*n_chunks;
+            const int ik02 = pair/neq1;
+            const int iq1 = pair - ik02*neq1;
+            int first, last;
+            chunk_bounds(node, ichunk, first, last);
+            if (last <= first) {
+                continue;
+            }
+
+            const float * this_q = (const float *) ((const char *) q +
+                    (int64_t) iq1*stride_q + (int64_t) ik02*rk2*nbq2);
+            const char * this_k = (const char *) k +
+                    (int64_t) ik02*nbk2 + (int64_t) first*stride_k;
+            const char * this_v = (const char *) v +
+                    (int64_t) ik02*nbv2 + (int64_t) first*stride_v;
+            const char * this_m = mask ? (const char *) mask +
+                    (int64_t) iq1*stride_m + (int64_t) first*sizeof(uint16_t) : nullptr;
+            float * out = partial(node, pair, ichunk);
+            if (!iqk_flash_attn_impl(int_type_k_in, int_type_v,
+                    Dk, Dv, rk2, last - first, nbq2, stride_k, stride_v, 0, Dv,
+                    this_q, this_k, this_v, this_m, nullptr, 0,
+                    scale, softcap, out, out + Dv*rk2, out + (Dv + 1)*rk2)) {
+                return false;
+            }
+        }
+
+        barrier(barrier_data);
+
+        for (int output = ith; output < neq1*neq2; output += nth) {
+            const int iq1 = output/neq2;
+            const int iq2 = output - iq1*neq2;
+            const int ik02 = iq2/rk2;
+            const int il = iq2 - ik02*rk2;
+            const int pair = ik02*neq1 + iq1;
+            float * Racc = (float *) ((char *) qkv + (iq2 + (int64_t) iq1*ne1)*nb1);
+            float M = -INFINITY;
+            float S = 0.0f;
+            for (int inode = 0; inode < numa_shards; ++inode) {
+                for (int ichunk = 0; ichunk < n_chunks; ++ichunk) {
+                    int first, last;
+                    chunk_bounds(inode, ichunk, first, last);
+                    if (last <= first) {
+                        continue;
+                    }
+                    const float * part = partial(inode, pair, ichunk);
+                    const float * R = part + il*Dv;
+                    const float * Mj = part + Dv*rk2;
+                    const float * Sj = Mj + rk2;
+                    accumulate_qkv(Dv, M, S, Mj[il], Sj[il], Racc, R);
+                }
+            }
+            Racc[Dv + 0] = pack_softmax_max(M);
+            Racc[Dv + 1] = S;
+        }
+        return true;
+    }
+
     int first_k = 0, last_k = nek1;
     if (neq3 == 1 && rk2 > 1 && neq1 == 1 && nek1 > 256 && mask) {
         // This is a quick hack for SWA models.
@@ -432,8 +709,13 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
                     R += j*Dv;
                     accumulate_qkv(Dv, M, S, Mj[j], Sj[j], Racc, R);
                 }
-                float norm = S > 0 ? 1/S : 1;
-                for (int i = 0; i < Dv; ++i) Racc[i] *= norm;
+                if (return_stats) {
+                    Racc[Dv + 0] = pack_softmax_max(M);
+                    Racc[Dv + 1] = S;
+                } else {
+                    float norm = S > 0 ? 1/S : 1;
+                    for (int i = 0; i < Dv; ++i) Racc[i] *= norm;
+                }
             }
             return true;
         }
@@ -500,8 +782,13 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
                         R += jj*Dv;
                         accumulate_qkv(Dv, M, S, Mj[jj], Sj[jj], Racc, R);
                     }
-                    float norm = S > 0 ? 1/S : 1;
-                    for (int i = 0; i < Dv; ++i) Racc[i] *= norm;
+                    if (return_stats) {
+                        Racc[Dv + 0] = pack_softmax_max(M);
+                        Racc[Dv + 1] = S;
+                    } else {
+                        float norm = S > 0 ? 1/S : 1;
+                        for (int i = 0; i < Dv; ++i) Racc[i] *= norm;
+                    }
                 }
                 return true;
             }
@@ -575,8 +862,52 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
                     S += expf(s - M);
                 }
             }
-            float norm = S > 0 ? 1/S : 1;
-            for (int i = 0; i < Dv; ++i) Racc[i] *= norm;
+            if (return_stats) {
+                Racc[Dv + 0] = pack_softmax_max(M);
+                Racc[Dv + 1] = S;
+            } else {
+                float norm = S > 0 ? 1/S : 1;
+                for (int i = 0; i < Dv; ++i) Racc[i] *= norm;
+            }
+        }
+        return true;
+    }
+
+    // Hybrid CPU/GPU attention asks for the unnormalized online-softmax state
+    // for a small target-verification batch.  The generic scheduling below
+    // distributes query heads independently.  For GQA that makes all query
+    // heads reread the same K/V head.  Process the GQA group together instead:
+    // all query heads for one (KV head, token) share a single K/V traversal.
+    //
+    // Keep the single-token path above: it also splits the long K dimension
+    // across workers and is faster when there are only a few KV heads.
+    if (return_stats && neq3 == 1 && neq1 > 1 && neq1 <= 16 &&
+            rk2 > 1 && rk2 == rv2 && rk2 <= 256) {
+        const int n_tasks = nek2*neq1;
+        for (int task = ith; task < n_tasks; task += nth) {
+            const int ik02 = task/neq1;
+            const int iq1  = task - ik02*neq1;
+            const int iq2  = ik02*rk2;
+
+            const float * this_q = (const float *)((const char *)q + iq1*stride_q + iq2*nbq2);
+            const char  * this_k = (const char *)k + ik02*nbk2;
+            const char  * this_v = (const char *)v + ik02*nbv2;
+            const char  * this_m = mask ? (const char *)mask + iq1*stride_m : nullptr;
+            float * out = (float *)((char *)qkv + (iq2 + iq1*ne1)*nb1);
+
+            float Mbuf[256];
+            float Sbuf[256];
+            if (!iqk_flash_attn_impl(int_type_k, int_type_v,
+                    Dk, Dv, rk2, nek1, nbq2, stride_k, stride_v, 0, nb1/sizeof(float),
+                    this_q, this_k, this_v, this_m, nullptr, 0,
+                    scale, softcap, out, Mbuf, Sbuf)) {
+                return false;
+            }
+            const int stride_out = nb1/sizeof(float);
+            for (int j = 0; j < rk2; ++j) {
+                out[j*stride_out + Dv + 0] = pack_softmax_max(Mbuf[j]);
+                out[j*stride_out + Dv + 1] = Sbuf[j];
+            }
         }
         return true;
     }
@@ -605,6 +936,10 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
                 int iq1 = (ith%ntg)*neq1g;
                 int this_neq1 = std::min(neq1g, neq1-iq1);
                 if (this_neq1 > 0) {
+                if (return_stats && this_neq1 > 1024) return false;
+                float Mbuf[1024];
+                float Sbuf[1024];
+                float * out = (float *)((char *)qkv + (iq3*ne2*ne1 + iq2 + iq1*ne1)*nb1);
                 if (!iqk_flash_attn_impl(int_type_k, int_type_v,
                         Dk, Dv, this_neq1, nek1, stride_q, stride_k, stride_v, stride_m, ne1*nb1/sizeof(float),
                         (const float *)((const char *)q + iq2*nbq2 + iq3*nbq3 + iq1*stride_q),
@@ -612,7 +947,14 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
                         (const void  *)((const char *)v + iq2/rv2*nbv2 + iq3/rv3*nbv3),
                         mask ? (const void  *)((const char *)mask + iq1*stride_m) : nullptr, sinksf, 0,
                         scale, softcap,
-                        (float *)((char *)qkv + (iq3*ne2*ne1 + iq2 + iq1*ne1)*nb1), nullptr, nullptr)) return false;
+                        out, return_stats ? Mbuf : nullptr, return_stats ? Sbuf : nullptr)) return false;
+                if (return_stats) {
+                    const int stride_out = ne1*nb1/sizeof(float);
+                    for (int j = 0; j < this_neq1; ++j) {
+                        out[j*stride_out + Dv + 0] = pack_softmax_max(Mbuf[j]);
+                        out[j*stride_out + Dv + 1] = Sbuf[j];
+                    }
+                }
                 }
             }
         }
@@ -644,6 +986,9 @@ bool iqk_flash_attn_noalibi([[maybe_unused]] int type_q, [[maybe_unused]] int ty
                             [[maybe_unused]] const void  * mask,     // mask. If not null, assumed to be fp16. nq x nk elements
                             [[maybe_unused]] float         scale,    // scale applied before softmax
                             [[maybe_unused]] float         softcap,  // if > 0, a "soft-cap" operation is applied before softmax
+                            [[maybe_unused]] bool          return_stats,
+                            [[maybe_unused]] int           numa_shards,
+                            [[maybe_unused]] int           numa_cold_capacity,
                             [[maybe_unused]] float       * qkv,      // v*softmax(scale*(k*q))
                             [[maybe_unused]] void * work_buffer, [[maybe_unused]] barrier_t barrier, [[maybe_unused]] void * barrier_data,
                             [[maybe_unused]] int ith, [[maybe_unused]] int nth, [[maybe_unused]] int n_swa, [[maybe_unused]] ggml_tensor * indexer) {
@@ -651,4 +996,3 @@ bool iqk_flash_attn_noalibi([[maybe_unused]] int type_q, [[maybe_unused]] int ty
 }
 
 #endif
-

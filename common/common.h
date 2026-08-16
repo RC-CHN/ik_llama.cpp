@@ -445,6 +445,9 @@ struct gpt_params {
     bool infill            = false; // use infill mode
     bool dump_kv_cache     = false; // dump the KV cache contents for debugging purposes
     bool no_kv_offload     = false; // disable KV offloading
+    bool hybrid_kv         = false; // keep Qwen3.5 dense attention KV in CPU HBM, leaving recurrent/MTP state on GPU
+    uint32_t hybrid_kv_hot = 65536; // GPU-resident recent KV tokens for --hybrid-kv (0 = all-cold diagnostic path)
+    uint32_t hybrid_kv_block = 256; // hot/cold migration block size in tokens
     bool warmup            = true;  // warmup run
     bool batch_warmup      = false; // batch warmup run
     bool check_tensors     = false; // validate tensor data

@@ -27,9 +27,13 @@ struct llama_cparams {
     float yarn_beta_slow;
     float defrag_thold;
 
+    uint32_t hybrid_kv_hot;
+    uint32_t hybrid_kv_block;
+
     bool embeddings;
     bool causal_attn;
     bool offload_kqv;
+    bool hybrid_kv;
     bool flash_attn;
     int  mla_attn;
     int  attn_max_batch;

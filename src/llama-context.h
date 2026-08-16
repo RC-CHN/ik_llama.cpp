@@ -125,6 +125,14 @@ struct llama_kv_cache {
     std::vector<struct ggml_tensor *> v_l;
     std::vector<struct ggml_tensor *> s_l; // per layer recurrent state storage (Qwen3Next)
 
+    // Qwen3.5 experimental hybrid cache: k_l/v_l are the complete HBM copy;
+    // these tensors are a GPU ring containing the recent logical KV window.
+    uint32_t hybrid_hot_size = 0;
+    uint32_t hybrid_numa_shards = 0;
+    uint32_t hybrid_numa_cold_capacity = 0;
+    std::vector<struct ggml_tensor *> k_hot_l;
+    std::vector<struct ggml_tensor *> v_hot_l;
+
     // Persistent DSA indexer-key cache. One per indexer layer, MQA single head:
     // [indexer_head_size, kv_size]. Stores architecture-specific indexer keys in their
     // scoring representation so a decoded token scores against all past indexer keys.
@@ -658,6 +666,7 @@ struct llama_context {
         size_t        step = 0;
     };
     std::vector<CacheCopy> cache_copies;
+    std::vector<CacheCopy> hybrid_cache_copies;
     // GLM-DSA lightning indexer: the indexer-key cache (kr_l) write is a separate ggml_cpy that
     // the K/V cache_copies fixup does NOT cover. Under graph reuse (FA pads KV to 256, so n_kv
     // stays constant across consecutive decode ubatches and the graph IS reused) its view_offs
@@ -669,7 +678,7 @@ struct llama_context {
     std::vector<CacheCopy> openpangu_cache_copies;
     std::vector<CacheCopy> openpangu_cache_copies_mtp;
 
-    bool update_cache_copies();
+    bool update_cache_copies(int32_t n_tokens);
 
     bool ensure_dflash_kv_cache_tensors(int32_t cross_ctx);
     void free_dflash_kv_cache_tensors();

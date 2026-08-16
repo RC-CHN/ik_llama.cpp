@@ -769,7 +769,7 @@ bool llama_context::can_reuse_graph(const llama_batch & u_batch, uint64_t seq_fi
            cparams.mtp_op_type == the_prev->mtp_op_type &&
            mtp_step_idx == the_prev->mtp_step_idx &&
            mtp_n_heads == the_prev->mtp_n_heads &&
-           update_cache_copies();
+           update_cache_copies(u_batch.n_tokens);
     if (false && !result) {
         printf("%s(%d):", __func__, cparams.mtp_op_type);
         why_not_reuse_previous(u_batch, *this, the_prev, seq_fingerprint, model_state_hash);
@@ -777,7 +777,7 @@ bool llama_context::can_reuse_graph(const llama_batch & u_batch, uint64_t seq_fi
     return result;
 }
 
-bool llama_context::update_cache_copies() {
+bool llama_context::update_cache_copies(int32_t n_tokens) {
     if (model.arch == LLM_ARCH_GEMMA4_MTP || model.arch == LLM_ARCH_GEMMA4_ASSISTANT) return true;
     if (model.arch == LLM_ARCH_DEEPSEEK4) return true;
     auto patch_dsa_cache_copies = [&]() -> bool {
@@ -896,7 +896,47 @@ bool llama_context::update_cache_copies() {
             }
         }
     }
-    return patch_dsa_cache_copies();
+    if (!patch_dsa_cache_copies()) {
+        return false;
+    }
+
+    if (kv_self.hybrid_hot_size > 0) {
+        const uint32_t hot_head = kv_self.head % kv_self.hybrid_hot_size;
+        const int32_t n_first = std::min<int32_t>(n_tokens, kv_self.hybrid_hot_size - hot_head);
+        const int32_t n_second = n_tokens - n_first;
+
+        auto patch_hot = [&](llama_context::CacheCopy & c, ggml_tensor * base,
+                             int32_t expected_tokens, uint32_t offset, int64_t rows_per_token) -> bool {
+            if (expected_tokens == 0) {
+                return c.cpy == nullptr;
+            }
+            if (!c.cpy || c.cpy->op != GGML_OP_CPY || c.cpy->view_src != base ||
+                    ggml_nelements(c.cpy->src[1]) != expected_tokens*rows_per_token) {
+                return false;
+            }
+            c.cpy->view_offs     = offset*c.step;
+            c.cpy->src[1]->data = (char *) base->data + c.cpy->view_offs;
+            c.cpy->data          = c.cpy->src[1]->data;
+            return true;
+        };
+
+        for (int il = 0; il < n_layer; ++il) {
+            if ((size_t) il >= kv_self.k_hot_l.size() || kv_self.k_hot_l[il] == nullptr) {
+                continue;
+            }
+            const int64_t n_head_kv = model.hparams.n_head_kv(il);
+            const int64_t n_embd_head_k = model.hparams.n_embd_head_k(il);
+            const int64_t n_embd_v_gqa = model.hparams.n_embd_v_gqa(il);
+            const size_t idx = 4*(size_t) il;
+            if (!patch_hot(hybrid_cache_copies[idx + 0], kv_self.k_hot_l[il], n_first,  hot_head, n_head_kv*n_embd_head_k) ||
+                !patch_hot(hybrid_cache_copies[idx + 1], kv_self.k_hot_l[il], n_second, 0,        n_head_kv*n_embd_head_k) ||
+                !patch_hot(hybrid_cache_copies[idx + 2], kv_self.v_hot_l[il], n_first,  hot_head, n_embd_v_gqa) ||
+                !patch_hot(hybrid_cache_copies[idx + 3], kv_self.v_hot_l[il], n_second, 0,        n_embd_v_gqa)) {
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 static std::vector<llama_context *> & llama_all_contexts() {
@@ -912,6 +952,7 @@ llama_context::llama_context(const llama_model & model)
     } else {
         cache_copies.resize(2*hparams.n_layer);
     }
+    hybrid_cache_copies.resize(4*hparams.n_layer);
     // DSA indexer-key cache copy. Entries stay null for non-DSA models and non-indexer layers,
     // so update_cache_copies() is a no-op when DSA is off.
     dsa_cache_copies.resize(hparams.n_layer);
@@ -1241,6 +1282,137 @@ static bool llama_mtp_tail_uses_layer_cache(const llama_model & model) {
          model.arch == LLM_ARCH_STEP35);
 }
 
+static inline bool llama_hybrid_kv_target(const llama_model & model, const llama_cparams & cparams) {
+    return cparams.hybrid_kv &&
+        cparams.mtp_op_type == MTP_OP_NONE &&
+        model.arch == LLM_ARCH_QWEN35;
+}
+
+static inline bool llama_hybrid_kv_cold_layer(
+        const llama_model & model, const llama_cparams & cparams, int64_t il) {
+    const int64_t n_mtp_first = model.hparams.n_layer - model.hparams.nextn_predict_layers;
+    return llama_hybrid_kv_target(model, cparams) &&
+        il < n_mtp_first &&
+        !llama_is_recurrent_layer(model.hparams, il);
+}
+
+static bool llama_hybrid_kv_numa_bind(
+        llama_kv_cache & cache, const llama_model & model, const llama_cparams & cparams) {
+#if defined(GGML_USE_CUDA) && defined(__linux__)
+    constexpr uint32_t n_shards = 4;
+    if (!llama_hybrid_kv_target(model, cparams) ||
+            !ggml_numa_exact_pin_enabled() || ggml_numa_node_count() != n_shards ||
+            cache.size <= cache.hybrid_hot_size) {
+        return false;
+    }
+
+    const uint32_t padding = llama_kv_cache::get_padding(true);
+    const uint32_t cold_capacity = cache.size - cache.hybrid_hot_size;
+    if (cache.size % padding != 0 || cache.hybrid_hot_size % padding != 0 ||
+            cold_capacity % n_shards != 0) {
+        LLAMA_LOG_WARN("%s: hybrid KV dimensions are not compatible with four NUMA shards\n", __func__);
+        return false;
+    }
+
+    using numa_ranges = std::vector<ggml_cuda_host_numa_range>;
+    std::map<ggml_backend_buffer_t, numa_ranges> buffer_ranges;
+    size_t bound_bytes = 0;
+    size_t n_tensors = 0;
+
+    auto add_region = [&](ggml_tensor * tensor, uint32_t row_begin, uint32_t row_count,
+                          uint32_t rows) -> bool {
+        if (row_count == 0) {
+            return true;
+        }
+        if (tensor == nullptr || tensor->buffer == nullptr || rows == 0 ||
+                ggml_backend_buffer_get_type(tensor->buffer) != ggml_backend_cuda_host_buffer_type()) {
+            return false;
+        }
+
+        const size_t tensor_bytes = ggml_nbytes(tensor);
+        if (tensor_bytes % rows != 0) {
+            return false;
+        }
+        const size_t row_bytes = tensor_bytes/rows;
+        char * base = (char *) ggml_backend_buffer_get_base(tensor->buffer);
+        char * data = (char *) tensor->data;
+        const size_t buffer_size = ggml_backend_buffer_get_size(tensor->buffer);
+        if (data < base || (size_t) (data - base) > buffer_size ||
+                tensor_bytes > buffer_size - (size_t) (data - base)) {
+            return false;
+        }
+        const size_t tensor_offset = (size_t) (data - base);
+
+        auto & ranges = buffer_ranges[tensor->buffer];
+        for (uint32_t node = 0; node < n_shards; ++node) {
+            const uint32_t first = row_begin + (uint64_t) row_count*node/n_shards;
+            const uint32_t last  = row_begin + (uint64_t) row_count*(node + 1)/n_shards;
+            if (last == first) {
+                continue;
+            }
+            ranges.push_back({ tensor_offset + (size_t) first*row_bytes,
+                               (size_t) (last - first)*row_bytes, node });
+            bound_bytes += (size_t) (last - first)*row_bytes;
+        }
+        return true;
+    };
+
+    for (int il = 0; il < (int) cache.k_l.size(); ++il) {
+        if (!llama_hybrid_kv_cold_layer(model, cparams, il)) {
+            continue;
+        }
+        const uint32_t rows = cache.rows(il);
+        if (rows != cache.size || (size_t) il >= cache.v_l.size()) {
+            LLAMA_LOG_WARN("%s: hybrid KV layer %d has an unsupported compact layout\n", __func__, il);
+            return false;
+        }
+        ggml_tensor * tensors[] = { cache.k_l[il], cache.v_l[il] };
+        for (ggml_tensor * tensor : tensors) {
+            if (tensor == nullptr || tensor->type != GGML_TYPE_BF16 ||
+                    !add_region(tensor, 0, cold_capacity, rows) ||
+                    !add_region(tensor, cold_capacity, cache.hybrid_hot_size, rows)) {
+                LLAMA_LOG_WARN("%s: hybrid KV tensor in layer %d cannot be NUMA-bound\n", __func__, il);
+                return false;
+            }
+            ++n_tensors;
+        }
+    }
+
+    if (buffer_ranges.empty() || n_tensors == 0) {
+        return false;
+    }
+    for (auto & entry : buffer_ranges) {
+        if (!ggml_backend_cuda_host_buffer_numa_rebind(
+                    entry.first, entry.second.data(), entry.second.size())) {
+            LLAMA_LOG_WARN("%s: failed to establish the hybrid KV NUMA layout; using the fallback kernel\n",
+                    __func__);
+            return false;
+        }
+    }
+
+    cache.hybrid_numa_shards = n_shards;
+    cache.hybrid_numa_cold_capacity = cold_capacity;
+    LLAMA_LOG_INFO("%s: bound %.2f GiB of hybrid KV (%zu tensors) across %u HBM NUMA shards; "
+                   "cold capacity = %u tokens\n",
+            __func__, bound_bytes/1024.0/1024.0/1024.0, n_tensors, n_shards, cold_capacity);
+    return true;
+#else
+    GGML_UNUSED(cache);
+    GGML_UNUSED(model);
+    GGML_UNUSED(cparams);
+    return false;
+#endif
+}
+
+static inline bool llama_qwen35_target_skips_mtp_tail(
+        const llama_model & model, const llama_cparams & cparams, int64_t il) {
+    const int64_t n_mtp_first = model.hparams.n_layer - model.hparams.nextn_predict_layers;
+    return model.arch == LLM_ARCH_QWEN35 &&
+        cparams.mtp_op_type == MTP_OP_NONE &&
+        model.hparams.nextn_predict_layers > 0 &&
+        il >= n_mtp_first;
+}
+
 static bool llama_kv_cache_init(
              struct llama_kv_cache & cache,
                const llama_context * ctx,
@@ -1312,6 +1484,11 @@ static bool llama_kv_cache_init(
 
     cache.type_k  = type_k;
     cache.type_v  = type_v;
+    cache.hybrid_hot_size = llama_hybrid_kv_target(model, cparams)
+        ? std::min<uint32_t>(cparams.hybrid_kv_hot, kv_size)
+        : 0;
+    cache.hybrid_numa_shards = 0;
+    cache.hybrid_numa_cold_capacity = 0;
 
     cache.cells.clear();
     cache.cells.resize(kv_size);
@@ -1356,8 +1533,17 @@ static bool llama_kv_cache_init(
         const bool is_mtp = llama_mtp_tail_uses_layer_cache(model);
         const int64_t n_mtp_first = hparams.n_layer - hparams.nextn_predict_layers;
         for (int64_t i = 0; i < n_layer; ++i) {
+            if ((cparams.mtp_op_type != MTP_OP_NONE && i < n_mtp_first) ||
+                    llama_qwen35_target_skips_mtp_tail(model, cparams, i)) {
+                continue;
+            }
             const bool is_mtp_tail = is_mtp && i >= n_mtp_first;
-            if ((split_cache || replicate_mla) && !is_mtp_tail) {
+            if (llama_hybrid_kv_cold_layer(model, cparams, i)) {
+                buft_layer_count[llama_default_buffer_type_cpu(true)]++;
+                if (cache.hybrid_hot_size > 0) {
+                    buft_layer_count[model.buft_layer[i].buft]++;
+                }
+            } else if ((split_cache || replicate_mla) && !is_mtp_tail) {
                 buft_layer_count[model.buft_layer[i].buft_matrix]++;
                 if (model.buft_layer[i].buft != model.buft_layer[i].buft_matrix) {
                     buft_layer_count[model.buft_layer[i].buft]++;
@@ -1421,6 +1607,8 @@ static bool llama_kv_cache_init(
     }
     if (needs_v_cache && !is_dsv4_k_only) cache.v_l.reserve(n_layer);
     cache.s_l.resize(n_layer, nullptr);
+    cache.k_hot_l.resize(n_layer, nullptr);
+    cache.v_hot_l.resize(n_layer, nullptr);
 
     // DSA indexer-key cache: one [indexer_head_size, kv_size] tensor per indexer layer.
     // Allocated below only when the model carries persistent DSA indexer tensors.
@@ -1452,15 +1640,27 @@ static bool llama_kv_cache_init(
             }
             continue;
         }
+        // The Qwen3.5 target graph executes only the main transformer layers. The
+        // MTP-only context owns the tail layer and its KV cache.
+        if (llama_qwen35_target_skips_mtp_tail(model, cparams, i)) {
+            cache.k_l.push_back(nullptr);
+            if (!is_dsv4_k_only) {
+                cache.v_l.push_back(nullptr);
+            }
+            continue;
+        }
         n_kv_active_layers++;
         const bool qnext_recurrent = llama_is_recurrent_layer(hparams, i);
+        const bool hybrid_kv_cold = llama_hybrid_kv_cold_layer(model, cparams, i);
         const uint32_t n_embd_v_row = llama_kv_v_row_embd(model, hparams, i);
         const uint32_t n_head_kv    = hparams.n_head_kv(i);
         const uint32_t n_embd_head_k= hparams.n_embd_head_k(i);
 
         const bool is_mtp_tail_layer = llama_mtp_tail_uses_layer_cache(model) && i >= n_mtp_first_layer;
         //struct ggml_context * ctx = split_cache && !qnext_recurrent ? ctx_map.at(model.buft_layer[i].buft_matrix) : offload ? ctx_map.at(model.buft_layer[i].buft) : cache.ctxs.front();
-        struct ggml_context * ctx = ((split_cache || replicate_mla) && !is_mtp_tail_layer) ? ctx_map.at(model.buft_layer[i].buft_matrix) : offload ? ctx_map.at(model.buft_layer[i].buft) : cache.ctxs.front();
+        struct ggml_context * ctx = hybrid_kv_cold ? ctx_map.at(llama_default_buffer_type_cpu(true)) :
+            ((split_cache || replicate_mla) && !is_mtp_tail_layer) ? ctx_map.at(model.buft_layer[i].buft_matrix) :
+            offload ? ctx_map.at(model.buft_layer[i].buft) : cache.ctxs.front();
         ggml_tensor * k = nullptr;
         ggml_tensor * v = nullptr;
         ggml_tensor * s = nullptr;
@@ -1566,22 +1766,22 @@ static bool llama_kv_cache_init(
                 split_cache_i = false;
             }
             int n_embd_head_v = hparams.n_embd_head_v(i);
-            auto this_type_k = type_k;
-            if (model.arch != LLM_ARCH_OPENPANGU && type_k_first != type_k && n_k_first > 0 && i < n_k_first) {
+            auto this_type_k = hybrid_kv_cold ? GGML_TYPE_BF16 : type_k;
+            if (!hybrid_kv_cold && model.arch != LLM_ARCH_OPENPANGU && type_k_first != type_k && n_k_first > 0 && i < n_k_first) {
                 this_type_k = type_k_first;
             }
-            if (model.arch != LLM_ARCH_OPENPANGU && type_k_last != type_k && n_k_last > 0 && i >= n_layer - n_k_last) {
+            if (!hybrid_kv_cold && model.arch != LLM_ARCH_OPENPANGU && type_k_last != type_k && n_k_last > 0 && i >= n_layer - n_k_last) {
                 this_type_k = type_k_last;
             }
             if (this_type_k != type_k) {
                 LLAMA_LOG_INFO("================= Setting K-cache type in layer %2d to %s\n", i, ggml_type_name(this_type_k));
             }
             int64_t v_ne = int64_t(n_embd_v_row)*cache.rows(i);
-            auto this_type_v = type_v;
-            if (model.arch != LLM_ARCH_OPENPANGU && type_v_first != type_v && n_v_first > 0 && i < n_v_first) {
+            auto this_type_v = hybrid_kv_cold ? GGML_TYPE_BF16 : type_v;
+            if (!hybrid_kv_cold && model.arch != LLM_ARCH_OPENPANGU && type_v_first != type_v && n_v_first > 0 && i < n_v_first) {
                 this_type_v = type_v_first;
             }
-            if (model.arch != LLM_ARCH_OPENPANGU && type_v_last != type_v && n_v_last > 0 && i >= n_layer - n_v_last) {
+            if (!hybrid_kv_cold && model.arch != LLM_ARCH_OPENPANGU && type_v_last != type_v && n_v_last > 0 && i >= n_layer - n_v_last) {
                 this_type_v = type_v_last;
             }
             if (this_type_v != type_v) {
@@ -1598,6 +1798,18 @@ static bool llama_kv_cache_init(
             } else {
                 k = ggml_new_tensor_2d(ctx, this_type_k, n_embd_head_k, n_head_kv*cache.rows(i));
                 v = ggml_new_tensor_1d(ctx, this_type_v, v_ne);
+            }
+
+            if (hybrid_kv_cold && cache.hybrid_hot_size > 0) {
+                ggml_context * hot_ctx = ctx_map.at(model.buft_layer[i].buft);
+                ggml_tensor * k_hot = ggml_new_tensor_2d(hot_ctx, GGML_TYPE_F16,
+                        n_embd_head_k, n_head_kv*cache.hybrid_hot_size);
+                ggml_tensor * v_hot = ggml_new_tensor_1d(hot_ctx, GGML_TYPE_F16,
+                        int64_t(n_embd_v_row)*cache.hybrid_hot_size);
+                ggml_format_name(k_hot, "cache_k_hot_l%d", i);
+                ggml_format_name(v_hot, "cache_v_hot_l%d", i);
+                cache.k_hot_l[i] = k_hot;
+                cache.v_hot_l[i] = v_hot;
             }
 
             auto k_name = std::string{"cache_k_l"} + std::to_string(i);
@@ -1698,6 +1910,7 @@ static bool llama_kv_cache_init(
             cache.bufs.push_back(buf);
         }
     }
+    llama_hybrid_kv_numa_bind(cache, model, cparams);
     if (split_cache || replicate_mla) {
         LLAMA_LOG_INFO("%s: KV cache size per device%s:\n", __func__,
                        replicate_mla ? " (MLA replicated)" : "");
@@ -7275,6 +7488,7 @@ static bool get_can_shift(const struct llama_context & lctx) {
     bool no_shift = !llama_model_supports_ctx_shift(&lctx.model);
     no_shift = no_shift || lctx.model.is_mla_model();
     no_shift = no_shift || lctx.model.hparams.rope_type == LLAMA_ROPE_TYPE_IMROPE;
+    no_shift = no_shift || lctx.cparams.hybrid_kv;
     // build_k_shift views n_ctx rows per layer, but a compacted layer holds only its window rows
     no_shift = no_shift || lctx.kv_self.any_compacted();
     return !no_shift;
@@ -7688,9 +7902,12 @@ struct llama_context_params llama_context_default_params() {
         /*.n_last_k                    =*/ -1,
         /*.n_first_v                   =*/ -1,
         /*.n_last_v                    =*/ -1,
+        /*.hybrid_kv_hot               =*/ 65536,
+        /*.hybrid_kv_block             =*/ 256,
         /*.logits_all                  =*/ false,
         /*.embeddings                  =*/ false,
         /*.offload_kqv                 =*/ true,
+        /*.hybrid_kv                   =*/ false,
         /*.flash_attn                  =*/ true,
         /*.mla_attn                    =*/ 3,
         /*.attn_max_batch              =*/ 256,
@@ -8179,8 +8396,11 @@ struct llama_context * llama_init_from_model(
     cparams.yarn_beta_fast   = params.yarn_beta_fast >= 0.0f ? params.yarn_beta_fast : hparams.yarn_beta_fast;
     cparams.yarn_beta_slow   = params.yarn_beta_slow >= 0.0f ? params.yarn_beta_slow : hparams.yarn_beta_slow;
     cparams.defrag_thold     = params.defrag_thold;
+    cparams.hybrid_kv_hot    = params.hybrid_kv_hot;
+    cparams.hybrid_kv_block  = params.hybrid_kv_block;
     cparams.embeddings       = params.embeddings;
     cparams.offload_kqv      = params.offload_kqv;
+    cparams.hybrid_kv        = params.hybrid_kv;
     cparams.flash_attn       = params.flash_attn;
     cparams.mla_attn         = params.mla_attn;
     cparams.attn_max_batch   = params.attn_max_batch;
@@ -8343,10 +8563,80 @@ struct llama_context * llama_init_from_model(
 
     cparams.mtp_op_type = params.mtp_op_type;
 
+    if (cparams.hybrid_kv) {
+#if defined(GGML_USE_CUDA)
+        if (ggml_backend_cuda_get_device_count() != 1) {
+            LLAMA_LOG_ERROR("%s: --hybrid-kv currently requires exactly one visible CUDA device\n", __func__);
+            llama_free(ctx);
+            return nullptr;
+        }
+#else
+        LLAMA_LOG_ERROR("%s: --hybrid-kv requires a CUDA build\n", __func__);
+        llama_free(ctx);
+        return nullptr;
+#endif
+        const bool cache_types_supported =
+            (params.type_k == GGML_TYPE_F16 || params.type_k == GGML_TYPE_BF16) &&
+            (params.type_v == GGML_TYPE_F16 || params.type_v == GGML_TYPE_BF16);
+        if (model->arch != LLM_ARCH_QWEN35) {
+            LLAMA_LOG_ERROR("%s: --hybrid-kv currently supports only Qwen3.5 dense models\n", __func__);
+            llama_free(ctx);
+            return nullptr;
+        }
+        if (model->n_gpu_layers <= (int) model->hparams.n_layer) {
+            LLAMA_LOG_ERROR("%s: --hybrid-kv currently requires the complete model to be offloaded to CUDA\n", __func__);
+            llama_free(ctx);
+            return nullptr;
+        }
+        if (!cparams.offload_kqv || !cparams.flash_attn) {
+            LLAMA_LOG_ERROR("%s: --hybrid-kv requires KV offload and flash attention to remain enabled\n", __func__);
+            llama_free(ctx);
+            return nullptr;
+        }
+        if (cparams.n_seq_max != 1) {
+            LLAMA_LOG_ERROR("%s: --hybrid-kv currently supports exactly one sequence (requested %u)\n",
+                    __func__, cparams.n_seq_max);
+            llama_free(ctx);
+            return nullptr;
+        }
+        if (!cache_types_supported) {
+            LLAMA_LOG_ERROR("%s: --hybrid-kv currently requires f16 or bf16 K/V cache types\n", __func__);
+            llama_free(ctx);
+            return nullptr;
+        }
+        if (cparams.hybrid_kv_block == 0 || cparams.hybrid_kv_block % llama_kv_cache::get_padding(true) != 0) {
+            LLAMA_LOG_ERROR("%s: --hybrid-kv-block must be a non-zero multiple of %u tokens\n",
+                    __func__, llama_kv_cache::get_padding(true));
+            llama_free(ctx);
+            return nullptr;
+        }
+        if (cparams.hybrid_kv_hot > 0 && cparams.hybrid_kv_hot % cparams.hybrid_kv_block != 0) {
+            LLAMA_LOG_ERROR("%s: --hybrid-kv-hot must be zero or a multiple of --hybrid-kv-block\n", __func__);
+            llama_free(ctx);
+            return nullptr;
+        }
+        if (cparams.hybrid_kv_hot > 0 && cparams.hybrid_kv_hot < cparams.n_ubatch) {
+            LLAMA_LOG_ERROR("%s: --hybrid-kv-hot must be zero or at least n_ubatch (%u) tokens\n",
+                    __func__, cparams.n_ubatch);
+            llama_free(ctx);
+            return nullptr;
+        }
+        if (cparams.defrag_thold >= 0.0f) {
+            LLAMA_LOG_ERROR("%s: --hybrid-kv does not support KV defragmentation\n", __func__);
+            llama_free(ctx);
+            return nullptr;
+        }
+    }
+
     LLAMA_LOG_INFO("%s: n_ctx         = %u\n",     __func__, cparams.n_ctx);
     LLAMA_LOG_INFO("%s: n_batch       = %u\n",     __func__, cparams.n_batch);
     LLAMA_LOG_INFO("%s: n_ubatch      = %u\n",     __func__, cparams.n_ubatch);
     LLAMA_LOG_INFO("%s: flash_attn    = %d\n",     __func__, cparams.flash_attn);
+    LLAMA_LOG_INFO("%s: hybrid_kv     = %d\n",     __func__, cparams.hybrid_kv);
+    if (cparams.hybrid_kv) {
+        LLAMA_LOG_INFO("%s: hybrid_kv_hot = %u\n", __func__, cparams.hybrid_kv_hot);
+        LLAMA_LOG_INFO("%s: hybrid_kv_blk = %u\n", __func__, cparams.hybrid_kv_block);
+    }
     if (model->is_mla_model()) {
     LLAMA_LOG_INFO("%s: mla_attn      = %d\n",     __func__, cparams.mla_attn);
     }
@@ -9671,6 +9961,10 @@ void llama_spec_ckpt_discard(struct llama_context * ctx) {
 }
 
 bool llama_kv_cache_seq_rm(struct llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    if (ctx->kv_self.hybrid_hot_size > 0 && p1 >= 0) {
+        LLAMA_LOG_ERROR("%s: --hybrid-kv supports only clear or tail removal\n", __func__);
+        return false;
+    }
     const bool result = llama_kv_cache_seq_rm(ctx->kv_self, seq_id, p0, p1);
     if (result && ctx->model.arch == LLM_ARCH_DEEPSEEK4 && p0 <= 0 && p1 < 0) {
         llama_reset_dsv4_state(ctx, seq_id);
@@ -9680,6 +9974,10 @@ bool llama_kv_cache_seq_rm(struct llama_context * ctx, llama_seq_id seq_id, llam
 
 void llama_kv_cache_seq_cp(struct llama_context * ctx, llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
     if (seq_id_src == seq_id_dst) {
+        return;
+    }
+    if (ctx->kv_self.hybrid_hot_size > 0) {
+        LLAMA_LOG_ERROR("%s: sequence copy is not supported with --hybrid-kv\n", __func__);
         return;
     }
     llama_kv_cache_seq_cp(ctx->kv_self, seq_id_src, seq_id_dst, p0, p1);
@@ -9693,12 +9991,20 @@ void llama_kv_cache_seq_add(struct llama_context * ctx, llama_seq_id seq_id, lla
     if (delta == 0) {
         return;
     }
+    if (ctx->kv_self.hybrid_hot_size > 0) {
+        LLAMA_LOG_ERROR("%s: position edits are not supported with --hybrid-kv\n", __func__);
+        return;
+    }
 
     llama_kv_cache_seq_add(ctx->kv_self, seq_id, p0, p1, delta);
 }
 
 void llama_kv_cache_seq_div(struct llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
     if (d == 1) {
+        return;
+    }
+    if (ctx->kv_self.hybrid_hot_size > 0) {
+        LLAMA_LOG_ERROR("%s: position edits are not supported with --hybrid-kv\n", __func__);
         return;
     }
 
@@ -9717,6 +10023,10 @@ llama_pos llama_kv_cache_seq_pos_max(struct llama_context * ctx, llama_seq_id se
 }
 
 void llama_kv_cache_defrag(struct llama_context * ctx) {
+    if (ctx->kv_self.hybrid_hot_size > 0) {
+        LLAMA_LOG_ERROR("%s: KV defragmentation is not supported with --hybrid-kv\n", __func__);
+        return;
+    }
     llama_kv_cache_defrag(ctx->kv_self);
 }
 
@@ -11301,6 +11611,10 @@ static bool llama_state_io_supported(
                         const char * func,
              llama_state_seq_flags flags = 0,
                       llama_seq_id seq_id = -1) {
+    if (ctx->kv_self.hybrid_hot_size > 0) {
+        LLAMA_LOG_ERROR("%s: state save/restore is not supported with --hybrid-kv\n", func);
+        return false;
+    }
     if (ctx->model.arch == LLM_ARCH_OPENPANGU) {
         if (seq_id >= 0 &&
             llama_kv_qnext_seq_id_in_range(ctx->kv_self, seq_id) &&

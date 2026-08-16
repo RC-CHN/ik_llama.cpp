@@ -4762,6 +4762,10 @@ bool ggml_numa_row_shard_enabled(void) {
     return g_state.numa.row_shard && ggml_is_numa();
 }
 
+bool ggml_numa_exact_pin_enabled(void) {
+    return g_state.numa.exact_pin && ggml_is_numa();
+}
+
 // DISTRIBUTE pins thread i to NUMA node i % n_nodes. Reorder its matrix-work
 // index so all threads on a node consume one contiguous output-row shard.
 static inline int ggml_numa_work_thread(int ith, int nth) {
@@ -10762,7 +10766,7 @@ struct ggml_tensor * ggml_latent_attn_indexed_ext(
 
 // ggml_flash_attn_ext
 
-struct ggml_tensor * ggml_flash_attn_ext(
+static struct ggml_tensor * ggml_flash_attn_ext_impl(
         struct ggml_context * ctx,
         struct ggml_tensor  * q,
         struct ggml_tensor  * k,
@@ -10770,7 +10774,8 @@ struct ggml_tensor * ggml_flash_attn_ext(
         struct ggml_tensor  * mask,
         float                 scale,
         float                 max_bias,
-        float                 softcap) {
+        float                 softcap,
+        bool                  return_stats) {
     GGML_ASSERT(ggml_can_mul_mat(k, q));
     // TODO: check if vT can be multiplied by (k*qT)
 
@@ -10798,13 +10803,14 @@ struct ggml_tensor * ggml_flash_attn_ext(
     // => result is { v->ne[0], q->ne[2], q->ne[1], q->ne[3] }
     // permute(0, 2, 1, 3)
     //int64_t ne[4] = { q->ne[0], q->ne[2], q->ne[1], q->ne[3] };
-    int64_t ne[4] = { v->ne[0], q->ne[2], q->ne[1], q->ne[3] };
+    int64_t ne[4] = { v->ne[0] + (return_stats ? 2 : 0), q->ne[2], q->ne[1], q->ne[3] };
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
 
     float params[] = { scale, max_bias, softcap };
     ggml_set_op_params(result, params, sizeof(params));
 
     ggml_set_op_params_i32(result, 4, 0);
+    ggml_set_op_params_i32(result, 5, return_stats ? 1 : 0);
 
     result->op   = GGML_OP_FLASH_ATTN_EXT;
     result->grad = is_node ? ggml_dup_tensor(ctx, result) : NULL;
@@ -10816,6 +10822,30 @@ struct ggml_tensor * ggml_flash_attn_ext(
     return result;
 }
 
+struct ggml_tensor * ggml_flash_attn_ext(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * mask,
+        float                 scale,
+        float                 max_bias,
+        float                 softcap) {
+    return ggml_flash_attn_ext_impl(ctx, q, k, v, mask, scale, max_bias, softcap, false);
+}
+
+struct ggml_tensor * ggml_flash_attn_ext_stats(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * mask,
+        float                 scale,
+        float                 max_bias,
+        float                 softcap) {
+    return ggml_flash_attn_ext_impl(ctx, q, k, v, mask, scale, max_bias, softcap, true);
+}
+
 void ggml_flash_attn_ext_set_prec(
         struct ggml_tensor * a,
         enum ggml_prec       prec) {
@@ -10824,6 +10854,18 @@ void ggml_flash_attn_ext_set_prec(
     const int32_t prec_i32 = (int32_t) prec;
 
     ggml_set_op_params_i32(a, 3, prec_i32); // scale is on first pos, max_bias on second
+}
+
+void ggml_flash_attn_ext_set_numa_shards(
+        struct ggml_tensor * a,
+        int32_t              n_shards,
+        int32_t              cold_capacity) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(ggml_get_op_params_i32(a, 5) != 0);
+    GGML_ASSERT(n_shards >= 0 && cold_capacity >= 0);
+
+    ggml_set_op_params_i32(a, 6, n_shards);
+    ggml_set_op_params_i32(a, 7, cold_capacity);
 }
 
 void ggml_flash_attn_ext_add_sinks(
@@ -23035,8 +23077,13 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     const int64_t Dv = nev0;
     const int64_t N  = neq1;
 
-    GGML_ASSERT(ne0 == Dv);
+    const bool return_stats = ggml_get_op_params_i32(dst, 5) != 0;
+    const int numa_shards = ggml_get_op_params_i32(dst, 6);
+    const int numa_cold_capacity = ggml_get_op_params_i32(dst, 7);
+
+    GGML_ASSERT(ne0 == Dv + (return_stats ? 2 : 0));
     GGML_ASSERT(ne2 == N);
+    GGML_ASSERT(!return_stats || sinks == NULL);
 
     // input tensor rows must be contiguous
     GGML_ASSERT(nbq0 == ggml_type_size(q->type));
@@ -23099,9 +23146,9 @@ static void ggml_compute_forward_flash_attn_ext_f16(
                 k->type, v->type,
                 Dk, Dv, neq1, nek1, q->nb[1], k->nb[1], v->nb[1], mask ? mask->nb[1] : 0,
                 q->data, k->data, v->data, mask ? mask->data : NULL, sinks ? sinks->data : NULL,
-                scale, softcap, (float *)dst->data,
+                scale, softcap, return_stats, numa_shards, numa_cold_capacity, (float *)dst->data,
                 params->wdata, (barrier_t)ggml_barrier, (void *)params->shared, ith, nth, dst->op_params[4],
-                dst->src[5])) return;
+                return_stats ? NULL : dst->src[5])) return;
 
 //    if (max_bias <= 0.0f && q->type == GGML_TYPE_F32 && mask && mask->type == GGML_TYPE_F16) {
 //        //if (ith == 0) printf("k: %ld x %ld x %ld, q: %ld x %ld x %ld, v: %ld x %ld x %ld mask: %ld x %ld x %ld\n",
@@ -23280,9 +23327,11 @@ static void ggml_compute_forward_flash_attn_ext_f16(
             S = S*ms + vs;
         }
 
-        // V /= S
-        const float S_inv = S == 0.0f ? 0.0f : 1.0f/S;
-        ggml_vec_scale_f32(Dv, VKQ32, S_inv);
+        if (!return_stats) {
+            // V /= S
+            const float S_inv = S == 0.0f ? 0.0f : 1.0f/S;
+            ggml_vec_scale_f32(Dv, VKQ32, S_inv);
+        }
 
         // dst indices
         const int i1 = iq1;
@@ -23293,7 +23342,12 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         //memcpy((char *) dst->data + (i1*nb1 + i2*nb2 + i3*nb3), V, nev0*sizeof(float));
 
         // permute(0, 2, 1, 3)
-        memcpy((char *) dst->data + (i3*ne2*ne1 + i2 + i1*ne1)*nb1, VKQ32, nb1);
+        float * out = (float *)((char *) dst->data + (i3*ne2*ne1 + i2 + i1*ne1)*nb1);
+        memcpy(out, VKQ32, Dv*sizeof(float));
+        if (return_stats) {
+            out[Dv + 0] = isfinite(M) ? M : -32752.0f;
+            out[Dv + 1] = S;
+        }
     }
 }
 

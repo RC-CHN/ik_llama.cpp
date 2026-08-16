@@ -942,6 +942,31 @@ void llm_build_context::llm_build_kv_store(
 
         // note: storing RoPE-ed version of K in the KV cache
         ggml_build_forward_expand(graph, lctx.cache_copies[2*il+0].cpy);
+
+        if ((size_t) il < kv.k_hot_l.size() && kv.k_hot_l[il]) {
+            lctx.hybrid_cache_copies[4*il + 0] = {};
+            lctx.hybrid_cache_copies[4*il + 1] = {};
+            const uint32_t hot_head = kv_head % kv.hybrid_hot_size;
+            const int32_t n_first = std::min<int32_t>(n_tokens, kv.hybrid_hot_size - hot_head);
+            const int32_t n_second = n_tokens - n_first;
+            GGML_ASSERT(n_tokens <= (int32_t) kv.hybrid_hot_size);
+
+            auto add_hot_k_copy = [&](int slot, int32_t count, int32_t src_token, uint32_t dst_token) {
+                if (count == 0) return;
+                const size_t src_off = (size_t) src_token*n_head_kv*k_cur->nb[1];
+                ggml_tensor * src = ggml_view_2d(ctx, k_cur, n_embd_head_k, (int64_t) count*n_head_kv,
+                        k_cur->nb[1], src_off);
+                const size_t hot_row = ggml_row_size(kv.k_hot_l[il]->type, n_embd_head_k);
+                ggml_tensor * dst = ggml_view_2d(ctx, kv.k_hot_l[il], n_embd_head_k, (int64_t) count*n_head_kv,
+                        hot_row, (size_t) dst_token*n_head_kv*hot_row);
+                auto & copy = lctx.hybrid_cache_copies[4*il + slot];
+                copy.cpy = ggml_cpy(ctx, src, dst);
+                copy.step = n_head_kv*hot_row;
+                ggml_build_forward_expand(graph, copy.cpy);
+            };
+            add_hot_k_copy(0, n_first,  0,       hot_head);
+            add_hot_k_copy(1, n_second, n_first, 0);
+        }
     }
 
     if (v_cur) {
@@ -963,6 +988,32 @@ void llm_build_context::llm_build_kv_store(
 
         lctx.cache_copies[2*il+1].cpy  = ggml_cpy(ctx, v_cur, v_cache_view);
         ggml_build_forward_expand(graph, lctx.cache_copies[2*il+1].cpy);
+
+        if ((size_t) il < kv.v_hot_l.size() && kv.v_hot_l[il]) {
+            lctx.hybrid_cache_copies[4*il + 2] = {};
+            lctx.hybrid_cache_copies[4*il + 3] = {};
+            GGML_ASSERT(!kv.v_trans);
+            const uint32_t hot_head = kv_head % kv.hybrid_hot_size;
+            const int32_t n_first = std::min<int32_t>(n_tokens, kv.hybrid_hot_size - hot_head);
+            const int32_t n_second = n_tokens - n_first;
+            GGML_ASSERT(n_tokens <= (int32_t) kv.hybrid_hot_size);
+
+            auto add_hot_v_copy = [&](int slot, int32_t count, int32_t src_token, uint32_t dst_token) {
+                if (count == 0) return;
+                const size_t src_row = ggml_row_size(v_cur->type, n_embd_v_gqa);
+                ggml_tensor * src = ggml_view_1d(ctx, v_cur, (int64_t) count*n_embd_v_gqa,
+                        (size_t) src_token*src_row);
+                const size_t hot_row = ggml_row_size(kv.v_hot_l[il]->type, n_embd_v_gqa);
+                ggml_tensor * dst = ggml_view_1d(ctx, kv.v_hot_l[il], (int64_t) count*n_embd_v_gqa,
+                        (size_t) dst_token*hot_row);
+                auto & copy = lctx.hybrid_cache_copies[4*il + slot];
+                copy.cpy = ggml_cpy(ctx, src, dst);
+                copy.step = hot_row;
+                ggml_build_forward_expand(graph, copy.cpy);
+            };
+            add_hot_v_copy(2, n_first,  0,       hot_head);
+            add_hot_v_copy(3, n_second, n_first, 0);
+        }
     }
 }
 
@@ -2057,7 +2108,139 @@ static ggml_tensor * llm_build_kqv(
 
     struct ggml_tensor * cur;
 
-    if (cparams.flash_attn) {
+    const bool hybrid_kv_attention =
+        cparams.hybrid_kv &&
+        cparams.mtp_op_type == MTP_OP_NONE &&
+        n_tokens <= 16 &&
+        kv_layer >= 0 &&
+        (size_t) kv_layer < kv.k_hot_l.size() &&
+        kv.hybrid_hot_size > 0 &&
+        kv.k_hot_l[kv_layer] != nullptr;
+
+    if (hybrid_kv_attention) {
+        GGML_ASSERT(cparams.flash_attn);
+        GGML_ASSERT(kq_mask && !sinks && n_swa == 0 && kv_view_offset == 0);
+        GGML_ASSERT(kv.v_hot_l[kv_layer] != nullptr);
+        GGML_ASSERT(n_kv % llama_kv_cache::get_padding(true) == 0);
+        GGML_ASSERT(kv.hybrid_hot_size % llama_kv_cache::get_padding(true) == 0);
+
+        struct stats_parts {
+            ggml_tensor * r;
+            ggml_tensor * m;
+            ggml_tensor * s;
+        };
+
+        auto split_stats = [&](ggml_tensor * stats) -> stats_parts {
+            GGML_ASSERT(stats->ne[0] == n_embd_head_v + 2);
+            auto r = ggml_view_4d(ctx, stats, n_embd_head_v, stats->ne[1], stats->ne[2], stats->ne[3],
+                    stats->nb[1], stats->nb[2], stats->nb[3], 0);
+            auto m = ggml_view_4d(ctx, stats, 1, stats->ne[1], stats->ne[2], stats->ne[3],
+                    stats->nb[1], stats->nb[2], stats->nb[3], n_embd_head_v*sizeof(float));
+            auto s = ggml_view_4d(ctx, stats, 1, stats->ne[1], stats->ne[2], stats->ne[3],
+                    stats->nb[1], stats->nb[2], stats->nb[3], (n_embd_head_v + 1)*sizeof(float));
+            return { r, m, s };
+        };
+
+        auto merge_stats = [&](ggml_tensor * a, ggml_tensor * b, bool normalize) -> ggml_tensor * {
+            auto av = split_stats(a);
+            auto bv = split_stats(b);
+            auto m = ggml_scale(ctx,
+                    ggml_add(ctx, ggml_add(ctx, av.m, bv.m), ggml_abs(ctx, ggml_sub(ctx, av.m, bv.m))),
+                    0.5f);
+            auto wa = ggml_exp(ctx, ggml_sub(ctx, av.m, m));
+            auto wb = ggml_exp(ctx, ggml_sub(ctx, bv.m, m));
+            auto r = ggml_add(ctx,
+                    ggml_mul(ctx, av.r, ggml_repeat(ctx, wa, av.r)),
+                    ggml_mul(ctx, bv.r, ggml_repeat(ctx, wb, bv.r)));
+            auto s = ggml_add(ctx, ggml_mul(ctx, av.s, wa), ggml_mul(ctx, bv.s, wb));
+            if (normalize) {
+                return ggml_div(ctx, r, ggml_repeat(ctx, s, r));
+            }
+            return ggml_concat(ctx, ggml_concat(ctx, r, m, 0), s, 0);
+        };
+
+        auto make_mask_view = [&](int32_t logical_offset, int32_t count) {
+            return ggml_view_2d(ctx, kq_mask, count, kq_mask->ne[1], kq_mask->nb[1],
+                    (size_t) logical_offset*kq_mask->nb[0]);
+        };
+
+        auto make_stats = [&](ggml_tensor * kc, ggml_tensor * vc, int32_t physical_offset,
+                              int32_t logical_offset, int32_t count, bool cold) {
+            GGML_ASSERT(count > 0 && count % llama_kv_cache::get_padding(true) == 0);
+            const size_t k_row = ggml_row_size(kc->type, n_embd_head_k);
+            const size_t v_row = ggml_row_size(vc->type, n_embd_v_gqa);
+            auto kp = ggml_view_3d(ctx, kc, n_embd_head_k, count, n_head_kv,
+                    k_row*n_head_kv, k_row, (size_t) physical_offset*k_row*n_head_kv);
+            auto vp = ggml_view_3d(ctx, vc, n_embd_head_v, count, n_head_kv,
+                    v_row, ggml_row_size(vc->type, n_embd_head_v), (size_t) physical_offset*v_row);
+            auto mp = make_mask_view(logical_offset, count);
+            auto stats = ggml_flash_attn_ext_stats(ctx, q, kp, vp, mp, kq_scale,
+                    hparams.f_max_alibi_bias, hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+            if (cold && kv.hybrid_numa_shards > 1) {
+                GGML_ASSERT((uint32_t) count <= kv.hybrid_numa_cold_capacity);
+                ggml_flash_attn_ext_set_numa_shards(
+                        stats, kv.hybrid_numa_shards, kv.hybrid_numa_cold_capacity);
+            }
+            if (!cold) {
+                // Cache writes mutate persistent tensors and are otherwise invisible
+                // as data dependencies of the attention read.
+                auto dep = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+                dep->op = GGML_OP_NONE;
+                const size_t copy_idx = 4*(size_t) il;
+                int src = 0;
+                for (int i = 0; i < 4; ++i) {
+                    if (auto * cpy = lctx.hybrid_cache_copies[copy_idx + i].cpy) {
+                        dep->src[src++] = cpy;
+                    }
+                }
+                stats->src[5] = dep;
+            }
+            cb(stats, cold ? "hybrid_kv_cold_stats" : "hybrid_kv_hot_stats", il);
+            return stats;
+        };
+
+        const int32_t hot_n  = std::min<int32_t>(n_kv, kv.hybrid_hot_size);
+        const int32_t cold_n = n_kv - hot_n;
+        const int32_t hot_physical = cold_n % kv.hybrid_hot_size;
+        const int32_t hot_first = std::min<int32_t>(hot_n, kv.hybrid_hot_size - hot_physical);
+        const int32_t hot_second = hot_n - hot_first;
+
+        if (cold_n == 0) {
+            GGML_ASSERT(hot_second == 0);
+            const size_t k_row = ggml_row_size(kv.k_hot_l[kv_layer]->type, n_embd_head_k);
+            const size_t v_row = ggml_row_size(kv.v_hot_l[kv_layer]->type, n_embd_v_gqa);
+            auto kp = ggml_view_3d(ctx, kv.k_hot_l[kv_layer], n_embd_head_k, hot_first, n_head_kv,
+                    k_row*n_head_kv, k_row, (size_t) hot_physical*k_row*n_head_kv);
+            auto vp = ggml_view_3d(ctx, kv.v_hot_l[kv_layer], n_embd_head_v, hot_first, n_head_kv,
+                    v_row, ggml_row_size(kv.v_hot_l[kv_layer]->type, n_embd_head_v),
+                    (size_t) hot_physical*v_row);
+            auto mp = make_mask_view(0, hot_first);
+            cur = ggml_flash_attn_ext(ctx, q, kp, vp, mp, kq_scale,
+                    hparams.f_max_alibi_bias,
+                    hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+            cb(cur, "hybrid_kv_hot_fa", il);
+        } else {
+            std::vector<ggml_tensor *> parts;
+            parts.reserve(3);
+            parts.push_back(make_stats(k_cache, v_cache, 0, 0, cold_n, true));
+            parts.push_back(make_stats(kv.k_hot_l[kv_layer], kv.v_hot_l[kv_layer],
+                    hot_physical, cold_n, hot_first, false));
+            if (hot_second > 0) {
+                parts.push_back(make_stats(kv.k_hot_l[kv_layer], kv.v_hot_l[kv_layer],
+                        0, cold_n + hot_first, hot_second, false));
+            }
+
+            ggml_tensor * merged = parts[0];
+            for (size_t i = 1; i < parts.size(); ++i) {
+                merged = merge_stats(merged, parts[i], i + 1 == parts.size());
+            }
+            cur = merged;
+            cb(cur, "hybrid_kv_merge", il);
+        }
+
+        cur = ggml_reshape_2d(ctx, cur, n_embd_head_v*n_head, n_tokens);
+        cb(cur, "kqv_merged_cont", il);
+    } else if (cparams.flash_attn) {
         GGML_UNUSED(model);
         GGML_UNUSED(n_ctx);
 
@@ -2699,6 +2882,23 @@ ggml_cgraph * llm_build_context::llama_build_graph(
             if (strcmp(name, "kqv_merged_cont") == 0) {
                 // all nodes between the KV store and the attention output are run on the CPU
                 ggml_backend_sched_set_tensor_backend(lctx.sched, cur, lctx.backend_cpu);
+            }
+        }
+
+        if (strcmp(name, "hybrid_kv_cold_stats") == 0) {
+            ggml_backend_sched_set_tensor_backend(lctx.sched, cur, lctx.backend_cpu);
+        }
+
+        if (strcmp(name, "hybrid_kv_hot_fa") == 0 ||
+                strcmp(name, "hybrid_kv_hot_stats") == 0 ||
+                strcmp(name, "hybrid_kv_merge") == 0) {
+            for (auto * backend : lctx.backends) {
+                if (!ggml_backend_is_cpu(backend) &&
+                        ggml_backend_supports_buft(backend, lctx.model.buft_layer[il].buft) &&
+                        (ggml_backend_supports_op(backend, cur) || ggml_backend_offload_op(backend, cur))) {
+                    ggml_backend_sched_set_tensor_backend(lctx.sched, cur, backend);
+                    break;
+                }
             }
         }
 

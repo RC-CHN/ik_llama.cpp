@@ -925,6 +925,7 @@ extern "C" {
     GGML_API bool    ggml_is_numa(void); // true if init detected that system has >1 NUMA node
     GGML_API uint32_t ggml_numa_node_count(void);
     GGML_API bool     ggml_numa_row_shard_enabled(void);
+    GGML_API bool     ggml_numa_exact_pin_enabled(void);
 
     GGML_API void    ggml_print_object (const struct ggml_object * obj);
     GGML_API void    ggml_print_objects(const struct ggml_context * ctx);
@@ -2501,6 +2502,19 @@ extern "C" {
             float                 max_bias,
             float                 softcap);
 
+    // Same attention calculation, but returns the online-softmax state instead
+    // of a normalized value: [R (Dv values), M, S] per query/head, where
+    // R = sum(exp(score-M)*V) and S = sum(exp(score-M)).
+    GGML_API struct ggml_tensor * ggml_flash_attn_ext_stats(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * mask,
+            float                 scale,
+            float                 max_bias,
+            float                 softcap);
+
     // Backend hint stored in ggml_flash_attn_ext op_params slot 4.
     // Negative values request the generic implementation instead of IQK FA.
     #define GGML_FLASH_ATTN_EXT_IQK_DISABLED (-1)
@@ -2508,6 +2522,14 @@ extern "C" {
     GGML_API void ggml_flash_attn_ext_set_prec(
             struct ggml_tensor * a,
             enum ggml_prec       prec);
+
+    // Mark a raw-statistics FA node whose K/V rows have been placed in
+    // contiguous NUMA shards. cold_capacity is the number of rows covered by
+    // the complete cold region; the actual K/V view may contain fewer rows.
+    GGML_API void ggml_flash_attn_ext_set_numa_shards(
+            struct ggml_tensor * a,
+            int32_t              n_shards,
+            int32_t              cold_capacity);
 
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,

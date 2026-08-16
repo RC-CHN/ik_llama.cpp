@@ -34,6 +34,20 @@ GGML_API GGML_CALL ggml_backend_buffer_type_t ggml_backend_cuda_split_buffer_typ
 // pinned host buffer for use with the CPU backend for faster copies between CPU and GPU
 GGML_API GGML_CALL ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type(void);
 
+struct ggml_cuda_host_numa_range {
+    size_t   offset;
+    size_t   size;
+    uint32_t node;
+};
+
+// Rebind page-aligned ranges of a CUDA host buffer to Linux NUMA nodes. The
+// buffer is temporarily unregistered because Linux cannot migrate CUDA-pinned
+// pages, then registered again before this function returns.
+GGML_API GGML_CALL bool ggml_backend_cuda_host_buffer_numa_rebind(
+        ggml_backend_buffer_t                    buffer,
+        const struct ggml_cuda_host_numa_range * ranges,
+        size_t                                   n_ranges);
+
 GGML_API GGML_CALL int  ggml_backend_cuda_get_device_count(void);
 GGML_API GGML_CALL void ggml_backend_cuda_get_device_description(int device, char * description, size_t description_size);
 GGML_API GGML_CALL void ggml_backend_cuda_get_device_memory(int device, size_t * free, size_t * total);
