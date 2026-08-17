@@ -432,7 +432,7 @@ public:
 
     llama_tokens::const_iterator cend();
 
-    llama_tokens tokens_data();
+    llama_tokens tokens_data() const;
 
     // for compatibility with speculative decoding, ctx shift, slot save/load
     const std::vector<llama_token>& get_text_tokens() const;

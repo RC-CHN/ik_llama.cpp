@@ -1,6 +1,18 @@
 #include "server-task.h"
 #include "server-chat.h"
 
+#include <algorithm>
+#include <chrono>
+#include <filesystem>
+#include <limits>
+#include <system_error>
+
+#if defined(__linux__)
+#include <cerrno>
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
 json result_timings::to_json() const {
     json base = {
         {"prompt_n",               prompt_n},
@@ -1052,6 +1064,10 @@ json server_task_result_cmpl_partial::to_json_anthropic_partial() {
 
 
 size_t server_prompt::size() const {
+    return ram_size() + disk_size();
+}
+
+size_t server_prompt::ram_size() const {
     size_t res = data.size();
 
     for (const auto& checkpoint : checkpoints) {
@@ -1061,13 +1077,184 @@ size_t server_prompt::size() const {
     return res;
 }
 
+server_prompt_cache::server_prompt_cache(
+        llama_context * ctx,
+               int32_t   limit_ram_mib,
+               int32_t   limit_disk_mib,
+                size_t   limit_tokens,
+           std::string   disk_root,
+                bool     rewind_to_checkpoint_on_save) {
+    this->ctx = ctx;
+    this->ram_enabled = limit_ram_mib != 0;
+    this->limit_ram_size = 1024ull * 1024ull * (limit_ram_mib < 0 ? 0 : limit_ram_mib);
+    this->limit_disk_size = 1024ull * 1024ull * (limit_disk_mib < 0 ? 0 : limit_disk_mib);
+    this->limit_tokens = limit_tokens;
+    this->rewind_to_checkpoint_on_save = rewind_to_checkpoint_on_save;
+
+    if (limit_disk_mib != 0) {
+        if (disk_root.empty()) {
+            throw std::runtime_error("disk prompt caching requires a cache root");
+        }
+        namespace fs = std::filesystem;
+        std::error_code ec;
+        fs::create_directories(disk_root, ec);
+        if (ec) {
+            throw std::runtime_error("failed to create disk prompt-cache root '" + disk_root + "': " + ec.message());
+        }
+
+        const uint64_t stamp = (uint64_t) std::chrono::steady_clock::now().time_since_epoch().count();
+        for (uint32_t attempt = 0; attempt < 1024; ++attempt) {
+            const fs::path candidate = fs::path(disk_root) /
+                ("ik-llama-prompt-cache-" + std::to_string(stamp) + "-" + std::to_string(attempt));
+            ec.clear();
+            if (fs::create_directory(candidate, ec)) {
+                fs::permissions(candidate, fs::perms::owner_all,
+                        fs::perm_options::replace, ec);
+                if (ec) {
+                    std::error_code remove_ec;
+                    fs::remove(candidate, remove_ec);
+                    throw std::runtime_error("failed to make disk prompt-cache directory private below '" +
+                            disk_root + "': " + ec.message());
+                }
+                disk_directory = candidate.string();
+                break;
+            }
+            if (ec) {
+                throw std::runtime_error("failed to create private disk prompt-cache directory below '" +
+                        disk_root + "': " + ec.message());
+            }
+        }
+        if (disk_directory.empty()) {
+            throw std::runtime_error("failed to allocate a unique disk prompt-cache directory below '" + disk_root + "'");
+        }
+    }
+}
+
+server_prompt_cache::~server_prompt_cache() {
+    clear();
+    if (!disk_directory.empty()) {
+        std::error_code ec;
+        std::filesystem::remove_all(disk_directory, ec);
+        if (ec) {
+            LLAMA_LOG_WARN("failed to remove disk prompt-cache directory '%s': %s\n",
+                    disk_directory.c_str(), ec.message().c_str());
+        }
+    }
+}
+
+static void server_prompt_remove_state_file(server_prompt & prompt) {
+    for (const std::string * path : { &prompt.state_file, &prompt.checkpoint_file }) {
+        if (path->empty()) {
+            continue;
+        }
+        std::error_code ec;
+        std::filesystem::remove(*path, ec);
+        if (ec) {
+            LLAMA_LOG_WARN("failed to remove disk prompt-cache file '%s': %s\n",
+                    path->c_str(), ec.message().c_str());
+        }
+    }
+    prompt.state_file.clear();
+    prompt.state_file_size = 0;
+    prompt.checkpoint_file.clear();
+    prompt.checkpoint_file_size = 0;
+}
+
+static void server_prompt_remove_checkpoint_state_files(server_prompt & prompt) {
+    for (auto & checkpoint : prompt.checkpoints) {
+        if (checkpoint.state_file.empty()) {
+            continue;
+        }
+        std::error_code ec;
+        std::filesystem::remove(checkpoint.state_file, ec);
+        if (ec) {
+            LLAMA_LOG_WARN("failed to remove staged prompt checkpoint '%s': %s\n",
+                    checkpoint.state_file.c_str(), ec.message().c_str());
+        }
+        checkpoint.state_file.clear();
+        checkpoint.state_file_size = 0;
+    }
+}
+
+static void server_prompt_remove_all_files(server_prompt & prompt) {
+    server_prompt_remove_state_file(prompt);
+    server_prompt_remove_checkpoint_state_files(prompt);
+}
+
+static bool server_prompt_load_checkpoint_file(server_prompt & prompt);
+
+static void server_prompt_release_file_pages(const std::string & path, bool flush_dirty) {
+#if defined(__linux__)
+    const int flags = (flush_dirty ? O_RDWR : O_RDONLY) | O_CLOEXEC;
+    const int fd = open(path.c_str(), flags);
+    if (fd < 0) {
+        LLAMA_LOG_WARN("failed to open disk prompt-cache file for page-cache release '%s': errno %d\n",
+                path.c_str(), errno);
+        return;
+    }
+    if (flush_dirty && fdatasync(fd) != 0) {
+        LLAMA_LOG_WARN("failed to flush disk prompt-cache file '%s': errno %d\n",
+                path.c_str(), errno);
+    }
+    const int rc = posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+    if (rc != 0) {
+        LLAMA_LOG_WARN("failed to release disk prompt-cache pages for '%s': error %d\n",
+                path.c_str(), rc);
+    }
+    close(fd);
+#else
+    (void) path;
+    (void) flush_dirty;
+#endif
+}
+
 size_t server_prompt_cache::size() const {
+    return ram_size() + disk_size();
+}
+
+size_t server_prompt_cache::ram_size() const {
     size_t res = 0;
 
     for (const auto& state : states) {
-        res += state.size();
+        res += state.ram_size();
     }
 
+    return res;
+}
+
+size_t server_prompt_cache::disk_size() const {
+    // Count the private directory rather than only cached LRU entries. A
+    // loaded hybrid snapshot remains leased by its live slot so it can be
+    // re-adopted without a multi-GiB rewrite, and still belongs to this tier's
+    // capacity budget while it is active.
+    if (!disk_directory.empty()) {
+        namespace fs = std::filesystem;
+        std::error_code ec;
+        size_t res = 0;
+        fs::directory_iterator it(disk_directory, ec);
+        const fs::directory_iterator end;
+        while (!ec && it != end) {
+            if (it->is_regular_file(ec) && !ec) {
+                const uintmax_t file_size = it->file_size(ec);
+                if (!ec) {
+                    res += file_size > std::numeric_limits<size_t>::max() - res
+                        ? std::numeric_limits<size_t>::max() - res
+                        : (size_t) file_size;
+                }
+            }
+            if (!ec) {
+                it.increment(ec);
+            }
+        }
+        if (!ec) {
+            return res;
+        }
+    }
+
+    size_t res = 0;
+    for (const auto & state : states) {
+        res += state.disk_size();
+    }
     return res;
 }
 
@@ -1094,7 +1281,7 @@ bool server_prompt_cache::load(server_prompt& prompt, const server_tokens& token
         tokens_new_ex = tokens_new.get_tokens_exclude_think(ctx, think_tokens);
     }
     else {
-        prompt_tokens = std::move(prompt.tokens); 
+        prompt_tokens = prompt.tokens.clone();
         tokens_new_ex = tokens_new.clone();
     }
     const auto lcp_best = prompt_tokens.get_common_prefix(ctx, tokens_new_ex);
@@ -1111,7 +1298,7 @@ bool server_prompt_cache::load(server_prompt& prompt, const server_tokens& token
             tokens = it->tokens.get_tokens_exclude_think(ctx, think_tokens);
         }
         else {
-            tokens = std::move(it->tokens);
+            tokens = it->tokens.clone();
         }
         const auto lcp_cur = tokens.get_common_prefix(ctx, tokens_new_ex);
         const float f_keep_cur = float(lcp_cur.first) / tokens.size();
@@ -1128,16 +1315,62 @@ bool server_prompt_cache::load(server_prompt& prompt, const server_tokens& token
 
     if (it_best != states.end()) {
         LLAMA_LOG_INFO(" - found better prompt with f_keep = %.3f, sim = %.3f, n_keep = %d, n_discarded_prompt = %d\n", f_keep_best, sim_best, it_best->n_kept_prompt, it_best->n_discarded_prompt);
-        const size_t size = it_best->data.size();
-        const size_t n = llama_state_seq_set_data(ctx, it_best->data.data(), size, id_slot, 0);
-        if (n != size) {
-            LLAMA_LOG_INFO("failed to restore state with size %zu\n", size);
-            return false;
+        if (!it_best->state_file.empty()) {
+            make_ram_room(it_best->checkpoint_file_size);
+            if (!server_prompt_load_checkpoint_file(*it_best)) {
+                return false;
+            }
+            const size_t state_token_count = it_best->state_n_tokens >= 0
+                ? (size_t) it_best->state_n_tokens : it_best->tokens.size();
+            llama_tokens state_tokens(state_token_count);
+            size_t token_count = 0;
+            const size_t n = llama_state_seq_load_file(ctx, it_best->state_file.c_str(), id_slot,
+                    state_tokens.data(), state_tokens.size(), &token_count);
+            server_prompt_release_file_pages(it_best->state_file, false);
+            if (n == 0 || token_count != state_tokens.size()) {
+                LLAMA_LOG_INFO("failed to restore disk prompt-cache state '%s' (%zu of %zu tokens)\n",
+                        it_best->state_file.c_str(), token_count, state_tokens.size());
+                std::list<server_prompt_checkpoint>().swap(it_best->checkpoints);
+                return false;
+            }
+
+            // A hybrid prompt-tail snapshot is immutable and remains a valid
+            // future cache entry after it has been loaded. Transfer its file
+            // into the live slot's checkpoint list instead of deleting and
+            // immediately streaming the same multi-GiB state back to disk.
+            // save() will adopt this file again when the slot is displaced.
+            if (rewind_to_checkpoint_on_save && it_best->state_n_tokens > 0) {
+                server_prompt_checkpoint retained = {};
+                retained.pos_min = llama_kv_cache_seq_pos_min(ctx, id_slot);
+                retained.pos_max = llama_kv_cache_seq_pos_max(ctx, id_slot);
+                const llama_pos prompt_offset = it_best->state_pos_max_prompt >= 0
+                    ? it_best->state_pos_max_prompt - retained.pos_max : 0;
+                retained.pos_min_prompt = retained.pos_min + prompt_offset;
+                retained.pos_max_prompt = retained.pos_max + prompt_offset;
+                retained.n_tokens = it_best->state_n_tokens;
+                retained.state_file = std::move(it_best->state_file);
+                retained.state_file_size = it_best->state_file_size;
+                it_best->state_file_size = 0;
+                it_best->checkpoints.push_back(std::move(retained));
+                LLAMA_LOG_INFO("retained loaded hybrid prompt snapshot for zero-copy re-adoption\n");
+            }
+            server_prompt_remove_state_file(*it_best);
+        } else {
+            const size_t size = it_best->data.size();
+            const size_t n = llama_state_seq_set_data(ctx, it_best->data.data(), size, id_slot, 0);
+            if (n != size) {
+                LLAMA_LOG_INFO("failed to restore state with size %zu\n", size);
+                return false;
+            }
         }
 
         it_best->data.clear();
         it_best->data.shrink_to_fit();
 
+        // The destination may own a staged snapshot from its current live
+        // sequence. It is about to be replaced, so release that file now
+        // instead of retaining it until process teardown.
+        server_prompt_remove_all_files(prompt);
         prompt = std::move(*it_best);
 
         states.erase(it_best);
@@ -1146,7 +1379,7 @@ bool server_prompt_cache::load(server_prompt& prompt, const server_tokens& token
     return true;
 }
 
-server_prompt* server_prompt_cache::alloc(const server_prompt& prompt, size_t state_size) {
+server_prompt* server_prompt_cache::alloc(server_prompt & prompt, size_t state_size) {
     for (auto it = states.begin(); it != states.end();) {
         auto tokens_ctx_shift = prompt.tokens.clone();  // copy cache tokens
         tokens_ctx_shift.discard_n_tokens(prompt.n_kept_prompt, prompt.n_discarded_prompt);
@@ -1161,6 +1394,7 @@ server_prompt* server_prompt_cache::alloc(const server_prompt& prompt, size_t st
         // next, remove any cached prompts that are fully contained in the current prompt
         else if (len == it->tokens.size()) {
             LLAMA_LOG_INFO(" - removing obsolete cached prompt with length %d\n", (int)len);
+            server_prompt_remove_all_files(*it);
             it = states.erase(it);
         }
         else {
@@ -1170,20 +1404,8 @@ server_prompt* server_prompt_cache::alloc(const server_prompt& prompt, size_t st
 
     std::vector<uint8_t> state_data;
 
-    // check if we can allocate enough memory for the new state
-    try {
+    if (state_size > 0) {
         state_data.resize(state_size);
-    }
-    catch (const std::bad_alloc& e) {
-        LLAMA_LOG_INFO("failed to allocate memory for prompt cache state: %s\n", e.what());
-
-        limit_size = std::max<size_t>(1, 0.4 * size());
-
-        LLAMA_LOG_INFO(" - cache size limit reduced to %.3f MiB\n", limit_size / (1024.0 * 1024.0));
-
-        update();
-
-        return nullptr;
     }
 
     // TODO: for some reason we can't copy server_tokens, so we have to do this workaround
@@ -1194,38 +1416,543 @@ server_prompt* server_prompt_cache::alloc(const server_prompt& prompt, size_t st
         /*.n_discarded_prompt     =*/ prompt.n_discarded_prompt,
         /*.think_tokens                   =*/ prompt.think_tokens,
         /*.data            =*/ std::move(state_data),
-        /*.checkpoints     =*/ prompt.checkpoints,
+        /*.state_file      =*/ {},
+        /*.state_file_size =*/ 0,
+        /*.checkpoint_file =*/ {},
+        /*.checkpoint_file_size =*/ 0,
+        /*.state_n_tokens =*/ prompt.state_n_tokens,
+        /*.state_pos_max_prompt =*/ prompt.state_pos_max_prompt,
+        /*.checkpoints     =*/ std::move(prompt.checkpoints),
     };
 
     return &cur;
 }
 
+static bool server_prompt_commit_partial(const std::string & partial_path, const std::string & final_path);
+
+static size_t server_prompt_checkpoint_file_size(const server_prompt & prompt) {
+    if (prompt.checkpoints.empty()) {
+        return 0;
+    }
+
+    size_t size = 3*sizeof(uint32_t);
+    for (const auto & checkpoint : prompt.checkpoints) {
+        size += sizeof(checkpoint.pos_min) + sizeof(checkpoint.pos_max) +
+            sizeof(checkpoint.pos_min_prompt) + sizeof(checkpoint.pos_max_prompt) +
+            sizeof(checkpoint.n_tokens) + sizeof(uint64_t) + checkpoint.data.size();
+    }
+    return size;
+}
+
+static std::pair<std::string, std::string> server_prompt_cache_next_paths(server_prompt_cache & cache) {
+    namespace fs = std::filesystem;
+    const std::string base = "prompt-" + std::to_string(cache.disk_file_id++);
+    const fs::path final_path = fs::path(cache.disk_directory) / (base + ".bin");
+    const fs::path partial_path = fs::path(cache.disk_directory) / (base + ".partial");
+    return { final_path.string(), partial_path.string() };
+}
+
+bool server_prompt_cache::stage_checkpoint(
+        server_prompt_checkpoint & checkpoint,
+            const server_tokens & tokens,
+                      int32_t      id_slot) {
+    if (!has_disk_tier() || !checkpoint.state_file.empty() || checkpoint.n_tokens <= 0 ||
+            checkpoint.n_tokens > tokens.n_tokens()) {
+        return false;
+    }
+
+    llama_tokens state_tokens = tokens.tokens_data();
+    state_tokens.resize((size_t) checkpoint.n_tokens);
+    const size_t state_size = llama_state_seq_get_size(ctx, id_slot, 0);
+    const size_t estimated_file_size = 3*sizeof(uint32_t) +
+        state_tokens.size()*sizeof(llama_token) + state_size;
+    if (state_size == 0 || !make_disk_room(estimated_file_size)) {
+        LLAMA_LOG_WARN("cannot stage hybrid prompt checkpoint: %.3f MiB state does not fit the disk tier budget\n",
+                estimated_file_size / (1024.0 * 1024.0));
+        return false;
+    }
+
+    const auto paths = server_prompt_cache_next_paths(*this);
+    const int64_t t_start = ggml_time_us();
+    const size_t written = llama_state_seq_save_file(ctx, paths.second.c_str(), id_slot,
+            state_tokens.data(), state_tokens.size());
+    if (written == 0 || !server_prompt_commit_partial(paths.second, paths.first)) {
+        std::error_code ec;
+        std::filesystem::remove(paths.second, ec);
+        return false;
+    }
+    server_prompt_release_file_pages(paths.first, true);
+
+    checkpoint.state_file = paths.first;
+    checkpoint.state_file_size = written;
+    LLAMA_LOG_INFO(" - staged self-consistent hybrid checkpoint at token %" PRId64
+            ": %.3f MiB in %.2f ms\n", checkpoint.n_tokens,
+            written/(1024.0*1024.0), (ggml_time_us() - t_start)/1000.0);
+    return true;
+}
+
+static bool server_prompt_commit_partial(const std::string & partial_path, const std::string & final_path) {
+    std::error_code ec;
+    std::filesystem::rename(partial_path, final_path, ec);
+    if (!ec) {
+        return true;
+    }
+    std::error_code remove_ec;
+    std::filesystem::remove(partial_path, remove_ec);
+    LLAMA_LOG_WARN("failed to commit disk prompt-cache state '%s': %s\n",
+            final_path.c_str(), ec.message().c_str());
+    return false;
+}
+
+static bool server_prompt_save_checkpoint_file(server_prompt & prompt) {
+    if (prompt.checkpoints.empty()) {
+        return true;
+    }
+    GGML_ASSERT(!prompt.state_file.empty());
+
+    const std::string final_path = prompt.state_file + ".checkpoints";
+    const std::string partial_path = final_path + ".partial";
+    std::ofstream file(partial_path, std::ios::binary | std::ios::trunc);
+    const uint32_t magic = LLAMA_STATE_SEQ_MAGIC;
+    const uint32_t version = LLAMA_STATE_SEQ_VERSION;
+    const uint32_t count = (uint32_t) prompt.checkpoints.size();
+    size_t file_size = sizeof(magic) + sizeof(version) + sizeof(count);
+    file.write(reinterpret_cast<const char *>(&magic), sizeof(magic));
+    file.write(reinterpret_cast<const char *>(&version), sizeof(version));
+    file.write(reinterpret_cast<const char *>(&count), sizeof(count));
+    for (const auto & checkpoint : prompt.checkpoints) {
+        const uint64_t data_size = checkpoint.data.size();
+        file.write(reinterpret_cast<const char *>(&checkpoint.pos_min), sizeof(checkpoint.pos_min));
+        file.write(reinterpret_cast<const char *>(&checkpoint.pos_max), sizeof(checkpoint.pos_max));
+        file.write(reinterpret_cast<const char *>(&checkpoint.pos_min_prompt), sizeof(checkpoint.pos_min_prompt));
+        file.write(reinterpret_cast<const char *>(&checkpoint.pos_max_prompt), sizeof(checkpoint.pos_max_prompt));
+        file.write(reinterpret_cast<const char *>(&checkpoint.n_tokens), sizeof(checkpoint.n_tokens));
+        file.write(reinterpret_cast<const char *>(&data_size), sizeof(data_size));
+        file.write(reinterpret_cast<const char *>(checkpoint.data.data()), checkpoint.data.size());
+        file_size += sizeof(checkpoint.pos_min) + sizeof(checkpoint.pos_max) +
+            sizeof(checkpoint.pos_min_prompt) + sizeof(checkpoint.pos_max_prompt) +
+            sizeof(checkpoint.n_tokens) + sizeof(data_size) + checkpoint.data.size();
+    }
+    file.close();
+    if (!file) {
+        std::error_code ec;
+        std::filesystem::remove(partial_path, ec);
+        LLAMA_LOG_WARN("failed to write prompt-cache checkpoints to '%s'\n", partial_path.c_str());
+        return false;
+    }
+    if (!server_prompt_commit_partial(partial_path, final_path)) {
+        return false;
+    }
+    server_prompt_release_file_pages(final_path, true);
+
+    prompt.checkpoint_file = final_path;
+    prompt.checkpoint_file_size = file_size;
+    return true;
+}
+
+static bool server_prompt_load_checkpoint_file(server_prompt & prompt) {
+    if (prompt.checkpoint_file.empty()) {
+        return true;
+    }
+
+    std::ifstream file(prompt.checkpoint_file, std::ios::binary);
+    uint32_t magic = 0;
+    uint32_t version = 0;
+    uint32_t count = 0;
+    file.read(reinterpret_cast<char *>(&magic), sizeof(magic));
+    file.read(reinterpret_cast<char *>(&version), sizeof(version));
+    file.read(reinterpret_cast<char *>(&count), sizeof(count));
+    if (!file || magic != LLAMA_STATE_SEQ_MAGIC || version != LLAMA_STATE_SEQ_VERSION || count > 4096) {
+        LLAMA_LOG_WARN("invalid disk prompt-cache checkpoint file '%s'\n", prompt.checkpoint_file.c_str());
+        return false;
+    }
+
+    std::list<server_prompt_checkpoint> checkpoints;
+    for (uint32_t i = 0; i < count; ++i) {
+        server_prompt_checkpoint checkpoint = {};
+        uint64_t data_size = 0;
+        file.read(reinterpret_cast<char *>(&checkpoint.pos_min), sizeof(checkpoint.pos_min));
+        file.read(reinterpret_cast<char *>(&checkpoint.pos_max), sizeof(checkpoint.pos_max));
+        file.read(reinterpret_cast<char *>(&checkpoint.pos_min_prompt), sizeof(checkpoint.pos_min_prompt));
+        file.read(reinterpret_cast<char *>(&checkpoint.pos_max_prompt), sizeof(checkpoint.pos_max_prompt));
+        file.read(reinterpret_cast<char *>(&checkpoint.n_tokens), sizeof(checkpoint.n_tokens));
+        file.read(reinterpret_cast<char *>(&data_size), sizeof(data_size));
+        if (!file || data_size > std::numeric_limits<size_t>::max()) {
+            LLAMA_LOG_WARN("truncated disk prompt-cache checkpoint file '%s'\n", prompt.checkpoint_file.c_str());
+            return false;
+        }
+        try {
+            checkpoint.data.resize((size_t) data_size);
+        } catch (const std::bad_alloc &) {
+            LLAMA_LOG_WARN("cannot allocate %.3f MiB for a restored context checkpoint\n",
+                    data_size / (1024.0 * 1024.0));
+            return false;
+        }
+        file.read(reinterpret_cast<char *>(checkpoint.data.data()), checkpoint.data.size());
+        if (!file) {
+            LLAMA_LOG_WARN("truncated disk prompt-cache checkpoint file '%s'\n", prompt.checkpoint_file.c_str());
+            return false;
+        }
+        checkpoints.push_back(std::move(checkpoint));
+    }
+
+    server_prompt_release_file_pages(prompt.checkpoint_file, false);
+    prompt.checkpoints = std::move(checkpoints);
+    return true;
+}
+
+bool server_prompt_cache::save_to_disk(server_prompt & prompt, int32_t id_slot) {
+    GGML_ASSERT(has_disk_tier());
+    llama_tokens state_tokens = prompt.tokens.tokens_data();
+    if (prompt.state_n_tokens >= 0 &&
+            (size_t) prompt.state_n_tokens < state_tokens.size()) {
+        state_tokens.resize((size_t) prompt.state_n_tokens);
+    }
+    const size_t state_size = llama_state_seq_get_size(ctx, id_slot, 0);
+    const size_t estimated_file_size = 3*sizeof(uint32_t) +
+        state_tokens.size()*sizeof(llama_token) + state_size +
+        server_prompt_checkpoint_file_size(prompt);
+    if (state_size == 0 || !make_disk_room(estimated_file_size)) {
+        LLAMA_LOG_WARN("cannot stream %.3f MiB prompt state: disk tier budget is exhausted\n",
+                estimated_file_size / (1024.0 * 1024.0));
+        return false;
+    }
+
+    const auto paths = server_prompt_cache_next_paths(*this);
+    const size_t n = llama_state_seq_save_file(ctx, paths.second.c_str(), id_slot,
+            state_tokens.data(), state_tokens.size());
+    if (n == 0) {
+        std::error_code ec;
+        std::filesystem::remove(paths.second, ec);
+        LLAMA_LOG_WARN("failed to stream prompt-cache state to '%s'\n", paths.second.c_str());
+        return false;
+    }
+    if (!server_prompt_commit_partial(paths.second, paths.first)) {
+        return false;
+    }
+    server_prompt_release_file_pages(paths.first, true);
+
+    prompt.state_file = paths.first;
+    prompt.state_file_size = n;
+    if (!server_prompt_save_checkpoint_file(prompt)) {
+        server_prompt_remove_state_file(prompt);
+        return false;
+    }
+    std::list<server_prompt_checkpoint>().swap(prompt.checkpoints);
+    LLAMA_LOG_INFO(" - streamed prompt cache to disk: %s, %.3f MiB\n",
+            prompt.state_file.c_str(), prompt.disk_size() / (1024.0 * 1024.0));
+    return true;
+}
+
+bool server_prompt_cache::spill_to_disk(server_prompt & prompt) {
+    GGML_ASSERT(has_disk_tier());
+    if (prompt.data.empty()) {
+        return !prompt.state_file.empty();
+    }
+
+    llama_tokens state_tokens = prompt.tokens.tokens_data();
+    if (prompt.state_n_tokens >= 0 &&
+            (size_t) prompt.state_n_tokens < state_tokens.size()) {
+        state_tokens.resize((size_t) prompt.state_n_tokens);
+    }
+    if (state_tokens.size() > std::numeric_limits<uint32_t>::max()) {
+        LLAMA_LOG_WARN("cannot spill prompt cache with %zu tokens to disk\n", state_tokens.size());
+        return false;
+    }
+
+    const size_t estimated_file_size = 3*sizeof(uint32_t) +
+        state_tokens.size()*sizeof(llama_token) + prompt.data.size() +
+        server_prompt_checkpoint_file_size(prompt);
+    if (!make_disk_room(estimated_file_size)) {
+        LLAMA_LOG_WARN("cannot spill %.3f MiB prompt state: disk tier budget is exhausted\n",
+                estimated_file_size / (1024.0 * 1024.0));
+        return false;
+    }
+
+    const auto paths = server_prompt_cache_next_paths(*this);
+    std::ofstream file(paths.second, std::ios::binary | std::ios::trunc);
+    const uint32_t magic = LLAMA_STATE_SEQ_MAGIC;
+    const uint32_t version = LLAMA_STATE_SEQ_VERSION;
+    const uint32_t token_count = (uint32_t) state_tokens.size();
+    file.write(reinterpret_cast<const char *>(&magic), sizeof(magic));
+    file.write(reinterpret_cast<const char *>(&version), sizeof(version));
+    file.write(reinterpret_cast<const char *>(&token_count), sizeof(token_count));
+    file.write(reinterpret_cast<const char *>(state_tokens.data()), state_tokens.size() * sizeof(llama_token));
+    file.write(reinterpret_cast<const char *>(prompt.data.data()), prompt.data.size());
+    const size_t file_size = sizeof(magic) + sizeof(version) + sizeof(token_count) +
+        state_tokens.size() * sizeof(llama_token) + prompt.data.size();
+    file.close();
+    if (!file) {
+        std::error_code ec;
+        std::filesystem::remove(paths.second, ec);
+        LLAMA_LOG_WARN("failed to spill RAM prompt-cache state to '%s'\n", paths.second.c_str());
+        return false;
+    }
+    if (!server_prompt_commit_partial(paths.second, paths.first)) {
+        return false;
+    }
+    server_prompt_release_file_pages(paths.first, true);
+
+    prompt.state_file = paths.first;
+    prompt.state_file_size = file_size;
+    if (!server_prompt_save_checkpoint_file(prompt)) {
+        server_prompt_remove_state_file(prompt);
+        return false;
+    }
+    std::vector<uint8_t>().swap(prompt.data);
+    std::list<server_prompt_checkpoint>().swap(prompt.checkpoints);
+    LLAMA_LOG_INFO(" - spilled cached prompt to disk: %s, %.3f MiB\n",
+            prompt.state_file.c_str(), prompt.disk_size() / (1024.0 * 1024.0));
+    return true;
+}
+
+void server_prompt_cache::make_ram_room(size_t incoming_size) {
+    if (!ram_enabled || limit_ram_size == 0) {
+        return;
+    }
+
+    while (ram_size() + incoming_size > limit_ram_size) {
+        auto it = std::find_if(states.begin(), states.end(), [](const server_prompt & state) {
+            return !state.data.empty();
+        });
+        if (it == states.end()) {
+            break;
+        }
+
+        if (has_disk_tier() && spill_to_disk(*it)) {
+            continue;
+        }
+
+        LLAMA_LOG_INFO(" - RAM prompt-cache limit reached, dropping oldest in-memory entry (%.3f MiB)\n",
+                it->ram_size() / (1024.0 * 1024.0));
+        server_prompt_remove_all_files(*it);
+        states.erase(it);
+    }
+}
+
+bool server_prompt_cache::make_disk_room(size_t incoming_size) {
+    if (!has_disk_tier() || limit_disk_size == 0) {
+        return has_disk_tier();
+    }
+
+    while (incoming_size > limit_disk_size ||
+            disk_size() > limit_disk_size - incoming_size) {
+        auto it = std::find_if(states.begin(), states.end(), [](const server_prompt & state) {
+            return state.disk_size() > 0;
+        });
+        if (it == states.end()) {
+            return false;
+        }
+        LLAMA_LOG_INFO(" - making disk prompt-cache room, removing oldest spilled entry (%.3f MiB)\n",
+                it->disk_size() / (1024.0 * 1024.0));
+        server_prompt_remove_all_files(*it);
+        states.erase(it);
+    }
+    return true;
+}
+
+static bool server_prompt_read_state_payload(
+        const std::string & path,
+                  uint32_t   expected_tokens,
+     std::vector<uint8_t> & data) {
+    std::ifstream file(path, std::ios::binary);
+    uint32_t magic = 0;
+    uint32_t version = 0;
+    uint32_t token_count = 0;
+    file.read(reinterpret_cast<char *>(&magic), sizeof(magic));
+    file.read(reinterpret_cast<char *>(&version), sizeof(version));
+    file.read(reinterpret_cast<char *>(&token_count), sizeof(token_count));
+    if (!file || magic != LLAMA_STATE_SEQ_MAGIC || version != LLAMA_STATE_SEQ_VERSION ||
+            token_count != expected_tokens) {
+        return false;
+    }
+    file.seekg((std::streamoff) token_count*sizeof(llama_token), std::ios::cur);
+    file.read(reinterpret_cast<char *>(data.data()), data.size());
+    const bool result = file && file.peek() == std::ifstream::traits_type::eof();
+    file.close();
+    server_prompt_release_file_pages(path, false);
+    return result;
+}
+
+bool server_prompt_cache::save(server_prompt & prompt, int32_t id_slot) {
+    if (rewind_to_checkpoint_on_save) {
+        const auto checkpoint = std::find_if(prompt.checkpoints.rbegin(), prompt.checkpoints.rend(),
+                [&](const server_prompt_checkpoint & cur) {
+                    return cur.n_tokens < prompt.tokens.n_tokens() && !cur.state_file.empty();
+                });
+        if (checkpoint == prompt.checkpoints.rend()) {
+            LLAMA_LOG_WARN("hybrid prompt cache has no self-consistent staged tail state; "
+                    "skipping this cache entry\n");
+            return false;
+        }
+
+        std::string staged_file = checkpoint->state_file;
+        const size_t staged_file_size = checkpoint->state_file_size;
+        prompt.state_n_tokens = checkpoint->n_tokens;
+        prompt.state_pos_max_prompt = checkpoint->pos_max_prompt;
+        checkpoint->state_file.clear();
+        checkpoint->state_file_size = 0;
+        for (const auto & cur : prompt.checkpoints) {
+            if (!cur.state_file.empty()) {
+                std::error_code ec;
+                std::filesystem::remove(cur.state_file, ec);
+            }
+        }
+        std::list<server_prompt_checkpoint>().swap(prompt.checkpoints);
+
+        const size_t header_size = 3*sizeof(uint32_t) +
+            (size_t) prompt.state_n_tokens*sizeof(llama_token);
+        if (staged_file_size <= header_size) {
+            std::error_code ec;
+            std::filesystem::remove(staged_file, ec);
+            return false;
+        }
+        const size_t state_size = staged_file_size - header_size;
+        make_ram_room(state_size);
+        const bool state_fits_ram = ram_enabled &&
+            (limit_ram_size == 0 || ram_size() + state_size <= limit_ram_size);
+
+        server_prompt * cur = nullptr;
+        if (state_fits_ram) {
+            try {
+                cur = alloc(prompt, state_size);
+            } catch (const std::bad_alloc &) {
+                cur = nullptr;
+            }
+            if (cur != nullptr && server_prompt_read_state_payload(staged_file,
+                        (uint32_t) prompt.state_n_tokens, cur->data)) {
+                std::error_code ec;
+                std::filesystem::remove(staged_file, ec);
+                LLAMA_LOG_INFO(" - promoted staged hybrid prompt cache to RAM: %.3f MiB\n",
+                        state_size/(1024.0*1024.0));
+                update();
+                return true;
+            }
+            if (cur != nullptr) {
+                states.pop_back();
+            }
+        }
+
+        cur = alloc(prompt, 0);
+        if (cur == nullptr) {
+            std::error_code ec;
+            std::filesystem::remove(staged_file, ec);
+            return false;
+        }
+        cur->state_file = std::move(staged_file);
+        cur->state_file_size = staged_file_size;
+        LLAMA_LOG_INFO(" - adopted staged hybrid prompt cache on disk: %s, %.3f MiB\n",
+                cur->state_file.c_str(), cur->disk_size()/(1024.0*1024.0));
+        update();
+        return true;
+    }
+    if (prompt.state_n_tokens < 0) {
+        prompt.state_n_tokens = prompt.tokens.n_tokens();
+        prompt.state_pos_max_prompt = prompt.tokens.pos_next() - 1;
+    }
+
+    const size_t state_size = llama_state_seq_get_size(ctx, id_slot, 0);
+    if (state_size == 0) {
+        LLAMA_LOG_WARN("failed to query prompt-cache state size for sequence %d\n", id_slot);
+        return false;
+    }
+
+    make_ram_room(state_size + prompt.ram_size());
+    const bool state_fits_ram = ram_enabled &&
+        (limit_ram_size == 0 || state_size + prompt.ram_size() <= limit_ram_size);
+
+    if (!state_fits_ram && has_disk_tier()) {
+        server_prompt * cur = alloc(prompt, 0);
+        if (cur == nullptr) {
+            return false;
+        }
+        if (!save_to_disk(*cur, id_slot)) {
+            prompt.checkpoints = std::move(cur->checkpoints);
+            states.pop_back();
+            return false;
+        }
+        update();
+        return true;
+    }
+
+    if (!ram_enabled) {
+        LLAMA_LOG_WARN("prompt cache has no enabled storage tier\n");
+        return false;
+    }
+
+    server_prompt * cur = nullptr;
+    try {
+        cur = alloc(prompt, state_size);
+    } catch (const std::bad_alloc & e) {
+        LLAMA_LOG_WARN("failed to allocate %.3f MiB for RAM prompt cache: %s\n",
+                state_size / (1024.0 * 1024.0), e.what());
+        if (!has_disk_tier()) {
+            return false;
+        }
+        cur = alloc(prompt, 0);
+        if (cur == nullptr || !save_to_disk(*cur, id_slot)) {
+            if (cur != nullptr) {
+                prompt.checkpoints = std::move(cur->checkpoints);
+                states.pop_back();
+            }
+            return false;
+        }
+        update();
+        return true;
+    }
+    if (cur == nullptr) {
+        return false;
+    }
+
+    const size_t n = llama_state_seq_get_data(ctx, cur->data.data(), state_size, id_slot, 0);
+    if (n != state_size) {
+        LLAMA_LOG_WARN("failed to save RAM prompt-cache state: expected %zu bytes, wrote %zu\n", state_size, n);
+        prompt.checkpoints = std::move(cur->checkpoints);
+        states.pop_back();
+        return false;
+    }
+    update();
+    return true;
+}
 
 void server_prompt_cache::update() {
-    if (limit_size > 0) {
-        // always keep at least one state, regardless of the limits
-        while (states.size() > 1 && size() > limit_size) {
-            if (states.empty()) {
+    make_ram_room(0);
+
+    if (has_disk_tier() && limit_disk_size > 0) {
+        while (disk_size() > limit_disk_size) {
+            auto it = std::find_if(states.begin(), states.end(), [](const server_prompt & state) {
+                return !state.state_file.empty();
+            });
+            if (it == states.end()) {
                 break;
             }
-
-            LLAMA_LOG_INFO(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
-
-            states.pop_front();
+            LLAMA_LOG_INFO(" - disk prompt-cache limit reached, removing oldest spilled entry (%.3f MiB)\n",
+                    it->disk_size() / (1024.0 * 1024.0));
+            server_prompt_remove_all_files(*it);
+            states.erase(it);
         }
     }
 
-    // average size per token
-    const float size_per_token = std::max<float>(1.0f, float(size()) / (std::max<size_t>(1, n_tokens())));
+    const float size_per_token = std::max<float>(1.0f, float(size()) / std::max<size_t>(1, n_tokens()));
+    const size_t combined_limit = limit_ram_size + limit_disk_size;
+    const size_t limit_tokens_cur = combined_limit > 0
+        ? std::max<size_t>(limit_tokens, combined_limit / size_per_token)
+        : limit_tokens;
 
-    // dynamically increase the token limit if it can fit in the memory limit
-    const size_t limit_tokens_cur = limit_size > 0 ? std::max<size_t>(limit_tokens, limit_size / size_per_token) : limit_tokens;
-
-    LLAMA_LOG_INFO(" - cache state: %zu prompts, %.3f MiB (limits: %.3f MiB, %zu tokens, %zu est)\n",
-        states.size(), size() / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0), limit_tokens, limit_tokens_cur);
+    LLAMA_LOG_INFO(" - tiered prompt cache: %zu prompts, RAM %.3f/%.3f MiB, disk %.3f/%.3f MiB (%zu token limit, %zu est)\n",
+        states.size(), ram_size() / (1024.0 * 1024.0), limit_ram_size / (1024.0 * 1024.0),
+        disk_size() / (1024.0 * 1024.0), limit_disk_size / (1024.0 * 1024.0), limit_tokens, limit_tokens_cur);
 
     for (const auto& state : states) {
-        LLAMA_LOG_INFO("   - prompt %p: %7d tokens, %7d discarded, checkpoints: %2zu, %9.3f MiB\n",
-            (const void*)&state, state.n_tokens(), state.n_discarded_prompt, state.checkpoints.size(), state.size() / (1024.0 * 1024.0));
+        LLAMA_LOG_INFO("   - prompt %p: %7d tokens, %7d discarded, checkpoints: %2zu, RAM %9.3f MiB, disk %9.3f MiB\n",
+            (const void*)&state, state.n_tokens(), state.n_discarded_prompt, state.checkpoints.size(),
+            state.ram_size() / (1024.0 * 1024.0), state.disk_size() / (1024.0 * 1024.0));
     }
+}
+
+void server_prompt_cache::clear() {
+    for (auto & state : states) {
+        server_prompt_remove_all_files(state);
+    }
+    states.clear();
 }

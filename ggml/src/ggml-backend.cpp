@@ -2339,6 +2339,13 @@ static bool ggml_backend_sched_copy_hybrid_cold_ready(
         ggml_tensor * input_cpy = tensor_copy(input, split->backend_id, sched->cur_copy);
         ggml_backend_tensor_set_async(backend, input_cpy, input->data, 0, ggml_nbytes(input));
     }
+
+    // The host source is gallocr-managed and may be reused by a later cold
+    // split as soon as this function returns.  Finish the queued H2D transfer
+    // before releasing it.  Hot attention has already been submitted on this
+    // stream, so the CPU-cold/CUDA-hot overlap is preserved; this is only the
+    // dependency barrier immediately before the merge.
+    ggml_backend_synchronize(backend);
     sched->needs_sync[split->backend_id] = false;
     return true;
 }
@@ -2668,7 +2675,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         bool start_hybrid = false;
-        if (!hybrid_pending && hybrid_cold && ggml_backend_sched_hybrid_async_enabled() &&
+        if (!hybrid_pending && hybrid_cold &&
+                !ggml_backend_sched_split_has_name(split, "hybrid_kv_hot_stats") &&
+                ggml_backend_sched_hybrid_async_enabled() &&
                 ggml_backend_sched_hybrid_cold_tokens(split) >= ggml_backend_sched_hybrid_async_min_cold()) {
             // Only detach a cold split when a matching GPU merge boundary occurs
             // before any other CPU work.  Otherwise use the ordinary serial path.

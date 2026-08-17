@@ -381,9 +381,18 @@ static __global__ void flash_attn_vec_ext_f32(
 template <int Dk, int Dv, int cols_per_block, ggml_type type_K, ggml_type type_V, bool use_logit_softcap>
 void ggml_cuda_flash_attn_ext_vec_f32_case_impl(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     constexpr int nwarps = Dk/WARP_SIZE;
-    fattn_kernel_t fattn_kernel = flash_attn_vec_ext_f32<Dk, Dv, cols_per_block, type_K, type_V, use_logit_softcap>;
-    constexpr bool need_f16_K = (Dk != 128 && Dk != 256) && type_K == GGML_TYPE_F16;
-    constexpr bool need_f16_V = (Dv != 64 && Dv != 128 && Dv != 256) && type_V == GGML_TYPE_F16;
+    // The vector kernel has no native BF16 dot/dequant primitives. Convert a
+    // BF16 hot cache to FP16 in the CUDA pool and reuse the FP16 specialization;
+    // this keeps the canonical CPU cache in BF16 without sending the hot ring
+    // back over PCIe.
+    constexpr ggml_type kernel_type_K = type_K == GGML_TYPE_BF16 ? GGML_TYPE_F16 : type_K;
+    constexpr ggml_type kernel_type_V = type_V == GGML_TYPE_BF16 ? GGML_TYPE_F16 : type_V;
+    fattn_kernel_t fattn_kernel = flash_attn_vec_ext_f32<
+            Dk, Dv, cols_per_block, kernel_type_K, kernel_type_V, use_logit_softcap>;
+    constexpr bool need_f16_K = type_K == GGML_TYPE_BF16 ||
+            ((Dk != 128 && Dk != 256) && type_K == GGML_TYPE_F16);
+    constexpr bool need_f16_V = type_V == GGML_TYPE_BF16 ||
+            ((Dv != 64 && Dv != 128 && Dv != 256) && type_V == GGML_TYPE_F16);
     constexpr size_t nbytes_shared = 0;
     // MLA (Dv=512): the KV cache is padded to FATTN_KQ_STRIDE (256), not to Dv, so use 256 as the KQ-row
     // granularity. Passing Dv=512 asserts n_kv % 512 == 0, which fails for odd multiples of 256.

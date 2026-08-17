@@ -115,7 +115,7 @@ struct server_slot {
 
     server_prompt server_cached_prompt;
 
-    void prompt_save(server_prompt_cache& prompt_cache) const;
+    void prompt_save(server_prompt_cache& prompt_cache);
 
     void prompt_load(server_prompt_cache& prompt_cache, const server_tokens& tokens, float min_reusable_fraction);
 
@@ -391,7 +391,7 @@ struct server_context {
     // Re-aggregates all active vectors and updates the model state
     bool apply_control_vectors_internal();
 
-    bool create_checkpoint(server_slot & slot);
+    bool create_checkpoint(server_slot & slot, int64_t n_tokens_override = -1);
 
     void apply_checkpoint(server_slot & slot);
 

@@ -1344,7 +1344,7 @@ llama_tokens::const_iterator server_tokens::cend() {
     return tokens.cend();
 }
 
-llama_tokens server_tokens::tokens_data() {
+llama_tokens server_tokens::tokens_data() const {
     return tokens;
 }
 

@@ -361,6 +361,12 @@ struct server_prompt_checkpoint {
 
     std::vector<uint8_t> data;
 
+    // Optional full sequence snapshot captured at the checkpoint position.
+    // Hybrid recurrent prompt caching uses this instead of reconstructing a
+    // past state from a later snapshot plus partial recurrent data.
+    std::string state_file;
+    size_t state_file_size = 0;
+
     size_t size() const {
         return data.size();
     }
@@ -393,9 +399,29 @@ struct server_prompt {
 
     std::vector<uint8_t> data;
 
+    // Exactly one of data or state_file is populated. Disk-backed entries keep
+    // only token/similarity metadata in memory; recurrent checkpoints spill to
+    // their own sidecar as well.
+    std::string state_file;
+    size_t state_file_size = 0;
+    std::string checkpoint_file;
+    size_t checkpoint_file_size = 0;
+
+    // Number of cached tokens and prompt position represented by the serialized
+    // state. Hybrid recurrent models may deliberately save a self-consistent
+    // prompt-tail state while retaining the longer token list for matching.
+    int64_t state_n_tokens = -1;
+    llama_pos state_pos_max_prompt = -1;
+
     std::list<server_prompt_checkpoint> checkpoints;
 
     size_t size() const;
+
+    size_t ram_size() const;
+
+    size_t disk_size() const {
+        return state_file_size + checkpoint_file_size;
+    }
 
     int n_tokens() const {
         return tokens.size();
@@ -408,6 +434,12 @@ struct server_prompt {
             n_discarded_prompt,
             think_tokens,
             data,
+            state_file,
+            state_file_size,
+            checkpoint_file,
+            checkpoint_file_size,
+            state_n_tokens,
+            state_pos_max_prompt,
             checkpoints
         };
     }
@@ -429,27 +461,64 @@ struct server_prompt {
 };
 
 struct server_prompt_cache {
-    server_prompt_cache(llama_context* ctx, int32_t limit_size_mib, size_t limit_tokens) {
-        this->ctx = ctx;
-        this->limit_size = 1024ull * 1024ull * (limit_size_mib < 0 ? 0 : limit_size_mib);
-        this->limit_tokens = limit_tokens;
-    }
+    server_prompt_cache(
+            llama_context * ctx,
+                   int32_t   limit_ram_mib,
+                   int32_t   limit_disk_mib,
+                    size_t   limit_tokens,
+               std::string   disk_root = {},
+                    bool     rewind_to_checkpoint_on_save = false);
+
+    ~server_prompt_cache();
 
     std::list<server_prompt> states;
 
-    // in bytes, 0 = no limit
-    size_t limit_size = 0;
+    bool ram_enabled = false;
+
+    // In bytes, 0 means no limit for an enabled tier.
+    size_t limit_ram_size = 0;
+    size_t limit_disk_size = 0;
 
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
     llama_context* ctx;
+
+    // Empty when no disk spill tier is configured. Otherwise this is a private
+    // per-process directory below the user-selected cache root.
+    std::string disk_directory;
+    uint64_t disk_file_id = 0;
+    bool rewind_to_checkpoint_on_save = false;
+
+    bool has_disk_tier() const {
+        return !disk_directory.empty();
+    }
+
     size_t size() const;
+
+    size_t ram_size() const;
+
+    size_t disk_size() const;
 
     size_t n_tokens() const;
 
-    server_prompt* alloc(const server_prompt& prompt, size_t state_size);
+    server_prompt* alloc(server_prompt & prompt, size_t state_size);
+
+    bool save(server_prompt & prompt, int32_t id_slot);
+
+    bool stage_checkpoint(server_prompt_checkpoint & checkpoint,
+            const server_tokens & tokens, int32_t id_slot);
+
+    bool spill_to_disk(server_prompt & prompt);
+
+    bool save_to_disk(server_prompt & prompt, int32_t id_slot);
+
+    void make_ram_room(size_t incoming_size);
+
+    bool make_disk_room(size_t incoming_size);
 
     bool load(server_prompt& prompt, const server_tokens& tokens_new, llama_context* ctx, int32_t id_slot, float min_reusable_fraction);
 
     void update();
+
+    void clear();
 };

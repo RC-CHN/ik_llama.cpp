@@ -559,6 +559,8 @@ struct gpt_params {
     int32_t ctx_checkpoints_tolerance = 5;    // the number of tokens before the full prompt to create the checkpoint
     common_checkpoint_eviction ctx_checkpoint_eviction = COMMON_CHECKPOINT_EVICTION_VARIANCE;
     int32_t cache_ram_mib = 8192;   // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
+    int32_t cache_disk_mib = 0;      // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
+    std::string cache_disk_path;     // empty = a private directory below the system temporary directory
     int32_t cache_ram_n_min = 0;     // min number of tokens required to save in the ram
     float cache_ram_similarity = 0.5f; // similarity of tokens to cached tokens
 

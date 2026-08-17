@@ -14,6 +14,7 @@
 #include "mtmd-helper.h"
 
 #include <fstream>
+#include <filesystem>
 #include <iostream>
 #include <regex>
 #include <exception>
@@ -32,6 +33,28 @@ static void server_prompt_checkpoint_update(server_prompt_checkpoint & ckpt, lla
     if (n != checkpoint_size) {
         GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", checkpoint_size, n);
     }
+}
+
+static void server_prompt_checkpoint_remove_state_file(server_prompt_checkpoint & checkpoint) {
+    if (checkpoint.state_file.empty()) {
+        return;
+    }
+    std::error_code ec;
+    std::filesystem::remove(checkpoint.state_file, ec);
+    if (ec) {
+        LLAMA_LOG_WARN("failed to remove staged prompt checkpoint '%s': %s\n",
+                checkpoint.state_file.c_str(), ec.message().c_str());
+    }
+    checkpoint.state_file.clear();
+    checkpoint.state_file_size = 0;
+}
+
+static void server_prompt_checkpoints_clear_state_files(
+        std::list<server_prompt_checkpoint> & checkpoints) {
+    for (auto & checkpoint : checkpoints) {
+        server_prompt_checkpoint_remove_state_file(checkpoint);
+    }
+    checkpoints.clear();
 }
 
 static void log_text(const gpt_params & params_base, const std::string & text) {
@@ -203,6 +226,21 @@ server_context::~server_context() {
 
 bool server_context::load_model(const gpt_params& params_) {
     params_base = params_;
+
+    // Hybrid prompt states are first streamed at a self-consistent prompt-tail
+    // checkpoint, then promoted into RAM if the configured RAM tier has room.
+    // Capturing that checkpoint directly in RAM would transiently duplicate the
+    // full canonical KV cache, which is unsafe on HBM-only systems.
+    if (params_base.hybrid_kv && params_base.cache_disk_mib == 0 &&
+            params_base.cache_ram_mib != 0) {
+        LOG_WARNING("hybrid prompt caching is disabled: --cache-disk N is required as the safe staging tier\n", {});
+        params_base.cache_ram_mib = 0;
+    }
+    if (params_base.cache_disk_mib != 0 && params_base.hybrid_kv && params_base.hybrid_kv_hot > 0 &&
+            (params_base.cache_type_k != "bf16" || params_base.cache_type_v != "bf16")) {
+        LOG_ERROR("disk prompt caching with a hybrid GPU hot ring requires -ctk bf16 -ctv bf16 so restored tokens remain bit-exact\n", {});
+        return false;
+    }
 
     llama_init_result llama_init = llama_init_from_gpt_params(params_base);
 
@@ -403,26 +441,62 @@ void server_context::init() {
 
     bool reuse_forced_off = false;
     if (llama_model_is_openpangu(model) && params_base.has_mtp &&
-        (params_base.ctx_checkpoints_n > 0 || params_base.cache_ram_mib != 0)) {
+        (params_base.ctx_checkpoints_n > 0 || params_base.cache_ram_mib != 0 || params_base.cache_disk_mib != 0)) {
         LLAMA_LOG_WARN("context checkpoints and prompt cache are disabled for openPangu while MTP is enabled: the MTP companion keeps its own conv slot, which no saved target state carries\n");
         params_base.ctx_checkpoints_n = 0;
         params_base.cache_ram_mib    = 0;
+        params_base.cache_disk_mib   = 0;
         reuse_forced_off = true;
     }
 
-    if (params_base.cache_ram_mib != 0 && llama_model_supports_partial_kv_reuse(model)) {
-        if (params_base.cache_ram_mib < 0) {
-            LLAMA_LOG_INFO("prompt cache is enabled, size limit: %s\n", "no limit");
+    if (params_base.hybrid_kv) {
+        const bool prompt_cache_enabled =
+            params_base.cache_ram_mib != 0 || params_base.cache_disk_mib != 0;
+        if (prompt_cache_enabled) {
+            if (params_base.ctx_checkpoints_n != 2) {
+                LLAMA_LOG_WARN("using exactly two hybrid-KV context checkpoints per slot: "
+                        "one staged prompt-tail state and one final state\n");
+                params_base.ctx_checkpoints_n = 2;
+            }
+            if (params_base.ctx_checkpoints_tolerance <= 0) {
+                LLAMA_LOG_WARN("setting hybrid-KV prompt checkpoint tolerance to 5 tokens so "
+                        "the disk-staged state precedes prompt completion\n");
+                params_base.ctx_checkpoints_tolerance = 5;
+            }
+            if (params_base.ctx_checkpoints_interval > 0) {
+                LLAMA_LOG_WARN("disabling periodic hybrid-KV checkpoints for prompt caching; "
+                        "the prompt-tail and final checkpoints remain enabled\n");
+                params_base.ctx_checkpoints_interval = 0;
+            }
+        } else if (params_base.ctx_checkpoints_n > 2) {
+            LLAMA_LOG_WARN("limiting --hybrid-kv to two context checkpoints per slot to protect HBM capacity\n");
+            params_base.ctx_checkpoints_n = 2;
         }
-        else {
-            LLAMA_LOG_INFO("prompt cache is enabled, size limit: %d MiB\n", params_base.cache_ram_mib);
+    }
+
+    if ((params_base.cache_ram_mib != 0 || params_base.cache_disk_mib != 0) &&
+            llama_model_supports_partial_kv_reuse(model)) {
+        std::string disk_root;
+        if (params_base.cache_disk_mib != 0) {
+            disk_root = params_base.cache_disk_path;
+            if (disk_root.empty()) {
+                disk_root = (std::filesystem::temp_directory_path() / "ik_llama_prompt_cache").string();
+            }
         }
-        LLAMA_LOG_INFO("%s", "use `--cache-ram 0` to disable the prompt cache\n");
-        // only apply ram size limit. No token limit for now.
-        prompt_cache = std::make_unique<server_prompt_cache>(ctx, params_base.cache_ram_mib, 0);
+        const std::string ram_limit = params_base.cache_ram_mib < 0
+            ? "no limit" : std::to_string(params_base.cache_ram_mib) + " MiB";
+        const std::string disk_limit = params_base.cache_disk_mib < 0
+            ? "no limit" : std::to_string(params_base.cache_disk_mib) + " MiB";
+        LLAMA_LOG_INFO("tiered prompt cache is enabled: RAM %s, disk %s%s%s\n",
+                params_base.cache_ram_mib == 0 ? "disabled" : ram_limit.c_str(),
+                params_base.cache_disk_mib == 0 ? "disabled" : disk_limit.c_str(),
+                disk_root.empty() ? "" : ", root: ", disk_root.c_str());
+        prompt_cache = std::make_unique<server_prompt_cache>(ctx,
+                params_base.cache_ram_mib, params_base.cache_disk_mib, 0, disk_root,
+                params_base.hybrid_kv);
     }
     else {
-        if (params_base.cache_ram_mib != 0) {
+        if (params_base.cache_ram_mib != 0 || params_base.cache_disk_mib != 0) {
             LLAMA_LOG_WARN("prompt cache is disabled because this model has private state outside the generic KV cache\n");
         } else if (!reuse_forced_off) {
             LLAMA_LOG_INFO("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
@@ -472,20 +546,11 @@ void server_context::init() {
 }
 
 
-void server_slot::prompt_save(server_prompt_cache& prompt_cache) const {
+void server_slot::prompt_save(server_prompt_cache& prompt_cache) {
     assert(server_cached_prompt.data.size() == 0);
-
-    const size_t cur_size = llama_state_seq_get_size(ctx, id, 0);
-
-    LLAMA_LOG_INFO(" - saving prompt with length %d, total state size = %.3f MiB\n",
-        (int)server_cached_prompt.tokens.size(), cur_size / (1024.0 * 1024.0));
-
-    auto* cur = prompt_cache.alloc(server_cached_prompt, cur_size);
-    if (cur == nullptr) {
-        return;
-    }
-
-    llama_state_seq_get_data(ctx, cur->data.data(), cur_size, id, 0);
+    LLAMA_LOG_INFO(" - saving prompt with length %d to tiered cache\n",
+            (int) server_cached_prompt.tokens.size());
+    prompt_cache.save(server_cached_prompt, id);
 }
 
 void server_slot::prompt_load(server_prompt_cache& prompt_cache, const server_tokens& tokens, float min_reusable_fraction) {
@@ -965,6 +1030,8 @@ void server_context::copy_data_to_cached_prompt(const server_tokens & tokens, se
     slot.server_cached_prompt.n_discarded_prompt = slot.n_discarded_prompt;
     slot.server_cached_prompt.n_kept_prompt = slot.n_kept_prompt;
     slot.server_cached_prompt.think_tokens = slot.params.think_tokens;
+    slot.server_cached_prompt.state_n_tokens = -1;
+    slot.server_cached_prompt.state_pos_max_prompt = -1;
 }
 
 server_slot* server_context::get_available_slot(const server_task& task) {
@@ -2128,7 +2195,7 @@ bool server_context::system_prompt_set(const std::string& sys_prompt) {
         slot.n_discarded_prompt = 0;
         slot.n_kept_prompt = 0;
         slot.n_prompt_tokens_cache = 0;
-        slot.server_cached_prompt.checkpoints.clear();
+        server_prompt_checkpoints_clear_state_files(slot.server_cached_prompt.checkpoints);
         slot.checkpoint_pos = -1;
         slot.do_checkpoint = false;
         if (slot.ctx_sampling != nullptr) {
@@ -2136,7 +2203,7 @@ bool server_context::system_prompt_set(const std::string& sys_prompt) {
         }
     }
     if (prompt_cache) {
-        prompt_cache->states.clear();
+        prompt_cache->clear();
     }
 
     system_need_update = true;
@@ -2729,7 +2796,7 @@ static size_t load_checkpoints_from_file(const std::string & filename, std::list
     if (!file.is_open()) {
         return 0;
     }
-    checkpoints.clear();
+    server_prompt_checkpoints_clear_state_files(checkpoints);
     // version checks
     {
         uint32_t magic;
@@ -3067,7 +3134,7 @@ void server_context::process_single_task(server_task&& task) {
         llama_kv_cache_seq_rm(ctx, slot->id, -1, -1);
         slot->cache_tokens.keep_first(0);
         //slot->cache_tokens.clear();
-        slot->server_cached_prompt.checkpoints.clear();
+        server_prompt_checkpoints_clear_state_files(slot->server_cached_prompt.checkpoints);
         slot->server_cached_prompt.data.clear();
         server_task_result result;
         result.id = task.id;
@@ -3853,7 +3920,7 @@ void server_context::apply_checkpoint(server_slot & slot) {
             if (do_reset) {
                 if (is_openpangu) {
                     common_speculative_clear_sequence_kv(slot.spec, ctx, slot.id);
-                    slot.server_cached_prompt.checkpoints.clear();
+                    server_prompt_checkpoints_clear_state_files(slot.server_cached_prompt.checkpoints);
                     slot.checkpoint_pos = -1;
                 }
                 if (is_dsv4 || is_openpangu) {
@@ -3879,6 +3946,7 @@ void server_context::apply_checkpoint(server_slot & slot) {
             const auto & cur = *it;
             if (cur.pos_max > pos_min_thold) {
                 SLT_WRN(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, (float)cur.data.size() / 1024 / 1024);
+                server_prompt_checkpoint_remove_state_file(*it);
                 it = slot.server_cached_prompt.checkpoints.erase(it);
             } else {
                 ++it;
@@ -3932,17 +4000,20 @@ static std::list<server_prompt_checkpoint>::iterator evict_checkpoint_by_varianc
     return it;
 }
 
-bool server_context::create_checkpoint(server_slot & slot) {
+bool server_context::create_checkpoint(server_slot & slot, int64_t n_tokens_override) {
+    const int64_t checkpoint_n_tokens = n_tokens_override >= 0
+        ? n_tokens_override : slot.cache_tokens.n_tokens();
     bool do_checkpoint = !slot.image_just_processed;
     int32_t pos_min = llama_kv_cache_seq_pos_min(slot.ctx, slot.id);
     const auto pos_max = llama_kv_cache_seq_pos_max(slot.ctx, slot.id);
     const auto checkpoint_pos_min = llama_model_is_openpangu(model) ? pos_max : pos_min;
 
     // no need for empty or small checkpoints
-    do_checkpoint = do_checkpoint && (pos_min >= 0 && slot.cache_tokens.n_tokens() >= 64);
+    do_checkpoint = do_checkpoint && (pos_min >= 0 && checkpoint_n_tokens >= 64);
 
     // no need to create checkpoints that are too close together
-    do_checkpoint = do_checkpoint && (slot.server_cached_prompt.checkpoints.empty() || slot.cache_tokens.n_tokens() > slot.server_cached_prompt.checkpoints.back().n_tokens);
+    do_checkpoint = do_checkpoint && (slot.server_cached_prompt.checkpoints.empty() ||
+            checkpoint_n_tokens > slot.server_cached_prompt.checkpoints.back().n_tokens);
 
     if (do_checkpoint) {
         const int64_t t_start = ggml_time_us();
@@ -3956,11 +4027,18 @@ bool server_context::create_checkpoint(server_slot & slot) {
             const auto & cur = *it;
             SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                 cur.pos_min, cur.pos_max, cur.n_tokens, (float)cur.data.size() / 1024 / 1024);
+            server_prompt_checkpoint_remove_state_file(*it);
             slot.server_cached_prompt.checkpoints.erase(it);
         }
 
         auto & cur = slot.server_cached_prompt.checkpoints.emplace_back();
-        server_prompt_checkpoint_update(cur, ctx, slot.id, slot.cache_tokens.n_tokens(), checkpoint_pos_min, pos_max, slot.n_past_offset);
+        server_prompt_checkpoint_update(cur, ctx, slot.id, checkpoint_n_tokens,
+                checkpoint_pos_min, pos_max, slot.n_past_offset);
+
+        if (params_base.hybrid_kv && prompt_cache &&
+                checkpoint_n_tokens < slot.n_prompt_tokens) {
+            prompt_cache->stage_checkpoint(cur, slot.cache_tokens, slot.id);
+        }
 
         SLT_WRN(slot, "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB, took %.2f ms)\n",
             (int)slot.server_cached_prompt.checkpoints.size(), params_base.ctx_checkpoints_n, cur.pos_min, cur.pos_max, cur.n_tokens, (float)cur.data.size() / 1024 / 1024,
@@ -4111,6 +4189,15 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
 
                             // reuse any previously computed tokens that are common with the new prompt
                             common_prefix prefix = slot.cache_tokens.get_common_prefix(ctx, prompt_tokens);
+                            if (slot.server_cached_prompt.state_n_tokens >= 0 &&
+                                    prefix.first > (size_t) slot.server_cached_prompt.state_n_tokens) {
+                                prefix.first = (size_t) slot.server_cached_prompt.state_n_tokens;
+                                if (slot.server_cached_prompt.state_pos_max_prompt >= 0) {
+                                    prefix.second = std::min(prefix.second,
+                                            prompt_tokens.size_up_to_pos(
+                                                slot.server_cached_prompt.state_pos_max_prompt + 1));
+                                }
+                            }
                             LLAMA_LOG_INFO("======== Cache: cache_size = %d, n_past =  %d, n_past_prompt = %d\n", (int32_t)slot.cache_tokens.size(),  (int32_t)prefix.first, (int32_t)prefix.second);
                             int32_t size_threshold = 20;
                             slot.n_past = prefix.first;
@@ -4167,7 +4254,16 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                             slot.n_past_se--;
                         }
                     }
-                    apply_checkpoint(slot);
+                    if (slot.server_cached_prompt.state_n_tokens != slot.n_past) {
+                        apply_checkpoint(slot);
+                    } else {
+                        LLAMA_LOG_INFO("using self-consistent cached state at token %d; "
+                                "no partial checkpoint restore is needed\n", slot.n_past);
+                        if (params_base.do_checkpoint &&
+                                slot.server_cached_prompt.checkpoints.empty()) {
+                            create_checkpoint(slot, slot.n_past);
+                        }
+                    }
                     slot.n_prompt_tokens_cache = slot.n_past_prompt;
                     slot.n_prompt_tokens_processed = 0;
                 }
@@ -4218,7 +4314,7 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                     slot.n_past_se = 0;
                     slot.n_prompt_tokens_cache = 0;
                     slot.ga_i = 0;
-                    slot.server_cached_prompt.checkpoints.clear();
+                    server_prompt_checkpoints_clear_state_files(slot.server_cached_prompt.checkpoints);
                     // TODO: is the system prompt ever in the sampling context?
                     common_sampler_reset(slot.ctx_sampling);
                 }

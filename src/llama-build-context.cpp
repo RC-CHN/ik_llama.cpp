@@ -2178,6 +2178,22 @@ static ggml_tensor * llm_build_kqv(
                     (size_t) logical_offset*kq_mask->nb[0]);
         };
 
+        auto add_hot_cache_dependencies = [&](ggml_tensor * op) {
+            // Cache writes mutate persistent tensors and are otherwise
+            // invisible as data dependencies of the attention read.
+            auto dep = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+            dep->op = GGML_OP_NONE;
+            const size_t copy_idx = 4*(size_t) il;
+            int src = 0;
+            for (int i = 0; i < 4; ++i) {
+                if (auto * cpy = lctx.hybrid_cache_copies[copy_idx + i].cpy) {
+                    dep->src[src++] = cpy;
+                }
+            }
+            GGML_ASSERT(src < GGML_MAX_SRC);
+            op->src[5] = dep;
+        };
+
         auto make_stats = [&](ggml_tensor * kc, ggml_tensor * vc, int32_t physical_offset,
                               int32_t logical_offset, int32_t count, bool cold) {
             GGML_ASSERT(count > 0 && count % llama_kv_cache::get_padding(true) == 0);
@@ -2196,18 +2212,7 @@ static ggml_tensor * llm_build_kqv(
                         stats, kv.hybrid_numa_shards, kv.hybrid_numa_cold_capacity, true);
             }
             if (!cold) {
-                // Cache writes mutate persistent tensors and are otherwise invisible
-                // as data dependencies of the attention read.
-                auto dep = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
-                dep->op = GGML_OP_NONE;
-                const size_t copy_idx = 4*(size_t) il;
-                int src = 0;
-                for (int i = 0; i < 4; ++i) {
-                    if (auto * cpy = lctx.hybrid_cache_copies[copy_idx + i].cpy) {
-                        dep->src[src++] = cpy;
-                    }
-                }
-                stats->src[5] = dep;
+                add_hot_cache_dependencies(stats);
             }
             cb(stats, cold ? "hybrid_kv_cold_stats" : "hybrid_kv_hot_stats", il);
             return stats;
@@ -2232,6 +2237,7 @@ static ggml_tensor * llm_build_kqv(
             cur = ggml_flash_attn_ext(ctx, q, kp, vp, mp, kq_scale,
                     hparams.f_max_alibi_bias,
                     hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+            add_hot_cache_dependencies(cur);
             cb(cur, "hybrid_kv_hot_fa", il);
         } else {
             auto cold_raw = make_stats(k_cache, v_cache, 0, 0, cold_n, true);

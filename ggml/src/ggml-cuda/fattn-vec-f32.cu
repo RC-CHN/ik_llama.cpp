@@ -69,6 +69,7 @@ void ggml_cuda_flash_attn_ext_vec_f32(ggml_backend_cuda_context & ctx, ggml_tens
     FATTN_VEC_F32_CASE(128, GGML_TYPE_F16,  GGML_TYPE_F16)
 
     FATTN_VEC_F32_CASE(256, GGML_TYPE_F16, GGML_TYPE_F16)
+    FATTN_VEC_F32_CASE(256, GGML_TYPE_BF16,GGML_TYPE_BF16)
     FATTN_VEC_F32_CASE(256, GGML_TYPE_Q8_0,GGML_TYPE_Q8_0)
 
     FATTN_VEC_F32_CASE(128, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_NL)
@@ -90,6 +91,7 @@ void ggml_cuda_flash_attn_ext_vec_f32(ggml_backend_cuda_context & ctx, ggml_tens
     FATTN_VEC_F32_CASE( 64, GGML_TYPE_F16, GGML_TYPE_F16)
     FATTN_VEC_F32_CASE(128, GGML_TYPE_F16, GGML_TYPE_F16)
     FATTN_VEC_F32_CASE(256, GGML_TYPE_F16, GGML_TYPE_F16)
+    FATTN_VEC_F32_CASE(256, GGML_TYPE_BF16,GGML_TYPE_BF16)
     FATTN_VEC_F32_CASE(256, GGML_TYPE_Q8_0,GGML_TYPE_Q8_0)
 
     FATTN_VEC_F32_CASE(128, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_NL)
@@ -132,7 +134,8 @@ bool ggml_cuda_fattn_vec_f32_is_supported([[maybe_unused]] ggml_backend_cuda_con
                V->type == GGML_TYPE_Q5_0 || V->type == GGML_TYPE_Q5_1 || V->type == GGML_TYPE_Q8_0);
     }
     if (K->ne[0] == 256) {
-        return K->type == V->type && (K->type == GGML_TYPE_F16 || K->type == GGML_TYPE_Q8_0);
+        return K->type == V->type &&
+            (K->type == GGML_TYPE_F16 || K->type == GGML_TYPE_BF16 || K->type == GGML_TYPE_Q8_0);
     }
     if (K->ne[0] != 128 || V->ne[0] != 128) return false;
     if ((K->type == GGML_TYPE_Q4_0 || K->type == GGML_TYPE_Q4_1 || K->type == GGML_TYPE_Q5_0 || K->type == GGML_TYPE_Q5_1 ||
@@ -159,7 +162,7 @@ bool ggml_cuda_fattn_vec_f32_is_supported([[maybe_unused]] ggml_backend_cuda_con
         return K->type == GGML_TYPE_F16;
     }
     if (K->ne[0] == 256) {
-        return K->type == GGML_TYPE_F16 || K->type == GGML_TYPE_Q8_0;
+        return K->type == GGML_TYPE_F16 || K->type == GGML_TYPE_BF16 || K->type == GGML_TYPE_Q8_0;
     }
     return false;
 #endif

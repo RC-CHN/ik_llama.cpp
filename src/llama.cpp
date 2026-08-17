@@ -29,6 +29,7 @@
 #include "ggml-backend.h"
 
 #include <cmath>
+#include <cstring>
 
 void llama_set_mtp_target_context(struct llama_context * ctx, struct llama_context * target_ctx);
 void llama_set_mtp_step_idx(struct llama_context * ctx, int32_t mtp_step_idx);
@@ -11587,6 +11588,83 @@ struct llama_data_read {
             }
             throw std::runtime_error("failed to restore kv cache");
         }
+
+        // k_l/v_l are the canonical CPU/HBM copy for hybrid KV. The GPU hot
+        // ring is deliberately omitted from state blobs, so rebuild the
+        // physical hot window synchronously before this state can be consumed.
+        // Keep the high-water boundary monotonic when restoring one sequence
+        // beside other live sequences; a whole-context restore starts from a
+        // cleared cache and naturally establishes a fresh boundary.
+        if (kv_self.hybrid_hot_size > 0 &&
+                (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+            if (kv_self.used > 0) {
+                const uint32_t pad = llama_kv_cache::get_padding(ctx->cparams.flash_attn);
+                const uint32_t live_end = llama_kv_cache_cell_max(kv_self);
+                const uint32_t next_n = std::min(kv_self.size, std::max(pad, GGML_PAD(live_end, pad)));
+                kv_self.n = std::max(kv_self.n, next_n);
+
+                const uint32_t rebuild_n = std::min(kv_self.n, kv_self.hybrid_hot_size);
+                const uint32_t rebuild_src = kv_self.n - rebuild_n;
+                const uint32_t rebuild_dst = rebuild_src % kv_self.hybrid_hot_size;
+                const uint32_t rebuild_first = std::min(rebuild_n,
+                        kv_self.hybrid_hot_size - rebuild_dst);
+                const uint32_t rebuild_second = rebuild_n - rebuild_first;
+                size_t rebuilt_bytes = 0;
+                const int64_t t_start = ggml_time_us();
+
+                auto rebuild_tensor = [&](ggml_tensor * src, ggml_tensor * dst,
+                                          uint32_t rows) -> bool {
+                    if (src == nullptr || dst == nullptr || rows == 0 ||
+                            src->type != dst->type ||
+                            !ggml_backend_buffer_is_host(src->buffer) ||
+                            ggml_nbytes(src) % rows != 0 ||
+                            ggml_nbytes(dst) % kv_self.hybrid_hot_size != 0) {
+                        return false;
+                    }
+                    const size_t src_token_bytes = ggml_nbytes(src)/rows;
+                    const size_t dst_token_bytes = ggml_nbytes(dst)/kv_self.hybrid_hot_size;
+                    if (src_token_bytes != dst_token_bytes ||
+                            live_end > kv_self.n || kv_self.n > rows) {
+                        return false;
+                    }
+                    if (live_end < kv_self.n) {
+                        std::memset((char *) src->data + (size_t) live_end*src_token_bytes,
+                                0, (size_t) (kv_self.n - live_end)*src_token_bytes);
+                    }
+                    auto copy_part = [&](uint32_t count, uint32_t src_token, uint32_t dst_token) {
+                        if (count == 0) {
+                            return;
+                        }
+                        const size_t bytes = (size_t) count*src_token_bytes;
+                        ggml_backend_tensor_set(dst,
+                                (const char *) src->data + (size_t) src_token*src_token_bytes,
+                                (size_t) dst_token*dst_token_bytes, bytes);
+                        rebuilt_bytes += bytes;
+                    };
+                    copy_part(rebuild_first,  rebuild_src,                 rebuild_dst);
+                    copy_part(rebuild_second, rebuild_src + rebuild_first, 0);
+                    return true;
+                };
+
+                for (size_t il = 0; il < kv_self.k_hot_l.size(); ++il) {
+                    if (kv_self.k_hot_l[il] == nullptr) {
+                        continue;
+                    }
+                    if (il >= kv_self.k_l.size() || il >= kv_self.v_l.size() ||
+                            il >= kv_self.v_hot_l.size() ||
+                            !rebuild_tensor(kv_self.k_l[il], kv_self.k_hot_l[il], kv_self.rows(il)) ||
+                            !rebuild_tensor(kv_self.v_l[il], kv_self.v_hot_l[il], kv_self.rows(il))) {
+                        throw std::runtime_error("failed to synchronously rebuild hybrid GPU hot ring");
+                    }
+                }
+                LLAMA_LOG_INFO("%s: synchronously rebuilt %u hybrid GPU hot-ring rows "
+                        "(%.3f MiB, %.2f ms)\n", __func__, rebuild_n,
+                        rebuilt_bytes/1024.0/1024.0, (ggml_time_us() - t_start)/1000.0);
+            } else {
+                kv_self.n = 0;
+            }
+            ctx->reset_scheduler();
+        }
     }
 };
 
@@ -11807,9 +11885,15 @@ struct llama_data_write_file : llama_data_write {
             }
             return;
         }
-        auto kv = get_kv_cache_split_tensor(tensor, model.layers[il]);
         temp_buffer.resize(size);
-        llama_data_write_buffer::get_tensor_data_split(temp_buffer.data(), tensor, kv, aux_buffer, offset, size);
+        if (model.hparams.recurrent_layer_arr[il]) {
+            llama_data_write_buffer::get_tensor_data_split(
+                    temp_buffer.data(), tensor, aux_buffer, offset, size);
+        } else {
+            auto kv = get_kv_cache_split_tensor(tensor, model.layers[il]);
+            llama_data_write_buffer::get_tensor_data_split(
+                    temp_buffer.data(), tensor, kv, aux_buffer, offset, size);
+        }
     }
 
     size_t get_size_written() override {
@@ -11847,9 +11931,26 @@ static bool llama_state_io_supported(
                         const char * func,
              llama_state_seq_flags flags = 0,
                       llama_seq_id seq_id = -1) {
-    if (ctx->kv_self.hybrid_hot_size > 0) {
-        LLAMA_LOG_ERROR("%s: state save/restore is not supported with --hybrid-kv\n", func);
-        return false;
+    if (ctx->kv_self.hybrid_hot_size > 0 &&
+            (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+        // The hot ring is reconstructed from the canonical HBM tensors after
+        // restore. If their element types differ, this introduces a second
+        // rounding step (for example F32 -> BF16 -> F16 instead of the
+        // original F32 -> F16) and can change sampling. Require an exact
+        // representation match until state blobs carry an explicit hot-ring
+        // payload.
+        for (size_t il = 0; il < ctx->kv_self.k_hot_l.size(); ++il) {
+            const ggml_tensor * k_hot = ctx->kv_self.k_hot_l[il];
+            const ggml_tensor * k_hbm = il < ctx->kv_self.k_l.size() ? ctx->kv_self.k_l[il] : nullptr;
+            const ggml_tensor * v_hot = il < ctx->kv_self.v_hot_l.size() ? ctx->kv_self.v_hot_l[il] : nullptr;
+            const ggml_tensor * v_hbm = il < ctx->kv_self.v_l.size() ? ctx->kv_self.v_l[il] : nullptr;
+            if ((k_hot != nullptr && (k_hbm == nullptr || k_hot->type != k_hbm->type)) ||
+                    (v_hot != nullptr && (v_hbm == nullptr || v_hot->type != v_hbm->type))) {
+                LLAMA_LOG_ERROR("%s: exact hybrid state save/restore requires matching HBM/hot cache types; "
+                        "use -ctk bf16 -ctv bf16\n", func);
+                return false;
+            }
+        }
     }
     if (ctx->model.arch == LLM_ARCH_OPENPANGU) {
         if (seq_id >= 0 &&

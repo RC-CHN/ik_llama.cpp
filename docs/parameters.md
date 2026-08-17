@@ -144,15 +144,17 @@ Notes:
 - Supported self-spec stage names are `ngram-cache`, `ngram-simple`, `ngram-map-k`, `ngram-map-k4v`, `ngram-mod`, and `suffix`.
 - Composite stage chains disable speculative autotune.
 
-## Cache Prompt to Host Memory
+## Cache Prompt to Host Memory or Disk
 
-When user starts a new conversation, the old conversation's kv cache will be saved in ram and can be retrieved later. This greatly reduces prompt processing time when switching between conversations and can have as many conversation as your ram is allowed.
+When a conversation is displaced from an active slot, its state can be retained and retrieved later instead of processing the prompt again. The newest entries stay in RAM up to the configured limit; when disk spill is enabled, older entries move to disk instead of being dropped.
 
-Note: When the available memory is very limited, turn this option off (`-cram 0`) to avoid memory swaping.
+Note: Set a conservative RAM limit on memory-constrained systems. Disk spill avoids swap and keeps inactive states out of the per-token inference path.
 
 | Parameter | Description | Default | Notes/Examples |
 | - | - | - | - |
 | `-cram, --cache-ram N` | Set the maximum cache size in MiB | 8192 | -1 = no limit, 0 = disable Very useful when the variations of the same prompt are re-sent to the model (coding agents, etc.). [PR 954](https://github.com/ikawrakow/ik_llama.cpp/pull/954) |
+| `--cache-disk N` | Set the maximum disk spill size in MiB | 0 | -1 = no limit, 0 = disable. The newest displaced sessions stay in the RAM tier up to `--cache-ram`; older entries spill to disk instead of being dropped. Hybrid KV prompt caching requires a disk staging tier; a GPU hot ring also requires `-ctk bf16 -ctv bf16` for bit-exact restore. |
+| `--cache-disk-path PATH` | Directory used for disk prompt-cache files | System temporary directory | Use a fast local SSD or persistent-memory filesystem. Files are held in a private per-server subdirectory and removed on clean shutdown. |
 | `-crs, --cache-ram-similarity N` | Max similarity of prompt tokens to cache tokens that triggers prompt cache | 0.50 |  |
 | `-cram-n-min, --cache-ram-n-min N` | Minimum number of cached tokens that triggers prompt cache | 0 |  |
 
