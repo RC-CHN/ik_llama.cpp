@@ -98,6 +98,12 @@ def main() -> int:
     parser.add_argument("--modes", default="concurrent,serial")
     parser.add_argument("--sessions", type=int, default=2)
     parser.add_argument(
+        "--prompt-template",
+        choices=("resident-sweep", "growth"),
+        default="resident-sweep",
+        help="use the standalone sweep prompt or the growth workload's exact milestone prompt",
+    )
+    parser.add_argument(
         "--concurrency-levels",
         default="",
         help="comma-separated active-session counts; default uses all resident sessions",
@@ -150,18 +156,29 @@ def main() -> int:
     corpus = args.corpus.read_text(encoding="utf-8", errors="replace")
     cut_pos, calibrated_tokens = calibrate_cut(args.url, corpus, args.context_tokens)
     session_names = [chr(ord("A") + index) for index in range(args.sessions)]
-    prompts = {
-        name: (
-            f"// RESIDENT_DECODE_SWEEP_SESSION_{name}\n"
-            + corpus[:cut_pos]
-            + f"\n// session {name}: resident decode sweep at {args.context_tokens}; continue the code.\n"
-        )
-        for name in session_names
-    }
+    if args.prompt_template == "growth":
+        prompts = {
+            name: (
+                f"// LOGICAL_PRODUCTION_SESSION_{name}\n"
+                + corpus[:cut_pos]
+                + f"\n// session {name}: context milestone {args.context_tokens}; continue the code.\n"
+            )
+            for name in session_names
+        }
+    else:
+        prompts = {
+            name: (
+                f"// RESIDENT_DECODE_SWEEP_SESSION_{name}\n"
+                + corpus[:cut_pos]
+                + f"\n// session {name}: resident decode sweep at {args.context_tokens}; continue the code.\n"
+            )
+            for name in session_names
+        }
     prompt_tokens = {name: tokenize_count(args.url, prompt) for name, prompt in prompts.items()}
     emit(
         "calibration_complete",
         context_tokens=args.context_tokens,
+        prompt_template=args.prompt_template,
         calibrated_corpus_tokens=calibrated_tokens,
         cut_chars=cut_pos,
         prompt_tokens=prompt_tokens,
@@ -329,6 +346,7 @@ def main() -> int:
     summary = {
         "completed": True,
         "context_tokens": args.context_tokens,
+        "prompt_template": args.prompt_template,
         "calibrated_corpus_tokens": calibrated_tokens,
         "sessions": session_names,
         "concurrency_levels": concurrency_levels,

@@ -776,15 +776,61 @@ std::vector<llama_token> llama_sampling_sample_and_accept_n(struct common_sample
     return common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft);
 }
 
+static bool common_sampler_can_fast_greedy(const common_sampler * gsmpl, bool grammar_first) {
+    const auto & params = gsmpl->params;
+
+    // Greedy speculative verification does not need to materialize a
+    // llama_token_data entry for every vocabulary item.  Keep the shortcut
+    // deliberately narrow: every stateful/dense transform falls back to the
+    // general sampler, while sparse static logit biases are applied exactly
+    // below.  n_probs also needs cur_p to be populated for the server response.
+    return !grammar_first &&
+        params.temp == 0.0f &&
+        params.n_probs == 0 &&
+        params.penalty_repeat == 1.0f &&
+        params.penalty_freq == 0.0f &&
+        params.penalty_present == 0.0f &&
+        gsmpl->grammar == nullptr &&
+        gsmpl->rbudget == nullptr &&
+        gsmpl->server_biases == nullptr &&
+        gsmpl->elb_states.empty();
+}
+
+static llama_token common_sampler_sample_fast_greedy(
+        common_sampler * gsmpl, llama_context * ctx, int idx) {
+    float * logits = llama_get_logits_ith(ctx, idx);
+    const int32_t n_vocab = llama_n_vocab(llama_get_model(ctx));
+
+    // Match llama_sampling_prepare_impl's in-place sparse bias semantics.  A
+    // row is sampled only once during speculative verification, so restoring
+    // it would add work and would differ from the existing path.
+    for (const auto & [token, bias] : gsmpl->params.logit_bias) {
+        if (token >= 0 && token < n_vocab) {
+            logits[token] += bias;
+        }
+    }
+
+    const float * best = std::max_element(logits, logits + n_vocab);
+    gsmpl->n_valid = 0;
+    return (llama_token) (best - logits);
+}
+
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const std::vector<llama_token> & draft, bool grammar_first) {
     GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
 
     std::vector<llama_token> result;
     result.reserve(idxs.size());
 
+    const bool fast_greedy = common_sampler_can_fast_greedy(gsmpl, grammar_first);
+    const auto sample = [&](int idx) {
+        return fast_greedy
+            ? common_sampler_sample_fast_greedy(gsmpl, ctx, idx)
+            : common_sampler_sample(gsmpl, ctx, idx, grammar_first);
+    };
+
     size_t i = 0;
     for (; i < draft.size(); i++) {
-        const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+        const llama_token id = sample(idxs[i]);
 
         gsmpl->drafted_text += common_token_to_piece(ctx, id, true);
 
@@ -798,7 +844,7 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     }
 
     if (i == draft.size()) {
-        const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
+        const llama_token id = sample(idxs[i]);
 
         gsmpl->drafted_text += common_token_to_piece(ctx, id, true);
 

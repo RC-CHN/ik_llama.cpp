@@ -14,6 +14,9 @@
 namespace {
 std::atomic<uint64_t> g_fa_pages_checked{0};
 std::atomic<uint64_t> g_fa_pages_skipped{0};
+std::atomic<uint64_t> g_fa_layout_plans{0};
+std::atomic<uint64_t> g_fa_layout_runs{0};
+std::atomic<uint64_t> g_fa_group_observations{0};
 }
 
 extern "C" IQK_API void iqk_fa_page_stats_add(
@@ -42,6 +45,10 @@ extern "C" IQK_API void iqk_fa_page_stats_get(
 #include <cstring>
 #include <cmath>
 #include <unordered_set>
+
+#if defined(GGML_AMX_BF16) && defined(__AMX_TILE__) && defined(__AMX_BF16__) && defined(__x86_64__)
+#include <cpuid.h>
+#endif
 
 namespace {
 inline uint32_t simple_gcd(uint32_t a, uint32_t b) {
@@ -74,9 +81,7 @@ inline float pack_softmax_max(float M) {
 }
 
 inline int32_t fa_param_i32(const ggml_tensor * tensor, int index) {
-    int32_t value;
-    std::memcpy(&value, tensor->op_params + index*sizeof(value), sizeof(value));
-    return value;
+    return tensor->op_params[index];
 }
 
 inline bool numa_fa_eligible(const ggml_tensor * dst, int nth) {
@@ -130,7 +135,129 @@ inline size_t numa_fa_align64(size_t size) {
     return (size + 63) & ~(size_t) 63;
 }
 
-constexpr int numa_fa_max_query_group_tokens = 5;
+// The AVX-512 kernel consumes two 16-row query tiles at once.  The AMX
+// implementation can retain four such tiles across two register waves. Derive
+// the token cohort from that live ISA capacity and the model's actual GQA
+// ratio, instead of assigning a context- or concurrency-specific depth.
+constexpr int numa_fa_query_tile_rows = 16;
+constexpr int numa_fa_avx_query_tiles = 2;
+constexpr int numa_fa_amx_query_tiles = 4;
+constexpr int numa_fa_max_query_rows = numa_fa_query_tile_rows*numa_fa_amx_query_tiles;
+constexpr int numa_fa_max_query_group_tokens = numa_fa_max_query_rows/6;
+
+inline bool numa_fa_amx_available() {
+#if defined(GGML_AMX_BF16) && defined(__AMX_TILE__) && defined(__AMX_BF16__) && defined(__x86_64__)
+    static const bool available = [] {
+        const char * disabled = std::getenv("GGML_AMX_DISABLE");
+        const char * fa_qk = std::getenv("GGML_AMX_FA_QK");
+        if ((disabled && disabled[0] != '\0' && disabled[0] != '0') ||
+                (fa_qk && (fa_qk[0] == '0' || std::strcmp(fa_qk, "off") == 0 ||
+                           std::strcmp(fa_qk, "false") == 0))) {
+            return false;
+        }
+        unsigned int eax, ebx, ecx, edx;
+        constexpr unsigned int cpuid_amx_bf16 = 1u << 22;
+        constexpr unsigned int cpuid_amx_tile = 1u << 24;
+        return __get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx) &&
+            (edx & (cpuid_amx_bf16 | cpuid_amx_tile)) == (cpuid_amx_bf16 | cpuid_amx_tile);
+    }();
+    return available;
+#else
+    return false;
+#endif
+}
+
+enum class numa_fa_group_policy {
+    adaptive,
+    narrow,
+    wide,
+};
+
+inline numa_fa_group_policy numa_fa_query_group_policy() {
+    static const numa_fa_group_policy policy = [] {
+        const char * value = std::getenv("GGML_NUMA_FA_WIDE_QUERY_GROUPS");
+        if (value == nullptr || value[0] == '\0' || std::strcmp(value, "auto") == 0 ||
+                std::strcmp(value, "adaptive") == 0) {
+            return numa_fa_group_policy::adaptive;
+        }
+        if (value[0] == '0' || std::strcmp(value, "false") == 0 ||
+                std::strcmp(value, "off") == 0) {
+            return numa_fa_group_policy::narrow;
+        }
+        return numa_fa_group_policy::wide;
+    }();
+    return policy;
+}
+
+inline int numa_fa_narrow_query_group_tokens(int gqa) {
+    return std::max(1, numa_fa_query_tile_rows*numa_fa_avx_query_tiles/std::max(1, gqa));
+}
+
+inline int numa_fa_wide_query_group_tokens(int gqa) {
+    return std::max(1, numa_fa_query_tile_rows*numa_fa_amx_query_tiles/std::max(1, gqa));
+}
+
+inline int numa_fa_max_query_group_tokens_for_layout(int gqa) {
+    const int query_rows = numa_fa_query_tile_rows*
+        (numa_fa_amx_available() && numa_fa_query_group_policy() != numa_fa_group_policy::narrow
+            ? numa_fa_amx_query_tiles : numa_fa_avx_query_tiles);
+    return std::max(1, query_rows/std::max(1, gqa));
+}
+
+constexpr int numa_fa_feedback_token_buckets = 17;
+constexpr int numa_fa_feedback_work_buckets = 32;
+
+struct numa_fa_group_feedback {
+    std::atomic<uint64_t> samples[2] = {};
+    std::atomic<uint64_t> total_us[2] = {};
+    std::atomic<uint64_t> decisions{0};
+};
+
+numa_fa_group_feedback g_numa_fa_group_feedback
+    [numa_fa_feedback_token_buckets][numa_fa_feedback_work_buckets];
+
+inline int numa_fa_work_bucket(int rows) {
+    int bucket = 0;
+    for (int value = std::max(1, rows); value > 1; value = (value + 1)/2) {
+        ++bucket;
+    }
+    return std::min(bucket, numa_fa_feedback_work_buckets - 1);
+}
+
+inline int numa_fa_max_rows_per_worker(
+        int n_kv, int cold_capacity, int n_shards, int local_nth) {
+    int result = 0;
+    for (int node = 0; node < n_shards; ++node) {
+        const int first = std::min(n_kv, (int) ((int64_t) cold_capacity*node/n_shards));
+        const int last = std::min(n_kv, (int) ((int64_t) cold_capacity*(node + 1)/n_shards));
+        const int blocks = std::max(0, last - first)/32;
+        result = std::max(result, 32*((blocks + local_nth - 1)/local_nth));
+    }
+    return result;
+}
+
+inline int numa_fa_choose_group_arm(numa_fa_group_feedback & feedback) {
+    const uint64_t narrow_samples = feedback.samples[0].load(std::memory_order_relaxed);
+    const uint64_t wide_samples = feedback.samples[1].load(std::memory_order_relaxed);
+    const uint64_t decision = feedback.decisions.fetch_add(1, std::memory_order_relaxed) + 1;
+
+    // Calibrate both kernels in the live topology before exploiting. Continue
+    // to challenge the current winner sparsely so thermal or co-tenant changes
+    // can move the crossover without a restart.
+    if (narrow_samples < 8 || wide_samples < 8) {
+        return narrow_samples <= wide_samples ? 0 : 1;
+    }
+    const uint64_t narrow_total = feedback.total_us[0].load(std::memory_order_relaxed);
+    const uint64_t wide_total = feedback.total_us[1].load(std::memory_order_relaxed);
+    const int winner = wide_total*narrow_samples < narrow_total*wide_samples ? 1 : 0;
+    return decision % 64 == 0 ? 1 - winner : winner;
+}
+
+inline void numa_fa_observe_group_arm(
+        numa_fa_group_feedback & feedback, int arm, uint64_t elapsed_us) {
+    feedback.total_us[arm].fetch_add(elapsed_us, std::memory_order_relaxed);
+    feedback.samples[arm].fetch_add(1, std::memory_order_relaxed);
+}
 
 inline size_t numa_fa_group_plan_size(int n_tokens) {
     return numa_fa_align64((1 + 2*(size_t) n_tokens)*sizeof(int32_t));
@@ -141,13 +268,36 @@ size_t iqk_fa_work_buffer_size(const struct ggml_tensor * dst, int nth) {
     auto Q = dst->src[0];
     auto K = dst->src[1];
     auto V = dst->src[2];
-    if (numa_fa_eligible(dst, nth)) {
+    const bool numa_eligible = numa_fa_eligible(dst, nth);
+    const bool batch_eligible = numa_eligible && numa_fa_batch_queries_eligible(dst, nth);
+    if (std::strncmp(dst->name, "hybrid_kv_cold_stats", 20) == 0) {
+        const uint64_t index = g_fa_layout_plans.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (index <= 8) {
+            const int n_shards = fa_param_i32(dst, 6);
+            const int gqa = K->ne[2] > 0 ? Q->ne[2]/K->ne[2] : 0;
+            std::fprintf(stderr,
+                    "iqk_fa: layout plan=%llu nth=%d q=[%lld,%lld,%lld,%lld] "
+                    "k=[%lld,%lld,%lld,%lld] stats=%d shards=%d cold=%d "
+                    "numa=%d batch=%d amx=%d group=%d\n",
+                    (unsigned long long) index, nth,
+                    (long long) Q->ne[0], (long long) Q->ne[1],
+                    (long long) Q->ne[2], (long long) Q->ne[3],
+                    (long long) K->ne[0], (long long) K->ne[1],
+                    (long long) K->ne[2], (long long) K->ne[3],
+                    fa_param_i32(dst, 5), n_shards, fa_param_i32(dst, 7),
+                    numa_eligible, batch_eligible, numa_fa_amx_available(),
+                    gqa > 0 ? numa_fa_max_query_group_tokens_for_layout(gqa) : 0);
+        }
+    }
+    if (numa_eligible) {
         const int n_shards = fa_param_i32(dst, 6);
-        if (numa_fa_batch_queries_eligible(dst, nth)) {
+        if (batch_eligible) {
             const int local_nth = nth/n_shards;
             const size_t group_plan_size = numa_fa_group_plan_size(Q->ne[1]);
+            const int gqa = Q->ne[2]/K->ne[2];
+            const int group_tokens = numa_fa_max_query_group_tokens_for_layout(gqa);
             const size_t packed_q_size = numa_fa_align64(
-                    (size_t) std::min<int64_t>(Q->ne[1], numa_fa_max_query_group_tokens)*
+                    (size_t) std::min<int64_t>(Q->ne[1], group_tokens)*
                     Q->ne[2]*Q->ne[0]*sizeof(float));
             return group_plan_size + packed_q_size +
                 (size_t) n_shards*local_nth*sizeof(float *);
@@ -466,28 +616,52 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
             last  = std::min(last,  nek1);
         };
 
-        // Pack up to five token rows (six GQA query heads each) together. The
-        // BF16 kernel's negative-stride convention repeats each input mask row
-        // for its six heads, so independent slots keep their own masks while
-        // sharing one K/V traversal. This covers both continuous batching and
-        // one MTP verification depth across several slots.
+        // Pack as many token rows as the active ISA's query-tile schedule can
+        // consume in one K/V traversal. The BF16 kernel's negative-stride
+        // convention repeats each input mask row for its GQA heads, so
+        // independent slots retain their own masks.
         if (numa_fa_batch_queries_enabled() && neq1 >= 1 && neq1 <= 16 &&
                 neq2 == 24 && nek2 == 4 && rk2 == 6) {
             const int n_chunks = local_nth;
+            const int narrow_group_limit = numa_fa_narrow_query_group_tokens(rk2);
+            const int max_group_limit = numa_fa_max_query_group_tokens_for_layout(rk2);
             const size_t group_plan_size = numa_fa_group_plan_size(neq1);
             const size_t packed_q_size = numa_fa_align64(
-                    (size_t) std::min(neq1, numa_fa_max_query_group_tokens)*neq2*Dk*sizeof(float));
+                    (size_t) std::min(neq1, max_group_limit)*neq2*Dk*sizeof(float));
             int32_t * group_plan = (int32_t *) work_buffer_in;
             float * packed_q = (float *) ((char *) work_buffer_in + group_plan_size);
             float ** partial_ptrs = (float **) ((char *) packed_q + packed_q_size);
 
-            constexpr int max_queries = numa_fa_max_query_group_tokens*6;
-            constexpr int result_stride = (256 + 16)*max_queries;
-            alignas(64) float local_results[2][result_stride];
-
+            numa_fa_group_feedback * group_feedback = nullptr;
+            int group_feedback_arm = -1;
+            int group_feedback_bucket = -1;
+            int group_feedback_rows = 0;
+            uint64_t group_started_us = 0;
             if (ith == 0) {
-                const int n_groups = (neq1 + numa_fa_max_query_group_tokens - 1)/
-                    numa_fa_max_query_group_tokens;
+                int group_limit = max_group_limit;
+                if (max_group_limit > narrow_group_limit && neq1 > narrow_group_limit &&
+                        numa_fa_query_group_policy() == numa_fa_group_policy::adaptive) {
+                    group_feedback_rows = numa_fa_max_rows_per_worker(
+                        nek1, numa_cold_capacity, numa_shards, local_nth);
+                    group_feedback_bucket = numa_fa_work_bucket(group_feedback_rows);
+                    group_feedback = &g_numa_fa_group_feedback
+                        [std::min(neq1, numa_fa_feedback_token_buckets - 1)]
+                        [group_feedback_bucket];
+                    group_feedback_arm = numa_fa_choose_group_arm(*group_feedback);
+                    group_limit = group_feedback_arm == 0 ? narrow_group_limit : max_group_limit;
+                }
+
+                const uint64_t index = g_fa_layout_runs.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (index <= 8) {
+                    std::fprintf(stderr,
+                            "iqk_fa: layout run=%llu nth=%d tokens=%d group=%d max_group=%d "
+                            "plan_bytes=%zu packed_q_bytes=%zu work=%p partials=%p\n",
+                            (unsigned long long) index, nth, neq1, group_limit,
+                            max_group_limit, group_plan_size, packed_q_size,
+                            work_buffer_in, (void *) partial_ptrs);
+                }
+
+                const int n_groups = (neq1 + group_limit - 1)/group_limit;
                 const int group_tokens = neq1/n_groups;
                 const int n_larger = neq1 % n_groups;
                 int first = 0;
@@ -499,8 +673,20 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
                 }
                 group_plan[0] = n_groups;
             }
+
+            constexpr int max_queries = numa_fa_max_query_group_tokens*6;
+            constexpr int result_stride = (256 + 16)*max_queries;
+            // Qwen's four KV heads fit in one per-worker scratch cohort.  A
+            // single compute/merge cycle avoids a second pair of 52-thread
+            // NUMA barriers while retaining independent online-softmax state
+            // for every head.
+            alignas(64) float local_results[4][result_stride];
+
             partial_ptrs[ith] = local_results[0];
             barrier(barrier_data);
+            if (ith == 0 && group_feedback != nullptr) {
+                group_started_us = ggml_time_us();
+            }
 
             auto chunk_bounds = [&](int inode, int ichunk, int & first, int & last) {
                 int node_first, node_last;
@@ -530,8 +716,8 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
                 }
                 barrier(barrier_data);
 
-                for (int head_first = 0; head_first < nek2; head_first += 2) {
-                    const int n_heads = std::min(2, nek2 - head_first);
+                for (int head_first = 0; head_first < nek2; head_first += 4) {
+                    const int n_heads = std::min(4, nek2 - head_first);
                     if (last > first) {
                         const char * this_m = mask ? (const char *) mask +
                                 (int64_t) group_first*stride_m + (int64_t) first*sizeof(uint16_t) : nullptr;
@@ -618,6 +804,32 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
                         }
                     }
                     barrier(barrier_data);
+                }
+            }
+            if (ith == 0 && group_feedback != nullptr) {
+                const uint64_t elapsed_us = ggml_time_us() - group_started_us;
+                numa_fa_observe_group_arm(*group_feedback, group_feedback_arm, elapsed_us);
+                const uint64_t index = g_fa_group_observations.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (index <= 8 || index % 256 == 0) {
+                    const uint64_t narrow_samples =
+                        group_feedback->samples[0].load(std::memory_order_relaxed);
+                    const uint64_t wide_samples =
+                        group_feedback->samples[1].load(std::memory_order_relaxed);
+                    const double narrow_us = narrow_samples > 0 ?
+                        group_feedback->total_us[0].load(std::memory_order_relaxed)/
+                            (double) narrow_samples : 0.0;
+                    const double wide_us = wide_samples > 0 ?
+                        group_feedback->total_us[1].load(std::memory_order_relaxed)/
+                            (double) wide_samples : 0.0;
+                    std::fprintf(stderr,
+                            "iqk_fa: adaptive group observation=%llu tokens=%d rows_per_worker=%d "
+                            "bucket=%d arm=%s elapsed_us=%llu narrow_samples=%llu narrow_mean_us=%.1f "
+                            "wide_samples=%llu wide_mean_us=%.1f\n",
+                            (unsigned long long) index, neq1, group_feedback_rows,
+                            group_feedback_bucket, group_feedback_arm == 0 ? "narrow" : "wide",
+                            (unsigned long long) elapsed_us,
+                            (unsigned long long) narrow_samples, narrow_us,
+                            (unsigned long long) wide_samples, wide_us);
                 }
             }
             return true;

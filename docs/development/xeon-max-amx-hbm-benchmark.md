@@ -414,3 +414,44 @@ failures: missing Python `jinja2`, an unavailable model download in the
 libcurl-free build, a BGE tokenizer fixture mismatch, and a ChatGLM4 trailing
 newline expectation mismatch. None executes the scheduler, KV-restore, or CPU
 flash-attention path changed here.
+
+## Final 45/20 tok/s heterogeneous acceptance (2026-08-19)
+
+The previous 37.934 tok/s 128K result is superseded by
+`tmp/bench-final-dual128k-auto-v89-20260819`. Two restored 128,026-token
+requests generated 2,048 tokens each. Aggregate decode-union throughput was
+**50.317 tok/s**, full-service output throughput was **49.830 tok/s**, and the
+two requests individually reached 25.158/25.933 tok/s. Each restore evaluated
+only five prompt tokens. Peak VRAM was 22,066 MiB; there was no OOM, full prompt
+reprocess, KV retry, or restore failure.
+
+The hot window is now selected by measured capacity plus compatible throughput
+feedback rather than a machine/context table. A capacity-only probe increased
+the window from 22,528 to 31,744 rows but regressed decode from 48.892 to
+39.145 tok/s even though it fit in VRAM. GPU average utilization increased from
+65.24% to 76.48%, showing that the larger GPU attention share had moved the
+critical path in the wrong direction. The feedback run selected the measured
+22,528-row winner; `capacity-plan.json` separately retained a 30,720-row safe
+capacity ceiling and the complete observation chain.
+
+The terminal production-capacity record is
+`tmp/bench-final-round-robin-3x200k-v85-20260819`. Two physical slots served
+three logical sessions in `AB -> CB -> CA` waves. Every session generated
+2,048 tokens and finished at approximately 202K context. Full-service,
+decode-window, and decode-union throughput were respectively **20.783**,
+**20.866**, and **23.828 tok/s**. All completion, prefix-reuse, and throughput
+gates passed. One live 201K hybrid tail was lazily streamed to a 13.020 GiB
+Optane snapshot in 12.295 s and restored in 5.609 s; the restored request
+evaluated one prompt token rather than reprocessing 200K.
+
+The implementation queues private-MTP accepted-state updates until their next
+draft boundary, permits stream-ordered recurrent checkpoint restores, records
+fine-grained decode critical-path timings, and uses logical-session liveness to
+avoid saving retired slots. Explicit `id_slot` routing now executes the same
+tiered-cache preparation as automatic LRU routing. At 128K, mean target decode
+still accounts for about 152.1 ms of a 177.1 ms iteration; at 200K it accounts
+for about 197.4 ms of 217.7 ms. Further work should therefore prioritize target
+microbatch/graph/merge overlap and asynchronous snapshot I/O. A complete
+PagedAttention migration becomes compelling for higher resident-session
+density or prefix copy-on-write, but it must cover canonical HBM KV, the GPU
+hot ring, recurrent state, MTP checkpoints, and disk snapshots together.

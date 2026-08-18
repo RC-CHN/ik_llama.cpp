@@ -7,6 +7,7 @@ import argparse
 import concurrent.futures
 import hashlib
 import json
+import struct
 import threading
 import time
 import urllib.request
@@ -21,9 +22,95 @@ def request_json(url: str, path: str, body: dict | None = None, timeout: float =
         return json.load(response)
 
 
-def tokenize_count(url: str, text: str) -> int:
+def tokenize(url: str, text: str) -> list[int]:
     response = request_json(url, "/tokenize", {"content": text, "add_special": False}, 600)
-    return len(response["tokens"])
+    return [int(token) for token in response["tokens"]]
+
+
+def tokenize_count(url: str, text: str) -> int:
+    return len(tokenize(url, text))
+
+
+def load_checkpoint_positions(path: Path) -> list[dict]:
+    """Read only checkpoint metadata while skipping the large recurrent payloads."""
+    header = struct.Struct("@IIQ")
+    record = struct.Struct("@iiiiQ")
+    with path.open("rb") as stream:
+        raw = stream.read(header.size)
+        if len(raw) != header.size:
+            raise ValueError(f"truncated checkpoint header: {path}")
+        magic, version, count = header.unpack(raw)
+        if count > 1024:
+            raise ValueError(f"implausible checkpoint count {count}: {path}")
+        checkpoints = []
+        for _ in range(count):
+            raw = stream.read(record.size)
+            if len(raw) != record.size:
+                raise ValueError(f"truncated checkpoint record: {path}")
+            pos_min, pos_max, pos_min_prompt, pos_max_prompt, data_len = record.unpack(raw)
+            checkpoints.append(
+                {
+                    "pos_min": pos_min,
+                    "pos_max": pos_max,
+                    "pos_min_prompt": pos_min_prompt,
+                    "pos_max_prompt": pos_max_prompt,
+                    "data_bytes": data_len,
+                }
+            )
+            stream.seek(data_len, 1)
+    return checkpoints
+
+
+def load_slot_states(path: Path) -> dict[int, dict]:
+    result = {}
+    for tokens_path in sorted(path.glob("slot-*.bin.tokens.json")):
+        stem = tokens_path.name.removeprefix("slot-").removesuffix(".bin.tokens.json")
+        try:
+            id_slot = int(stem)
+        except ValueError:
+            continue
+        checkpoint_path = path / f"slot-{id_slot}.bin.checkpoints"
+        payload = json.loads(tokens_path.read_text(encoding="utf-8"))
+        result[id_slot] = {
+            "tokens": [int(token) for token in payload.get("tokens", [])],
+            "checkpoints": (
+                load_checkpoint_positions(checkpoint_path) if checkpoint_path.exists() else []
+            ),
+        }
+    return result
+
+
+def restored_prefix_status(prompt_tokens: list[int], state: dict) -> dict:
+    saved_tokens = state["tokens"]
+    common_prefix = 0
+    for current, saved in zip(prompt_tokens, saved_tokens):
+        if current != saved:
+            break
+        common_prefix += 1
+
+    # apply_checkpoint() requires a checkpoint strictly before pos_next - 1.
+    # Deriving this from the saved metadata avoids a context-size or machine
+    # specific tolerance in the benchmark.
+    usable = [
+        checkpoint
+        for checkpoint in state["checkpoints"]
+        if checkpoint["pos_max"] < max(0, common_prefix - 1)
+    ]
+    best = max(usable, key=lambda checkpoint: checkpoint["pos_max"], default=None)
+    expected_prompt_n_max = (
+        max(0, len(prompt_tokens) - (best["pos_max"] + 1))
+        if best is not None
+        else len(prompt_tokens)
+    )
+    return {
+        "saved_tokens": len(saved_tokens),
+        "common_prefix_tokens": common_prefix,
+        "checkpoint_count": len(state["checkpoints"]),
+        "usable_checkpoint_count": len(usable),
+        "best_checkpoint_pos_max": best["pos_max"] if best is not None else None,
+        "expected_prompt_n_max": expected_prompt_n_max,
+        "reuse_available": best is not None,
+    }
 
 
 def calibrate_cuts(url: str, corpus: str, milestones: list[int]) -> dict[int, tuple[int, int]]:
@@ -82,12 +169,14 @@ def completion_body(
     n_predict: int,
     seed: int,
     id_slot: int | None = None,
+    preserve_displaced: bool = True,
     speculative_n_max: int | None = None,
 ) -> dict:
     body = {
         "prompt": prompt,
         "n_predict": n_predict,
         "cache_prompt": True,
+        "cache_prompt_preserve": preserve_displaced,
         "stream": False,
         "temperature": 0,
         "seed": seed,
@@ -114,6 +203,8 @@ def main() -> int:
     parser.add_argument("--final-decode-tokens", type=int, default=2048)
     parser.add_argument("--sessions", type=int, default=2)
     parser.add_argument("--speculative-n-max", type=int)
+    parser.add_argument("--slot-state-dir", type=Path)
+    parser.add_argument("--required-initial-restores", type=int, default=0)
     parser.add_argument(
         "--sticky-slots",
         action="store_true",
@@ -128,6 +219,17 @@ def main() -> int:
         raise ValueError("--sessions must be between 1 and 26")
     if args.speculative_n_max is not None and args.speculative_n_max < 0:
         raise ValueError("--speculative-n-max must be non-negative")
+    if args.required_initial_restores < 0 or args.required_initial_restores > args.sessions:
+        raise ValueError("--required-initial-restores must be between zero and --sessions")
+    if args.required_initial_restores and args.slot_state_dir is None:
+        raise ValueError("--required-initial-restores needs --slot-state-dir")
+
+    initial_slot_states = load_slot_states(args.slot_state_dir) if args.slot_state_dir else {}
+    if args.required_initial_restores > len(initial_slot_states):
+        raise ValueError(
+            f"need {args.required_initial_restores} initial slot states, found "
+            f"{len(initial_slot_states)} in {args.slot_state_dir}"
+        )
 
     args.result_dir.mkdir(parents=True, exist_ok=True)
     events_path = args.result_dir / "events.jsonl"
@@ -174,7 +276,8 @@ def main() -> int:
     def complete(name: str, stage_index: int, target: int, n_predict: int, barrier: threading.Barrier) -> dict:
         state = sessions[name]
         prompt = str(state["prompt"])
-        prompt_tokens_client = tokenize_count(args.url, prompt)
+        prompt_token_ids = tokenize(args.url, prompt)
+        prompt_tokens_client = len(prompt_token_ids)
         previous_prompt_tokens_client = int(state["previous_prompt_tokens_client"])
         previous_predicted_n = int(state["previous_predicted_n"])
         barrier.wait()
@@ -198,6 +301,7 @@ def main() -> int:
                 int(state["id_slot"])
                 if args.sticky_slots and state["id_slot"] is not None
                 else None,
+                not args.sticky_slots,
                 args.speculative_n_max,
             ),
         )
@@ -218,6 +322,20 @@ def main() -> int:
         )
         prompt_n_server = int(number(timings.get("prompt_n")))
         prompt_reuse_valid = prompt_n_server <= incremental_prompt_expected_max
+        initial_restore = None
+        response_slot = response.get("id_slot")
+        if stage_index == 0 and response_slot is not None and initial_slot_states:
+            slot_state = initial_slot_states.get(int(response_slot))
+            if slot_state is not None:
+                initial_restore = restored_prefix_status(prompt_token_ids, slot_state)
+                initial_restore["id_slot"] = int(response_slot)
+                initial_restore["actual_prompt_n"] = prompt_n_server
+                initial_restore["valid"] = bool(
+                    initial_restore["reuse_available"]
+                    and prompt_n_server <= initial_restore["expected_prompt_n_max"]
+                )
+                incremental_prompt_expected_max = initial_restore["expected_prompt_n_max"]
+                prompt_reuse_valid = initial_restore["valid"]
         model_window_s = (
             number(timings.get("prompt_ms")) + number(timings.get("predicted_ms"))
         ) / 1000
@@ -244,6 +362,7 @@ def main() -> int:
             "truncated": response.get("truncated"),
             "content_chars": len(content),
             "content_sha256": hashlib.sha256(content.encode()).hexdigest(),
+            "initial_restore": initial_restore,
             "timings": timings,
             "content": content,
         }
@@ -294,7 +413,36 @@ def main() -> int:
             rows = [futures[name].result() for name in sessions]
             stage_wall_s = time.perf_counter() - stage_started
 
-        reuse_violations = [row for row in rows if not row["prompt_reuse_valid"]]
+        initial_restore_rows = [
+            row for row in rows if row.get("initial_restore") is not None
+        ]
+        initial_restore_valid = sum(
+            bool(row["initial_restore"].get("valid")) for row in initial_restore_rows
+        )
+        if stage_index == 0 and args.required_initial_restores:
+            emit(
+                "initial_restore_validation",
+                required=args.required_initial_restores,
+                valid=initial_restore_valid,
+                requests=[
+                    {
+                        "session": row["session"],
+                        **row["initial_restore"],
+                    }
+                    for row in initial_restore_rows
+                ],
+            )
+            if initial_restore_valid < args.required_initial_restores:
+                raise RuntimeError(
+                    f"only {initial_restore_valid}/{args.required_initial_restores} "
+                    "required initial slot restores reused a checkpoint"
+                )
+
+        reuse_violations = [
+            row
+            for row in rows
+            if not row["prompt_reuse_valid"] and row.get("initial_restore") is None
+        ]
         if reuse_violations:
             phase(
                 "invalid_cache_reuse",
@@ -460,6 +608,7 @@ def main() -> int:
         "sessions": list(sessions),
         "sticky_slots": args.sticky_slots,
         "speculative_n_max": args.speculative_n_max,
+        "required_initial_restores": args.required_initial_restores,
         "session_slot_map": {name: state["id_slot"] for name, state in sessions.items()},
         "milestones": milestones,
         "decode_tokens": args.decode_tokens,

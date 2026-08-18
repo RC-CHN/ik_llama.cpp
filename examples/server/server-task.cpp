@@ -1828,12 +1828,44 @@ bool server_prompt_cache::save(server_prompt & prompt, int32_t id_slot) {
     if (rewind_to_checkpoint_on_save) {
         const auto checkpoint = std::find_if(prompt.checkpoints.rbegin(), prompt.checkpoints.rend(),
                 [&](const server_prompt_checkpoint & cur) {
-                    return cur.n_tokens < prompt.tokens.n_tokens() && !cur.state_file.empty();
+                    return cur.n_tokens <= prompt.tokens.n_tokens() && !cur.state_file.empty();
                 });
         if (checkpoint == prompt.checkpoints.rend()) {
-            LLAMA_LOG_WARN("hybrid prompt cache has no self-consistent staged tail state; "
-                    "skipping this cache entry\n");
-            return false;
+            // A completed request owns an exact partial checkpoint for its
+            // current token tail, but deliberately has no multi-GiB staged
+            // snapshot yet.  Stream that live state only when the slot is
+            // actually displaced.  This avoids blocking every checkpoint
+            // (including ones belonging to requests that remain resident)
+            // while still giving the tiered cache a self-consistent state and
+            // the smaller rewind checkpoints needed for tokenizer-boundary
+            // edits after a later restore.
+            const auto exact = std::find_if(prompt.checkpoints.rbegin(), prompt.checkpoints.rend(),
+                    [&](const server_prompt_checkpoint & cur) {
+                        return cur.n_tokens == prompt.tokens.n_tokens() && !cur.data.empty();
+                    });
+            if (exact == prompt.checkpoints.rend() || !has_disk_tier()) {
+                LLAMA_LOG_WARN("hybrid prompt cache has no self-consistent live tail checkpoint; "
+                        "skipping this cache entry\n");
+                return false;
+            }
+
+            prompt.state_n_tokens = exact->n_tokens;
+            prompt.state_pos_max_prompt = exact->pos_max_prompt;
+            server_prompt * cur = alloc(prompt, 0);
+            if (cur == nullptr) {
+                return false;
+            }
+            const int64_t t_start = ggml_time_us();
+            if (!save_to_disk(*cur, id_slot)) {
+                prompt.checkpoints = std::move(cur->checkpoints);
+                states.pop_back();
+                return false;
+            }
+            LLAMA_LOG_INFO(" - lazily streamed displaced hybrid prompt tail at token %" PRId64
+                    " in %.2f ms\n", cur->state_n_tokens,
+                    (ggml_time_us() - t_start) / 1000.0);
+            update();
+            return true;
         }
 
         std::string staged_file = checkpoint->state_file;

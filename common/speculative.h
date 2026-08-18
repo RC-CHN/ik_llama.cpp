@@ -65,6 +65,14 @@ struct common_speculative_metrics_snapshot {
     std::vector<common_speculative_metrics_stage_snapshot> stages;
 };
 
+struct common_speculative_commit_profile {
+    int64_t hidden_readback_us = 0;
+    int64_t state_restore_us = 0;
+    int64_t sampler_restore_us = 0;
+    int64_t mtp_hidden_update_us = 0;
+    int64_t checkpoint_control_us = 0;
+};
+
 // comma separated list of all types
 std::string common_speculative_type_name_str();
 
@@ -193,6 +201,9 @@ bool common_speculative_commit_accepted_output(
 
 const common_speculative_checkpoint * common_speculative_get_checkpoint(const common_speculative * spec);
 
+common_speculative_commit_profile common_speculative_get_last_commit_profile(
+        const common_speculative * spec);
+
 void common_speculative_checkpoint_discard(
     common_speculative_checkpoint & ckpt,
     llama_context * ctx);
@@ -208,7 +219,8 @@ bool common_speculative_checkpoint_restore(
     const std::vector<llama_token> & ids,
     int n_draft,
     const std::vector<float> & mtp_hidden_state_pre,
-    int32_t mtp_n_past_base);
+    int32_t mtp_n_past_base,
+    bool defer_recurrent_sync = false);
 
 bool common_speculative_commit(
         common_speculative * spec,
@@ -219,7 +231,8 @@ bool common_speculative_commit(
         const std::vector<llama_token> & ids,
         int n_draft,
         llama_pos pos_base,
-        const std::vector<int32_t> & accepted_output_indices);
+        const std::vector<int32_t> & accepted_output_indices,
+        bool defer_recurrent_sync = false);
 
 bool common_speculative_has_sequence_hidden(const common_speculative * spec, llama_seq_id seq_id);
 

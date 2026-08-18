@@ -250,11 +250,16 @@ static std::vector<llama_token> mtp_speculative_gen_draft(
     bool constant_draft_positions = false);
 
 static int32_t mtp_update_kv_cache(struct llama_context * ctx, const llama_batch & batch, bool is_prompt_warmup, int32_t mtp_heads);
+static bool mtp_finalize_pending_accept(common_speculative_state_mtp & state, llama_seq_id seq_id);
 
 struct mtp_last_embd {
     std::vector<float> embd;
     float prob = 0.0f;
     int   last_id = -1;
+};
+
+struct mtp_pending_accept {
+    int32_t n_tokens = 0;
 };
 
 struct common_speculative_state_mtp : public common_speculative_state {
@@ -278,6 +283,7 @@ struct common_speculative_state_mtp : public common_speculative_state {
     int n_embd = 0;
     std::unordered_map<llama_seq_id, std::vector<float>> target_hidden_by_seq;
     std::unordered_map<llama_seq_id, mtp_last_embd> draft_cache_by_seq;
+    std::unordered_map<llama_seq_id, mtp_pending_accept> pending_accept_by_seq;
 
     common_speculative_state_mtp(
             enum common_speculative_type type,
@@ -316,6 +322,10 @@ struct common_speculative_state_mtp : public common_speculative_state {
 
     void begin(const llama_tokens & prompt) override {
         GGML_UNUSED(prompt);
+        if (!pending_accept_by_seq.empty()) {
+            llama_synchronize(ctx_mtp);
+            pending_accept_by_seq.clear();
+        }
         target_hidden_by_seq.clear();
         draft_cache_by_seq.clear();
     }
@@ -355,6 +365,11 @@ struct common_speculative_state_mtp : public common_speculative_state {
 
         llama_context * ctx = ctx_mtp;
         mtp_heads_active = std::max<int32_t>(0, params.mtp_heads);
+
+        if (!mtp_finalize_pending_accept(*this, seq_id)) {
+            result.clear();
+            return;
+        }
 
         const auto hidden_it = target_hidden_by_seq.find(seq_id);
         if (hidden_it == target_hidden_by_seq.end() || (int) hidden_it->second.size() != n_embd) {
@@ -1097,6 +1112,7 @@ struct common_speculative {
     int last_n_drafted = 0;
     int64_t t_step_start_us = 0;
     bool last_step_target_only = false;
+    common_speculative_commit_profile last_commit_profile;
 };
 
 static bool common_speculative_stage_chain_matches(
@@ -2487,6 +2503,11 @@ const common_speculative_checkpoint * common_speculative_get_checkpoint(const co
     return spec != nullptr ? &spec->checkpoint : nullptr;
 }
 
+common_speculative_commit_profile common_speculative_get_last_commit_profile(
+        const common_speculative * spec) {
+    return spec != nullptr ? spec->last_commit_profile : common_speculative_commit_profile{};
+}
+
 void common_speculative_checkpoint_discard(
         common_speculative_checkpoint & ckpt,
         llama_context * ctx) {
@@ -2505,12 +2526,14 @@ bool common_speculative_checkpoint_restore(
         const std::vector<llama_token> & ids,
         int n_draft,
         const std::vector<float> & mtp_hidden_state_pre,
-        int32_t mtp_n_past_base) {
+        int32_t mtp_n_past_base,
+        bool defer_recurrent_sync) {
     if (!ckpt.valid) {
         return true;
     }
 
     const int step = (int) ids.size() - 1;
+    const int64_t init_start_us = ggml_time_us();
     if (ckpt.mode == LLAMA_SPEC_CKPT_PER_STEP &&
             llama_spec_ckpt_init(ctx, ckpt.mode, n_draft + 1) == LLAMA_SPEC_CKPT_NONE) {
         LOG_ERR("%s: seq_id=%d failed to reselect per-step checkpoint storage\n",
@@ -2518,8 +2541,14 @@ bool common_speculative_checkpoint_restore(
         common_speculative_checkpoint_discard(ckpt, ctx);
         return false;
     }
-    const enum llama_spec_ckpt_restore_result restore_result = llama_spec_ckpt_restore_ex(
-            ctx, seq_id, ckpt.n_past, ckpt.mode == LLAMA_SPEC_CKPT_PER_STEP ? step : 0);
+    spec->last_commit_profile.checkpoint_control_us += ggml_time_us() - init_start_us;
+    const int restore_step = ckpt.mode == LLAMA_SPEC_CKPT_PER_STEP ? step : 0;
+    const int64_t restore_start_us = ggml_time_us();
+    const enum llama_spec_ckpt_restore_result restore_result =
+        defer_recurrent_sync && ckpt.mode == LLAMA_SPEC_CKPT_PER_STEP
+            ? llama_spec_ckpt_restore_ex_deferred(ctx, seq_id, ckpt.n_past, restore_step)
+            : llama_spec_ckpt_restore_ex(ctx, seq_id, ckpt.n_past, restore_step);
+    spec->last_commit_profile.state_restore_us += ggml_time_us() - restore_start_us;
     if (restore_result == LLAMA_SPEC_CKPT_RESTORE_FAILED) {
         LOG_ERR("%s: seq_id=%d speculative checkpoint restore failed\n", __func__, (int) seq_id);
         common_speculative_checkpoint_discard(ckpt, ctx);
@@ -2527,6 +2556,7 @@ bool common_speculative_checkpoint_restore(
     }
 
     if (restore_result == LLAMA_SPEC_CKPT_RESTORE_DIRECT) {
+        const int64_t sampler_start_us = ggml_time_us();
         if (ckpt.sampler != nullptr && sampler_dst != nullptr) {
             common_sampler_clone(ckpt.sampler, sampler_dst);
         }
@@ -2535,8 +2565,10 @@ bool common_speculative_checkpoint_restore(
                 common_sampler_accept(sampler_dst, ctx, id, true);
             }
         }
+        spec->last_commit_profile.sampler_restore_us += ggml_time_us() - sampler_start_us;
 
         if (common_speculative_has_target_features(spec) && !mtp_hidden_state_pre.empty()) {
+            const int64_t hidden_update_start_us = ggml_time_us();
             if (!common_speculative_commit_accepted_hidden_rows(
                     spec,
                     spec_type_used,
@@ -2550,6 +2582,7 @@ bool common_speculative_checkpoint_restore(
                 LOG_DBG("%s: seq_id=%d synced MTP target hidden state from accepted-prefix rows after per-step restore\n",
                         __func__, (int) seq_id);
             }
+            spec->last_commit_profile.mtp_hidden_update_us += ggml_time_us() - hidden_update_start_us;
         }
 
         LOG_DBG("%s: seq_id=%d per-step restore: step=%d (rejected %d drafts)\n",
@@ -2615,7 +2648,9 @@ bool common_speculative_checkpoint_restore(
         }
     }
 
+    const int64_t discard_start_us = ggml_time_us();
     common_speculative_checkpoint_discard(ckpt, ctx);
+    spec->last_commit_profile.checkpoint_control_us += ggml_time_us() - discard_start_us;
     return true;
 }
 
@@ -2628,9 +2663,11 @@ bool common_speculative_commit(
         const std::vector<llama_token> & ids,
         int n_draft,
         llama_pos pos_base,
-        const std::vector<int32_t> & accepted_output_indices) {
+        const std::vector<int32_t> & accepted_output_indices,
+        bool defer_recurrent_sync) {
     GGML_ASSERT(spec != nullptr);
     GGML_ASSERT(!ids.empty());
+    spec->last_commit_profile = {};
 
     common_speculative_checkpoint & ckpt = spec->checkpoint;
     const common_speculative_type spec_type_used = spec->curr_impl != nullptr
@@ -2647,9 +2684,11 @@ bool common_speculative_commit(
             any_rejected &&
             ckpt.valid &&
             !accepted_output_indices.empty()) {
+        const int64_t hidden_readback_start_us = ggml_time_us();
         if (!common_speculative_copy_output_hidden_rows(spec, ctx, accepted_output_indices, mtp_hidden_state_pre)) {
             mtp_hidden_state_pre.clear();
         }
+        spec->last_commit_profile.hidden_readback_us += ggml_time_us() - hidden_readback_start_us;
     }
 
     if (any_rejected && ckpt.valid) {
@@ -2664,20 +2703,23 @@ bool common_speculative_commit(
             ids,
             n_draft,
             mtp_hidden_state_pre,
-            pos_base);
+            pos_base,
+            defer_recurrent_sync);
         return restored;
     }
 
     if (common_speculative_has_target_features(spec) && !accepted_output_indices.empty()) {
-        if (!common_speculative_commit_accepted_output(
-                spec,
-                ctx,
-                spec_type_used,
-                seq_id,
-                pos_base,
-                sampled_before,
-                ids,
-                accepted_output_indices)) {
+        std::vector<float> hidden_rows;
+        const int64_t hidden_readback_start_us = ggml_time_us();
+        const bool copied = common_speculative_copy_output_hidden_rows(
+            spec, ctx, accepted_output_indices, hidden_rows);
+        spec->last_commit_profile.hidden_readback_us += ggml_time_us() - hidden_readback_start_us;
+
+        const int64_t hidden_update_start_us = ggml_time_us();
+        const bool committed = copied && common_speculative_commit_accepted_hidden_rows(
+            spec, spec_type_used, seq_id, pos_base, sampled_before, ids, hidden_rows);
+        spec->last_commit_profile.mtp_hidden_update_us += ggml_time_us() - hidden_update_start_us;
+        if (!committed) {
             common_speculative_clear_sequence_hidden(spec, seq_id);
         } else if (spec_type_used != COMMON_SPECULATIVE_TYPE_MTP) {
             LOG_DBG("%s: seq_id=%d synced MTP target hidden state from accepted-prefix rows\n",
@@ -2685,8 +2727,10 @@ bool common_speculative_commit(
         }
     }
 
+    const int64_t control_start_us = ggml_time_us();
     llama_kv_cache_seq_rm(ctx, seq_id, pos_base + (llama_pos) (ids.size() - 1), -1);
     common_speculative_checkpoint_discard(ckpt, ctx);
+    spec->last_commit_profile.checkpoint_control_us += ggml_time_us() - control_start_us;
     return true;
 }
 
@@ -2798,6 +2842,11 @@ static mtp_last_embd & mtp_get_last_embd(common_speculative_state_mtp & state, l
 }
 
 static void mtp_invalidate_cached_draft(common_speculative_state_mtp & state, llama_seq_id seq_id) {
+    if (state.pending_accept_by_seq.erase(seq_id) > 0) {
+        // The output buffers are no longer needed, but the queued update must
+        // finish before this context can be cleared or repurposed.
+        llama_synchronize(state.ctx_mtp);
+    }
     auto it = state.draft_cache_by_seq.find(seq_id);
     if (it == state.draft_cache_by_seq.end()) {
         return;
@@ -2808,6 +2857,10 @@ static void mtp_invalidate_cached_draft(common_speculative_state_mtp & state, ll
 }
 
 static void mtp_invalidate_cached_drafts(common_speculative_state_mtp & state) {
+    if (!state.pending_accept_by_seq.empty()) {
+        llama_synchronize(state.ctx_mtp);
+        state.pending_accept_by_seq.clear();
+    }
     for (auto & entry : state.draft_cache_by_seq) {
         entry.second.last_id = -1;
         entry.second.prob = 0.0f;
@@ -2843,6 +2896,7 @@ static bool mtp_model_uses_recurrent_conditioning(const common_speculative_state
 }
 
 static void mtp_clear_target_hidden(common_speculative_state_mtp & state, llama_seq_id seq_id) {
+    mtp_invalidate_cached_draft(state, seq_id);
     state.target_hidden_by_seq.erase(seq_id);
     state.draft_cache_by_seq.erase(seq_id);
 }
@@ -2954,6 +3008,13 @@ static int32_t mtp_accept_batch(
         return 0;
     }
 
+    // A sequence cannot receive another accepted update before its next
+    // drafting round has consumed the previous output.
+    if (state.pending_accept_by_seq.find(seq_id) != state.pending_accept_by_seq.end() &&
+            !mtp_finalize_pending_accept(state, seq_id)) {
+        return -1;
+    }
+
     const size_t hidden_rows_floats = (size_t) accepted_batch.n_tokens * state.n_embd;
     if (!llama_set_draft_input_hidden_state_copy(state.ctx_mtp, hidden_rows, hidden_rows_floats)) {
         return -1;
@@ -2972,17 +3033,37 @@ static int32_t mtp_accept_batch(
         return 0;
     }
 
+    // Do not immediately synchronize this private context for its last
+    // embedding/logits.  With multiple server slots, enqueue every accepted
+    // update first and consume its output at the next draft boundary.  This
+    // turns the formerly serial post-decode bubbles into backend work that can
+    // overlap other slots and target recurrent restores.
+    state.pending_accept_by_seq[seq_id] = { accepted_batch.n_tokens };
+    return 0;
+}
+
+static bool mtp_finalize_pending_accept(
+        common_speculative_state_mtp & state,
+        llama_seq_id seq_id) {
+    const auto pending_it = state.pending_accept_by_seq.find(seq_id);
+    if (pending_it == state.pending_accept_by_seq.end()) {
+        return true;
+    }
+
+    const int32_t output_index = pending_it->second.n_tokens - 1;
     auto & last = mtp_get_last_embd(state, seq_id);
-    const float * embd = llama_get_embeddings_ith(state.ctx_mtp, accepted_batch.n_tokens - 1);
+    const float * embd = llama_get_embeddings_ith(state.ctx_mtp, output_index);
     if (embd != nullptr) {
         std::memcpy(last.embd.data(), embd, last.embd.size() * sizeof(float));
         if (!llama_set_draft_input_hidden_state_copy(state.ctx_mtp, last.embd.data(), last.embd.size())) {
-            return -1;
+            state.pending_accept_by_seq.erase(pending_it);
+            return false;
         }
-        last.last_id = common_sampler_sample_speculative(nullptr, state.ctx_mtp, accepted_batch.n_tokens - 1, &last.prob);
+        last.last_id = common_sampler_sample_speculative(nullptr, state.ctx_mtp, output_index, &last.prob);
     }
 
-    return 0;
+    state.pending_accept_by_seq.erase(pending_it);
+    return embd != nullptr;
 }
 
 int32_t common_speculative_on_target_batch(

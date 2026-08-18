@@ -312,6 +312,8 @@ struct server_context {
 
     void copy_data_to_cached_prompt(const server_tokens& tokens, server_slot& slot);
 
+    void prepare_slot_prompt_cache(server_slot& slot, const server_task& task);
+
     server_slot* get_available_slot(const server_task& task);
 
     int32_t populate_vocab_pieces();

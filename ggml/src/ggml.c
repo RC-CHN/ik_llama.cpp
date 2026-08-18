@@ -23160,6 +23160,16 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     // For now we do not implement sinks in the iqk FA implementation
     // DSV4 marks its FA nodes with the shared generic-FA backend hint.
     const bool use_iqk_fa = dst->op_params[4] != GGML_FLASH_ATTN_EXT_IQK_DISABLED;
+    if (use_iqk_fa && ith == 0) {
+        const size_t iqk_work_size = iqk_fa_work_buffer_size(dst, nth);
+        if (iqk_work_size > params->wsize) {
+            fprintf(stderr,
+                    "iqk_fa: work buffer too small for %s: required=%zu available=%zu "
+                    "threads=%d q_tokens=%lld\n",
+                    dst->name, iqk_work_size, params->wsize, nth, (long long) q->ne[1]);
+            GGML_ABORT("IQK flash-attention work buffer is smaller than its runtime layout");
+        }
+    }
     if (use_iqk_fa && iqk_flash_attn_noalibi(q->type, mask ? mask->type : GGML_TYPE_F16, max_bias,
                 q->ne[3], q->ne[2], q->nb[3], q->nb[2],
                 k->ne[3], k->ne[2], k->nb[3], k->nb[2],

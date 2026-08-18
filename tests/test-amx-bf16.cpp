@@ -337,6 +337,48 @@ bool run_fa_sparse_page_case(int n_tokens, int nk) {
     return true;
 }
 
+bool run_fa_work_buffer_case() {
+    ggml_tensor q   = {};
+    ggml_tensor k   = {};
+    ggml_tensor v   = {};
+    ggml_tensor dst = {};
+
+    q.type = GGML_TYPE_F32;
+    k.type = GGML_TYPE_BF16;
+    v.type = GGML_TYPE_BF16;
+    q.ne[0] = 256;
+    q.ne[1] = 10;
+    q.ne[2] = 24;
+    q.ne[3] = 1;
+    k.ne[0] = v.ne[0] = 256;
+    k.ne[1] = v.ne[1] = 128;
+    k.ne[2] = v.ne[2] = 4;
+    k.ne[3] = v.ne[3] = 1;
+    dst.src[0] = &q;
+    dst.src[1] = &k;
+    dst.src[2] = &v;
+    dst.op_params[5] = 1;   // return online-softmax statistics
+    dst.op_params[6] = 4;   // NUMA shards
+    dst.op_params[7] = 128; // cold-cache capacity
+    dst.op_params[8] = 1;   // return one partial per NUMA shard
+
+    constexpr size_t group_plan_bytes = 128;
+    constexpr size_t partial_ptr_bytes = 52*sizeof(float *);
+    constexpr size_t row_bytes = 24*256*sizeof(float);
+    constexpr size_t narrow_bytes = group_plan_bytes + 5*row_bytes + partial_ptr_bytes;
+    constexpr size_t wide_bytes   = group_plan_bytes + 10*row_bytes + partial_ptr_bytes;
+    const size_t actual = iqk_fa_work_buffer_size(&dst, 52);
+    if (actual != narrow_bytes && actual != wide_bytes) {
+        std::fprintf(stderr,
+            "NUMA FA work-buffer planner mismatch: expected %zu or %zu bytes, got %zu\n",
+            narrow_bytes, wide_bytes, actual);
+        return false;
+    }
+    std::printf("PASS NUMA FA work-buffer planner: %zu bytes (%s query groups)\n",
+        actual, actual == wide_bytes ? "wide" : "narrow");
+    return true;
+}
+
 int run_benchmark() {
     constexpr matrix_case tc = { 512, 128, 4096, 1 };
     std::mt19937 rng(0x9470cu);
@@ -466,6 +508,122 @@ int run_fa_page_benchmark() {
     return 0;
 }
 
+int run_fa_group_benchmark(int n_tokens, int nk, int iterations, bool disjoint_masks = false) {
+    constexpr int d = 256;
+    constexpr int gqa = 6;
+    if (n_tokens < 2 || n_tokens > 10 || n_tokens % 2 != 0 ||
+            nk < 32 || nk % 32 != 0 || iterations < 1) {
+        std::fprintf(stderr,
+            "query-group benchmark requires even tokens in [2,10], nk divisible by 32, and iterations > 0\n");
+        return 2;
+    }
+    const int nq = n_tokens*gqa;
+
+    std::vector<float> q(static_cast<size_t>(nq)*d);
+    std::vector<ggml_bf16_t> k(static_cast<size_t>(nk)*d);
+    std::vector<ggml_bf16_t> v(static_cast<size_t>(nk)*d);
+    std::vector<ggml_fp16_t> mask(static_cast<size_t>(n_tokens)*nk,
+        ggml_fp32_to_fp16(0.0f));
+    if (disjoint_masks) {
+        // Model two independently growing slots sharing one physical KV
+        // cache: each half of the query cohort can see a disjoint half of K.
+        // This exercises per-page AMX query-tile pruning in the combined call.
+        const int half_tokens = n_tokens/2;
+        for (int token = 0; token < n_tokens; ++token) {
+            for (int ik = 0; ik < nk; ++ik) {
+                const bool visible = token < half_tokens ? ik < nk/2 : ik >= nk/2;
+                mask[(size_t) token*nk + ik] =
+                    ggml_fp32_to_fp16(visible ? 0.0f : -INFINITY);
+            }
+        }
+    }
+    for (size_t i = 0; i < q.size(); ++i) {
+        q[i] = 0.25f*std::sin(0.011f*static_cast<float>(i));
+    }
+    for (size_t i = 0; i < k.size(); ++i) {
+        k[i] = ggml_fp32_to_bf16(0.25f*std::cos(0.005f*static_cast<float>(i)));
+        v[i] = ggml_fp32_to_bf16(std::sin(0.017f*static_cast<float>(i)));
+    }
+
+    std::vector<float> combined(static_cast<size_t>(nq)*d);
+    std::vector<float> split(static_cast<size_t>(nq)*d);
+    std::vector<float> combined_m(nq), combined_s(nq), split_m(nq), split_s(nq);
+    const int mask_stride = nk*sizeof(ggml_fp16_t);
+
+    auto invoke = [&](bool one_group) {
+        if (one_group) {
+            return iqk_fa_256_256(
+                GGML_TYPE_BF16, GGML_TYPE_BF16, nq, nk,
+                d*sizeof(float), d*sizeof(ggml_bf16_t), d*sizeof(ggml_bf16_t),
+                -mask_stride, d, q.data(), k.data(), v.data(), mask.data(),
+                1.0f/std::sqrt(static_cast<float>(d)), 0.0f, combined.data(), nullptr, 0,
+                combined_m.data(), combined_s.data());
+        }
+
+        const int half_tokens = n_tokens/2;
+        const int half_nq = half_tokens*gqa;
+        for (int half = 0; half < 2; ++half) {
+            if (!iqk_fa_256_256(
+                    GGML_TYPE_BF16, GGML_TYPE_BF16, half_nq, nk,
+                    d*sizeof(float), d*sizeof(ggml_bf16_t), d*sizeof(ggml_bf16_t),
+                    -mask_stride, d,
+                    q.data() + (size_t) half*half_nq*d, k.data(), v.data(),
+                    mask.data() + (size_t) half*half_tokens*nk,
+                    1.0f/std::sqrt(static_cast<float>(d)), 0.0f,
+                    split.data() + (size_t) half*half_nq*d, nullptr, 0,
+                    split_m.data() + half*half_nq, split_s.data() + half*half_nq)) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    if (!invoke(true) || !invoke(false)) {
+        return 1;
+    }
+    float max_output_error = 0.0f;
+    float max_stats_relative_error = 0.0f;
+    for (size_t i = 0; i < combined.size(); ++i) {
+        max_output_error = std::max(max_output_error, std::abs(combined[i] - split[i]));
+    }
+    for (int i = 0; i < nq; ++i) {
+        max_stats_relative_error = std::max(max_stats_relative_error,
+            std::abs(combined_m[i] - split_m[i])/std::max(1.0f, std::abs(split_m[i])));
+        max_stats_relative_error = std::max(max_stats_relative_error,
+            std::abs(combined_s[i] - split_s[i])/std::max(1.0f, std::abs(split_s[i])));
+    }
+    const bool mismatch = max_output_error > 0.08f || max_stats_relative_error > 1.0e-3f;
+    if (mismatch) {
+        std::fprintf(stderr,
+            "BF16 FA query-group mismatch: output=%g stats_relative=%g\n",
+            max_output_error, max_stats_relative_error);
+    }
+
+    auto measure = [&](bool one_group) {
+        const auto begin = std::chrono::steady_clock::now();
+        for (int i = 0; i < iterations; ++i) {
+            if (!invoke(one_group)) {
+                return -1.0;
+            }
+        }
+        const auto end = std::chrono::steady_clock::now();
+        return 1e3*std::chrono::duration<double>(end - begin).count()/iterations;
+    };
+    const double combined_ms = measure(true);
+    const double split_ms = measure(false);
+    if (combined_ms <= 0.0 || split_ms <= 0.0) {
+        return 1;
+    }
+    std::printf("BF16 FA query-group benchmark pattern=%s tokens=%d nq=%d nk=%d: "
+        "combined=%.3f ms split=%.3f ms split/combined=%.2fx "
+        "output_error=%g stats_relative=%g%s\n",
+        disjoint_masks ? "disjoint" : "dense",
+        n_tokens, nq, nk, combined_ms, split_ms, split_ms/combined_ms,
+        max_output_error, max_stats_relative_error,
+        std::getenv("GGML_AMX_DISABLE") ? " (AMX disabled)" : " (AMX requested)");
+    return mismatch ? 1 : 0;
+}
+
 } // namespace
 
 int main(int argc, char ** argv) {
@@ -474,6 +632,15 @@ int main(int argc, char ** argv) {
     }
     if (argc == 2 && std::strcmp(argv[1], "--bench-fa-pages") == 0) {
         return run_fa_page_benchmark();
+    }
+    if (argc >= 2 && argc <= 5 &&
+            (std::strcmp(argv[1], "--bench-fa-groups") == 0 ||
+             std::strcmp(argv[1], "--bench-fa-disjoint") == 0)) {
+        const int tokens = argc >= 3 ? std::atoi(argv[2]) : 8;
+        const int nk = argc >= 4 ? std::atoi(argv[3]) : 4096;
+        const int iterations = argc >= 5 ? std::atoi(argv[4]) : 100;
+        return run_fa_group_benchmark(
+            tokens, nk, iterations, std::strcmp(argv[1], "--bench-fa-disjoint") == 0);
     }
 
     const matrix_case cases[] = {
@@ -488,7 +655,11 @@ int main(int argc, char ** argv) {
     if (!run_fa_case( 6, 64)) return 1; // q_step=8,  k_step=64
     if (!run_fa_case(12, 64)) return 1; // q_step=16, k_step=64
     if (!run_fa_case(30, 96)) return 1; // q_step=32, k_step=32
+    if (!run_fa_case(48, 64)) return 1; // q_step=64, k_step=64
     if (!run_fa_repeated_mask_case(5, 96)) return 1;
+    if (!run_fa_repeated_mask_case(8, 128)) return 1;
     if (!run_fa_sparse_page_case(3, 256)) return 1;
+    if (run_fa_group_benchmark(10, 256, 1, true) != 0) return 1;
+    if (!run_fa_work_buffer_case()) return 1;
     return 0;
 }

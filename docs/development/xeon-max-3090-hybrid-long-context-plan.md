@@ -1493,3 +1493,180 @@ scripts/run-hybrid-growth-benchmark.sh tmp/bench-growth200k
 `test-tokenizer-0-bert-bge` 的 vocab/期望 token 不一致，`test-chat-template` 的
 ChatGLM4 期望与实际输出存在尾部换行差异；它们不经过本次修改的调度、KV restore 或
 CPU flash-attention 路径。
+
+## 45 tok/s 双路性能档与 20 tok/s 三会话容量档（2026-08-19）
+
+本轮把验收目标提高为：两个约 128K 的并发请求各输出至少 2,048 token 时，系统聚合
+decode 不低于 45 tok/s；两个物理 slot 服务三个约 200K 的逻辑会话、每个会话累计输出
+至少 2,048 token 时，系统总体不低于 20 tok/s。两个目标均已达到。
+
+这里继续区分三个口径，避免把单请求 timing 相加或把磁盘切换时间藏掉：
+
+- `service_output_tps = 所有有效输出 token / 整个工作负载墙钟`，包含 prompt、会话切换、
+  磁盘 save/load 和客户端调度开销；
+- `service_decode_union_tps = 所有输出 token / 至少一个请求正在 decode 的时间并集`；
+- `service_decode_window_tps = 所有输出 token / 首次 decode 开始至最后一次 decode 结束`，
+  因而保留波次之间的空泡。
+
+### 最终结果
+
+| 档位 | 正式记录 | 输出 | 完整服务 | decode window | decode union |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 128K 双路，自适应 hot-window | `tmp/bench-final-dual128k-auto-v89-20260819` | 2 × 2,048 | 49.830 | 50.317 | **50.317 tok/s** |
+| 200K，2 slot / 3 session | `tmp/bench-final-round-robin-3x200k-v85-20260819` | 3 × 2,048 | **20.783** | **20.866** | **23.828 tok/s** |
+
+128K v89 的两个 prompt 都约为 128,026 token，slot-state restore 后各只补算 5 token；
+单请求 decode 为 25.158/25.933 tok/s，请求结束偏差 2.429 s。总墙钟 82.200 s，峰值
+VRAM 22,066 MiB，GPU 平均/P50/P95 利用率为 64.09/65/78.05%，PCIe RX 平均/P95/
+峰值为 1.61/2.56/2.93 GiB/s。相对 45 tok/s 目标高 11.81%，相对历史 128K 单路
+34.45 tok/s 高约 46.06%。全程无 OOM、完整 prompt 重算、KV retry、restore failure，
+两路各完整返回 2,048 token。
+
+200K v85 使用 `AB -> CB -> CA` 三个 decode 波次；每个会话在两个波次中各输出
+1,024 token，而不是要求三路同时驻留或严格锁步。最终客户端上下文为
+202,075/202,072/202,088 token。6,144 token 的总墙钟为 295.626 s；三个
+`each_session_output_complete`、prefix-reuse、完整服务、decode-window 和 decode-union
+gate 全部通过。峰值 VRAM 22,684 MiB；没有 OOM、完整重算、KV retry、restore failure
+或 ENOSPC。
+
+这套容量测试复用了此前实际生成的
+`tmp/slot-state-dual200k-v70`。v70 从输入文本实际处理两路 200,027-token prompt，保存
+可恢复 state；v85 再把第三个逻辑会话引入两个物理 slot，并让 A 在被换出后从磁盘恢复。
+因此不是只伪造一个长度数字。A 的 201,050-token live tail 写盘约 13,019.868 MiB，
+流式写入 12.295 s（完整 save 12.361 s），恢复 5.609 s；缓存峰值 12.715 GiB。A
+恢复后只补算 1 token，没有退化成 200K 全量 prefill。
+
+### 这轮消掉的空泡
+
+128K 从本轮较早的 v68 `48.117 tok/s` 提升到 v89 `50.317 tok/s`，主要来自以下可组合
+的改动：
+
+- MTP accepted-state 更新不再在每个 slot 的 commit 尾部立即同步。多个私有 MTP
+  context 先排队，下一次 draft 边界才读取输出；target recurrent per-step restore 也可
+  依靠同一 backend stream 的顺序性延迟同步。这样一个 slot 的小图/复制可与另一个 slot
+  的工作重叠。
+- decode scheduler 分开记录 schedule、draft、batch preparation、checkpoint、target、
+  sync、sample、commit、hidden readback、state restore 和 MTP update 时间；深度 arm
+  使用自己的局部标准误差，而不让一个高噪声 arm 的方差长期抬高所有候选。宽度控制器
+  可在已经覆盖本地动作空间后只 exploit 当前最优点。
+- CPU BF16 flash-attention 的 query grouping、宽/窄 worker 形态和有效 mask tile 由实际
+  行数、NUMA worker 数与在线耗时选择；全 masked page 继续被数学上精确跳过。
+
+v89 的纯 decode 低开销 profile 中，每轮平均约为 target `152.129 ms`、draft
+`13.466 ms`、post `11.513 ms`，总计 `177.141 ms`。target 图仍占约 85.9%，说明当前
+主要余量已经从磁盘/调度控制转移到 target CUDA 图、CPU-cold/GPU-hot merge 和图间同步。
+
+200K 的关键 A/B 也支持“并发用于填空泡”而非“退回单槽排队”：output projection 放回
+GPU 后，双路 depth-1 从 18.328 提高到 21.228 tok/s；ubatch 256 -> 128 为
+21.373 tok/s；hot ring 降到最小 256 后为 21.630 tok/s。同一布局单路 depth-1/4 只有
+13.745/16.846 tok/s。104 个 SMT thread 反而只有 16.739 tok/s，因此最终仍使用 52 个
+物理核。v85 在真实换入换出和磁盘开销存在时仍给出 20.783 tok/s 的完整服务吞吐。
+
+### 显存容量只能给上界，吞吐反馈决定工作点
+
+`scripts/derive-hybrid-capacity.py` 不包含模型、机器或上下文查表。它从上一轮日志读取
+hot-ring 的实测 bytes/token，从 GPU telemetry 计算：
+
+```text
+baseline_peak = measured_peak - current_hot_tokens * measured_bytes_per_token
+capacity_hot  = align_down((total_vram - baseline_peak - reserve) / bytes_per_token)
+```
+
+其中 reserve fraction 可由 runner 配置，block/ubatch 对齐来自当前运行时参数。选择器还会
+沿 `capacity_profile` 链，只比较 model、server binary、workload、并发、KV 类型、MTP、
+batch 和上下文 envelope 一致且通过正确性/稳定性 gate 的结果；达到目标后 exploit
+实测最佳点，未达到时才在安全区间内提出新的 block-aligned 探索点。
+
+这不是纸面策略，v88 给出了必要的负例。仅按容量把 22,528 hot token 扩到 31,744 后，
+VRAM 虽仍安全（峰值 22,666 MiB），decode union 却从 v87 的 48.892 降至
+39.145 tok/s：GPU 平均利用率从 65.24% 升至 76.48%，但 PCIe RX 平均从 1.59 降至
+1.42 GiB/s，更多 attention 被移到已经成为临界路径的 GPU，CPU/HBM 侧反而空闲。
+v89 根据 v87/v88 的兼容观测和 45 tok/s SLA 自动选择 22,528，而容量上界仍单独记录为
+30,720；实测恢复并提升到 50.317 tok/s。`capacity-plan.json` 保存选择原因、候选、拒绝
+原因、显存基线、每 token 字节数和 reserve，后续可继续做闭环探索。
+
+### 显式槽位缓存与生命周期调度
+
+早期 round-robin v80/v81 暴露了两个与吞吐无关但会破坏生产语义的问题：指定
+`id_slot` 的请求绕过了自动 LRU 路径的 prompt-cache save/load；而 hybrid state 若在
+checkpoint 创建时立即复制完整 200K tail，会让仍驻留的请求也付出十几 GiB 的同步快照
+成本。
+
+现在显式槽和自动槽共用 `prepare_slot_prompt_cache()`。hybrid checkpoint 只记录与 live
+state 一致的位置/元数据，真正发生 displacement 且逻辑会话以后还会回来时才把精确 live
+tail 流式写盘。请求字段 `cache_prompt_preserve` 默认为兼容旧客户端的 `true`；生产驱动
+根据剩余调度队列动态计算 liveness，已经退休的会话发送 `false`，避免无用写盘。v85
+六次请求中只有会再次返回的 A 触发一次大 snapshot，其他被替换的终态均不保存。
+
+`scripts/summarize-hybrid-growth.py` 汇总 preserve/retire、load/save、lazy stream 次数和
+延迟；runner 还保存每 1--2 秒 GPU、PCIe、进程 I/O/RSS/CPU、Prometheus、NUMA、磁盘
+占用、逐请求事件、slot-state 动作、最终 slot、源代码 diff 以及二进制/脚本 hash。
+
+### 为什么此时仍不直接移植完整 PagedAttention
+
+vLLM 式 block table 对更高会话密度、copy-on-write prefix sharing 和长期碎片治理仍有
+价值，但本轮结果进一步说明它不是 45/20 tok/s 的首要缺口：Qwen3Next 的正确状态同时
+跨 canonical CPU-HBM KV、GPU hot ring、position-sensitive recurrent state、MTP
+per-step checkpoint 和磁盘 snapshot。只把 target K/V 分页，既不能合并私有 MTP 小图，
+也不能消除 recurrent restore 与 hidden-state readback。
+
+本轮采用的是较小且可验证的细粒度调度：attention 内按 mask/page 精确跳过，server 外按
+逻辑会话 liveness 形成 `AB -> CB -> CA` decode quantum，磁盘只在真正 displacement 时
+落盘。等生产目标变为更多长期前缀共享，统一 block table 必须同时覆盖上述五个状态域，
+否则容易得到“KV 可移动但 recurrent/MTP 不可恢复”的半套实现。
+
+### 仍有价值的下一步
+
+当前仍有优化空间，但优先级已经很清楚：
+
+1. 128K/200K 的 target 阶段分别占纯 decode iteration 约 85.9%/90.7%。优先尝试跨 slot
+   target microbatch、CUDA graph 复用、merge 融合或更早提交 CPU-cold partial，而不是
+   再扩大 GPU hot ring。
+2. 200K 每轮平均 post 约 12.879 ms，其中 commit 7.405 ms；继续把 recurrent restore、
+   accepted hidden update 与下一 slot target/draft 流水化，仍可能回收数个百分点。
+3. 13 GiB snapshot 的 12.3 s 写盘会伤害完整服务吞吐。下一步可做异步、分块、限速的
+   snapshot writer，并以队列 backpressure 保证一致性；不能重新引入每 checkpoint eager
+   copy。
+4. 只有当会话数和共享前缀使 HBM fragmentation/copy 成为主要成本时，再实施统一的
+   paged state allocator，并用现在的 union/window、restore guard 和硬件 telemetry 做 A/B。
+
+### 复现命令
+
+128K 自适应性能档（profile 链中的目录可以换成同构的上一轮正式结果）：
+
+```bash
+BENCH_WORKLOAD=growth \
+BENCH_CTX_SIZE=262144 BENCH_DRAFT_CTX=131072 \
+BENCH_PARALLEL=2 BENCH_SESSIONS=2 BENCH_STICKY_SLOTS=1 \
+BENCH_BATCH_SIZE=512 BENCH_UBATCH_SIZE=256 \
+BENCH_HOT_TOKENS=auto BENCH_HYBRID_BLOCK=256 \
+BENCH_CAPACITY_PROFILE=tmp/bench-final-dual128k-auto-v88-20260819 \
+BENCH_THROUGHPUT_TARGET=45 \
+BENCH_GPU_LAYERS=99 BENCH_MTP_MAX=10 BENCH_MTP_ADAPTIVE=1 \
+BENCH_MILESTONES=128000 BENCH_DECODE_TOKENS=2048 BENCH_FINAL_DECODE_TOKENS=2048 \
+BENCH_CACHE_TYPE_K=bf16 BENCH_CACHE_TYPE_V=bf16 \
+BENCH_CACHE_TYPE_K_DRAFT=q8_0 BENCH_CACHE_TYPE_V_DRAFT=q8_0 \
+BENCH_CACHE_RAM=0 BENCH_CACHE_DISK=26000 BENCH_MEMORY_MAX=46G \
+BENCH_CACHE_DIR=/mnt/optane-tmp-stage/ik-prompt-cache-dual128k \
+BENCH_SLOT_STATE_DIR=tmp/slot-state-dual128k-v55 BENCH_SLOT_STATE_ACTION=restore \
+scripts/run-hybrid-growth-benchmark.sh tmp/bench-dual128k-auto
+```
+
+200K 三会话终端容量档（`slot-state` 由前置真实增长阶段产生）：
+
+```bash
+BENCH_WORKLOAD=round-robin-decode \
+BENCH_CTX_SIZE=409600 BENCH_DRAFT_CTX=204800 \
+BENCH_PARALLEL=2 BENCH_SESSIONS=3 BENCH_STICKY_SLOTS=0 \
+BENCH_BATCH_SIZE=512 BENCH_UBATCH_SIZE=128 \
+BENCH_HOT_TOKENS=auto BENCH_HYBRID_BLOCK=256 \
+BENCH_GPU_LAYERS=66 BENCH_MTP_MAX=8 BENCH_MTP_ADAPTIVE=1 \
+BENCH_ROUND_CONTEXT=200000 BENCH_ROUND_DECODE_TOKENS=2048 \
+BENCH_ROUND_THROUGHPUT_TARGET=20 \
+BENCH_CACHE_TYPE_K=bf16 BENCH_CACHE_TYPE_V=bf16 \
+BENCH_CACHE_TYPE_K_DRAFT=q8_0 BENCH_CACHE_TYPE_V_DRAFT=q8_0 \
+BENCH_CACHE_RAM=0 BENCH_CACHE_DISK=40000 BENCH_MEMORY_MAX=46G \
+BENCH_CACHE_DIR=/mnt/optane-tmp-stage/ik-prompt-cache-round \
+BENCH_SLOT_STATE_DIR=tmp/slot-state-dual200k-v70 BENCH_SLOT_STATE_ACTION=bootstrap \
+scripts/run-hybrid-growth-benchmark.sh tmp/bench-round-robin-3x200k
+```

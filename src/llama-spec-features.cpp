@@ -59,7 +59,12 @@ static bool llama_spec_prepare_hidden_feature_view(
         return false;
     }
 
-    llama_synchronize(ctx);
+    // A completed decode clears n_queued_tokens.  In that state the host
+    // embedding rows are already materialized; avoid synchronizing unrelated
+    // stream-ordered recurrent restore copies queued between slot commits.
+    if (ctx->n_queued_tokens > 0) {
+        llama_synchronize(ctx);
+    }
 
     if (ctx->embd == nullptr) {
         return false;

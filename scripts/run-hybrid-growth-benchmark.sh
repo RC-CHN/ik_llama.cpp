@@ -22,7 +22,12 @@ sessions=${BENCH_SESSIONS:-2}
 draft_ctx=${BENCH_DRAFT_CTX:-204800}
 batch_size=${BENCH_BATCH_SIZE:-512}
 ubatch_size=${BENCH_UBATCH_SIZE:-256}
-hot_tokens=${BENCH_HOT_TOKENS:-8192}
+hot_tokens_requested=${BENCH_HOT_TOKENS:-auto}
+hot_tokens=$hot_tokens_requested
+hybrid_block=${BENCH_HYBRID_BLOCK:-256}
+capacity_profile=${BENCH_CAPACITY_PROFILE:-}
+gpu_headroom_fraction=${BENCH_GPU_HEADROOM_FRACTION:-0.0625}
+throughput_target=${BENCH_THROUGHPUT_TARGET:-}
 mtp_max=${BENCH_MTP_MAX:-4}
 request_mtp_max=${BENCH_REQUEST_MTP_MAX:-}
 mtp_adaptive=${BENCH_MTP_ADAPTIVE:-1}
@@ -35,17 +40,91 @@ sticky_slots=${BENCH_STICKY_SLOTS:-1}
 cache_ram=${BENCH_CACHE_RAM:-0}
 cache_disk=${BENCH_CACHE_DISK:-0}
 cache_dir=${BENCH_CACHE_DIR:-}
+slot_state_dir=${BENCH_SLOT_STATE_DIR:-}
+slot_state_action=${BENCH_SLOT_STATE_ACTION:-none}
 cache_type_k=${BENCH_CACHE_TYPE_K:-q8_0}
 cache_type_v=${BENCH_CACHE_TYPE_V:-q8_0}
 cache_type_k_draft=${BENCH_CACHE_TYPE_K_DRAFT:-q8_0}
 cache_type_v_draft=${BENCH_CACHE_TYPE_V_DRAFT:-q8_0}
 memory_max=${BENCH_MEMORY_MAX:-46G}
+threads=${BENCH_THREADS:-}
+cpu_bind=${BENCH_CPU_BIND:-}
 model_sha256=${BENCH_MODEL_SHA256:-7e78da5d7e3ae28d178121f58646953305f3e5bd3cb46f4a75584e8b6c6fe169}
 decode_sweep_context=${BENCH_SWEEP_CONTEXT:-40000}
 decode_sweep_depths=${BENCH_SWEEP_DEPTHS:-0,2,3,4,5,6,8}
 decode_sweep_modes=${BENCH_SWEEP_MODES:-concurrent,serial}
 decode_sweep_warmup=${BENCH_SWEEP_WARMUP:-16}
 decode_sweep_concurrency_levels=${BENCH_SWEEP_CONCURRENCY_LEVELS:-}
+decode_sweep_prompt_template=${BENCH_SWEEP_PROMPT_TEMPLATE:-resident-sweep}
+round_robin_context=${BENCH_ROUND_CONTEXT:-200000}
+round_robin_decode_tokens=${BENCH_ROUND_DECODE_TOKENS:-2048}
+round_robin_throughput_target=${BENCH_ROUND_THROUGHPUT_TARGET:-20}
+numa_fa_wide_query_groups=${BENCH_NUMA_FA_WIDE_QUERY_GROUPS:-auto}
+capacity_plan_json=
+capacity_plan_sha256=
+
+if [[ -z "$throughput_target" && "$workload" == round-robin-decode ]]; then
+    throughput_target=$round_robin_throughput_target
+fi
+
+if [[ ! "$hybrid_block" =~ ^[0-9]+$ || ! "$ubatch_size" =~ ^[0-9]+$ ]] ||
+        (( hybrid_block <= 0 || ubatch_size <= 0 )); then
+    printf 'hybrid block and ubatch must be positive integers: block=%s ubatch=%s\n' \
+        "$hybrid_block" "$ubatch_size" >&2
+    exit 2
+fi
+
+if [[ "$hot_tokens" == auto ]]; then
+    hot_tokens=$(( (ubatch_size + hybrid_block - 1) / hybrid_block * hybrid_block ))
+    if [[ -n "$capacity_profile" ]]; then
+        capacity_args=("$capacity_profile" --ubatch "$ubatch_size" \
+            --block "$hybrid_block" --headroom-fraction "$gpu_headroom_fraction" \
+            --max-tokens "$ctx_size")
+        if [[ -n "$throughput_target" ]]; then
+            capacity_args+=(--throughput-target "$throughput_target")
+        fi
+        capacity_plan_json=$(python3 scripts/derive-hybrid-capacity.py \
+            "${capacity_args[@]}" --json)
+        hot_tokens=$(python3 scripts/derive-hybrid-capacity.py "${capacity_args[@]}")
+    fi
+fi
+
+if [[ -z "$threads" ]]; then
+    mapfile -t physical_cpus < <(
+        lscpu -p=CPU,CORE,SOCKET | awk -F, '
+            $1 !~ /^#/ {
+                key = $3 ":" $2
+                if (!(key in seen)) {
+                    seen[key] = 1
+                    print $1
+                }
+            }'
+    )
+    threads=${#physical_cpus[@]}
+    cpu_bind=$(IFS=,; printf '%s' "${physical_cpus[*]}")
+elif [[ -z "$cpu_bind" ]]; then
+    mapfile -t online_cpus < <(lscpu -p=CPU | awk -F, '$1 !~ /^#/ { print $1 }')
+    if (( threads > ${#online_cpus[@]} )); then
+        printf 'BENCH_THREADS=%s exceeds %s online CPUs\n' "$threads" "${#online_cpus[@]}" >&2
+        exit 2
+    fi
+    selected_cpus=("${online_cpus[@]:0:threads}")
+    cpu_bind=$(IFS=,; printf '%s' "${selected_cpus[*]}")
+fi
+if (( threads <= 0 )); then
+    printf 'benchmark worker count must be positive, got: %s\n' "$threads" >&2
+    exit 2
+fi
+if [[ ! "$hot_tokens" =~ ^[0-9]+$ ]]; then
+    printf 'resolved hot ring must be a positive integer: hot=%s\n' "$hot_tokens" >&2
+    exit 2
+fi
+if (( hybrid_block <= 0 || hot_tokens <= 0 || hot_tokens % hybrid_block != 0 ||
+        hot_tokens < ubatch_size )); then
+    printf 'resolved hot ring must be block-aligned and at least ubatch: hot=%s block=%s ubatch=%s\n' \
+        "$hot_tokens" "$hybrid_block" "$ubatch_size" >&2
+    exit 2
+fi
 
 if [[ ! -f "$model" ]]; then
     printf 'model not found: %s\n' "$model" >&2
@@ -63,8 +142,35 @@ if [[ "$mtp_adaptive" != 0 && "$mtp_adaptive" != 1 ]]; then
     printf 'BENCH_MTP_ADAPTIVE must be 0 or 1, got: %s\n' "$mtp_adaptive" >&2
     exit 2
 fi
+if [[ "$numa_fa_wide_query_groups" != auto &&
+        "$numa_fa_wide_query_groups" != 0 && "$numa_fa_wide_query_groups" != 1 ]]; then
+    printf 'BENCH_NUMA_FA_WIDE_QUERY_GROUPS must be auto, 0, or 1, got: %s\n' \
+        "$numa_fa_wide_query_groups" >&2
+    exit 2
+fi
+if [[ "$slot_state_action" != none && "$slot_state_action" != save &&
+        "$slot_state_action" != restore && "$slot_state_action" != restore-save &&
+        "$slot_state_action" != bootstrap ]]; then
+    printf 'BENCH_SLOT_STATE_ACTION must be none, save, restore, restore-save, or bootstrap, got: %s\n' \
+        "$slot_state_action" >&2
+    exit 2
+fi
+if [[ "$slot_state_action" != none && -z "$slot_state_dir" ]]; then
+    printf 'BENCH_SLOT_STATE_DIR is required when BENCH_SLOT_STATE_ACTION=%s\n' \
+        "$slot_state_action" >&2
+    exit 2
+fi
 if [[ "$sticky_slots" == 1 && "$sessions" -gt "$parallel" ]]; then
     printf 'sticky sessions (%s) cannot exceed physical slots (%s)\n' "$sessions" "$parallel" >&2
+    exit 2
+fi
+if [[ "$slot_state_action" != none && "$slot_state_action" != bootstrap &&
+        "$sticky_slots" != 1 ]]; then
+    printf 'slot state save/restore requires BENCH_STICKY_SLOTS=1\n' >&2
+    exit 2
+fi
+if [[ "$slot_state_action" == bootstrap && "$sticky_slots" != 0 ]]; then
+    printf 'slot state bootstrap requires BENCH_STICKY_SLOTS=0\n' >&2
     exit 2
 fi
 
@@ -72,6 +178,10 @@ mkdir -p "$result_dir"
 if [[ -n "$(find "$result_dir" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
     printf 'result directory is not empty: %s\n' "$result_dir" >&2
     exit 2
+fi
+if [[ -n "$capacity_plan_json" ]]; then
+    printf '%s\n' "$capacity_plan_json" > "$result_dir/capacity-plan.json"
+    capacity_plan_sha256=$(sha256sum "$result_dir/capacity-plan.json" | cut -d' ' -f1)
 fi
 
 # The benchmark frequently evaluates an uncommitted optimization.  Capture the
@@ -84,6 +194,8 @@ server_binary_sha256=$(sha256sum build-cuda/bin/llama-server | cut -d' ' -f1)
 runner_sha256=$(sha256sum scripts/run-hybrid-growth-benchmark.sh | cut -d' ' -f1)
 growth_driver_sha256=$(sha256sum scripts/bench-hybrid-growth.py | cut -d' ' -f1)
 decode_sweep_driver_sha256=$(sha256sum scripts/bench-hybrid-decode-sweep.py | cut -d' ' -f1)
+round_robin_driver_sha256=$(sha256sum scripts/bench-hybrid-round-robin-decode.py | cut -d' ' -f1)
+capacity_driver_sha256=$(sha256sum scripts/derive-hybrid-capacity.py | cut -d' ' -f1)
 summarizer_sha256=$(sha256sum scripts/summarize-hybrid-growth.py | cut -d' ' -f1)
 
 pid_file=$result_dir/server.pid
@@ -114,15 +226,20 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT TERM
 
+server_env=(GGML_NUMA_ROW_SHARD=1 GGML_NUMA_FA_BATCH_QUERIES=1)
+if [[ "$numa_fa_wide_query_groups" != auto ]]; then
+    server_env+=("GGML_NUMA_FA_WIDE_QUERY_GROUPS=$numa_fa_wide_query_groups")
+fi
+
 server_cmd=(
-    numactl --physcpubind=0-51 --interleave=0-3
-    env GGML_NUMA_ROW_SHARD=1 GGML_NUMA_FA_BATCH_QUERIES=1
+    numactl --physcpubind="$cpu_bind" --interleave=0-3
+    env "${server_env[@]}"
     build-cuda/bin/llama-server
     --model "$model" --host 127.0.0.1 --port "$port"
     --ctx-size "$ctx_size" --batch-size "$batch_size" --ubatch-size "$ubatch_size"
     --parallel "$parallel" --ctx-size-draft "$draft_ctx"
-    --threads 52 --numa distribute --n-gpu-layers "$gpu_layers" --flash-attn on
-    --hybrid-kv --hybrid-kv-hot "$hot_tokens" --hybrid-kv-block 256
+    --threads "$threads" --numa distribute --n-gpu-layers "$gpu_layers" --flash-attn on
+    --hybrid-kv --hybrid-kv-hot "$hot_tokens" --hybrid-kv-block "$hybrid_block"
     --cache-type-k "$cache_type_k" --cache-type-v "$cache_type_v"
     --cache-type-k-draft "$cache_type_k_draft" --cache-type-v-draft "$cache_type_v_draft"
     --cache-ram "$cache_ram" --cache-disk "$cache_disk"
@@ -139,6 +256,24 @@ fi
 if [[ -n "$cache_dir" ]]; then
     mkdir -p "$cache_dir"
     server_cmd+=(--cache-disk-path "$cache_dir")
+fi
+if [[ "$slot_state_action" != none ]]; then
+    mkdir -p "$slot_state_dir"
+    if [[ "$slot_state_action" == save ]] &&
+            [[ -n "$(find "$slot_state_dir" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
+        printf 'slot state save directory is not empty: %s\n' "$slot_state_dir" >&2
+        exit 2
+    fi
+    if [[ "$slot_state_action" == restore || "$slot_state_action" == restore-save ||
+            "$slot_state_action" == bootstrap ]]; then
+        for id_slot in $(seq 0 $((parallel - 1))); do
+            if [[ ! -f "$slot_state_dir/slot-$id_slot.bin" ]]; then
+                printf 'slot state file not found: %s\n' "$slot_state_dir/slot-$id_slot.bin" >&2
+                exit 2
+            fi
+        done
+    fi
+    server_cmd+=(--slot-save-path "$slot_state_dir")
 fi
 
 systemd-run --user --quiet --scope -p "MemoryMax=$memory_max" -p MemorySwapMax=0 -- \
@@ -165,20 +300,41 @@ if [[ -z "$server_pid" ]] || ! kill -0 "$server_pid" 2>/dev/null; then
     exit 1
 fi
 
+if [[ "$slot_state_action" == restore || "$slot_state_action" == restore-save ||
+        "$slot_state_action" == bootstrap ]]; then
+    for id_slot in $(seq 0 $((parallel - 1))); do
+        printf '{"time":"%s","action":"restore","id_slot":%s,"response":' \
+            "$(date --iso-8601=seconds)" "$id_slot" >> "$result_dir/slot-state.jsonl"
+        curl --silent --show-error --fail-with-body --max-time 600 \
+            -H 'Content-Type: application/json' \
+            -d "{\"filename\":\"slot-$id_slot.bin\"}" \
+            "http://127.0.0.1:$port/slots/$id_slot?action=restore" \
+            >> "$result_dir/slot-state.jsonl"
+        printf '}\n' >> "$result_dir/slot-state.jsonl"
+    done
+fi
+
 {
     printf 'started_at=%s\n' "$(date --iso-8601=seconds)"
     printf 'revision=%s\n' "$(git rev-parse HEAD)"
     printf 'source_diff_sha256=%s\n' "$source_diff_sha256"
     printf 'server_binary_sha256=%s\n' "$server_binary_sha256"
-    printf 'runner_sha256=%s\ngrowth_driver_sha256=%s\ndecode_sweep_driver_sha256=%s\nsummarizer_sha256=%s\n' \
-        "$runner_sha256" "$growth_driver_sha256" "$decode_sweep_driver_sha256" "$summarizer_sha256"
+    printf 'runner_sha256=%s\ngrowth_driver_sha256=%s\ndecode_sweep_driver_sha256=%s\nround_robin_driver_sha256=%s\ncapacity_driver_sha256=%s\nsummarizer_sha256=%s\n' \
+        "$runner_sha256" "$growth_driver_sha256" "$decode_sweep_driver_sha256" \
+        "$round_robin_driver_sha256" "$capacity_driver_sha256" "$summarizer_sha256"
     printf 'server_pid=%s\n' "$server_pid"
     printf 'workload=%s\n' "$workload"
     printf 'milestones=%s\n' "$milestones"
     printf 'parallel=%s\nsessions=%s\nsticky_slots=%s\n' "$parallel" "$sessions" "$sticky_slots"
-    printf 'ctx_size=%s\ndraft_ctx=%s\nbatch_size=%s\nubatch_size=%s\nhot_tokens=%s\nmemory_max=%s\n' \
-        "$ctx_size" "$draft_ctx" "$batch_size" "$ubatch_size" "$hot_tokens" "$memory_max"
+    printf 'ctx_size=%s\ndraft_ctx=%s\nbatch_size=%s\nubatch_size=%s\n' \
+        "$ctx_size" "$draft_ctx" "$batch_size" "$ubatch_size"
+    printf 'hot_tokens_requested=%s\nhot_tokens=%s\nhybrid_block=%s\n' \
+        "$hot_tokens_requested" "$hot_tokens" "$hybrid_block"
+    printf 'capacity_profile=%s\ncapacity_plan_sha256=%s\ngpu_headroom_fraction=%s\nthroughput_target=%s\nmemory_max=%s\n' \
+        "$capacity_profile" "$capacity_plan_sha256" "$gpu_headroom_fraction" \
+        "$throughput_target" "$memory_max"
     printf 'cache_ram_mib=%s\ncache_disk_mib=%s\ncache_dir=%s\n' "$cache_ram" "$cache_disk" "$cache_dir"
+    printf 'slot_state_dir=%s\nslot_state_action=%s\n' "$slot_state_dir" "$slot_state_action"
     if [[ -n "$cache_dir" ]]; then
         df -B1 --output=size,avail,target "$cache_dir" | sed -n '2p' | \
             awk '{ printf "cache_filesystem_size_bytes=%s\ncache_filesystem_available_bytes=%s\ncache_filesystem_mount=%s\n", $1, $2, $3 }'
@@ -193,9 +349,13 @@ fi
     printf 'decode_sweep_context=%s\ndecode_sweep_depths=%s\ndecode_sweep_modes=%s\ndecode_sweep_warmup=%s\n' \
         "$decode_sweep_context" "$decode_sweep_depths" "$decode_sweep_modes" "$decode_sweep_warmup"
     printf 'decode_sweep_concurrency_levels=%s\n' "$decode_sweep_concurrency_levels"
+    printf 'decode_sweep_prompt_template=%s\n' "$decode_sweep_prompt_template"
+    printf 'round_robin_context=%s\nround_robin_decode_tokens=%s\nround_robin_throughput_target=%s\n' \
+        "$round_robin_context" "$round_robin_decode_tokens" "$round_robin_throughput_target"
     printf 'corpus_sha256='; sha256sum "$corpus" | cut -d' ' -f1
-    printf 'numa_physcpubind=0-51\nnuma_interleave=0-3\n'
+    printf 'threads=%s\nnuma_physcpubind=%s\nnuma_interleave=0-3\n' "$threads" "$cpu_bind"
     printf 'GGML_NUMA_ROW_SHARD=1\nGGML_NUMA_FA_BATCH_QUERIES=1\n'
+    printf 'GGML_NUMA_FA_WIDE_QUERY_GROUPS=%s\n' "$numa_fa_wide_query_groups"
     printf 'server_command='; printf '%q ' "${server_cmd[@]}"; printf '\n'
 } > "$result_dir/manifest.txt"
 
@@ -268,6 +428,12 @@ case "$workload" in
             --url "http://127.0.0.1:$port" --corpus "$corpus" --result-dir "$result_dir" \
             --milestones "$milestones" --decode-tokens "$decode_tokens" \
             --final-decode-tokens "$final_decode_tokens" --sessions "$sessions")
+        if [[ "$slot_state_action" == restore || "$slot_state_action" == restore-save ||
+                "$slot_state_action" == bootstrap ]]; then
+            required_initial_restores=$((sessions < parallel ? sessions : parallel))
+            driver_cmd+=(--slot-state-dir "$slot_state_dir" \
+                --required-initial-restores "$required_initial_restores")
+        fi
         if [[ "$sticky_slots" == 1 ]]; then
             driver_cmd+=(--sticky-slots)
         fi
@@ -284,9 +450,32 @@ case "$workload" in
             --url "http://127.0.0.1:$port" --corpus "$corpus" --result-dir "$result_dir" \
             --context-tokens "$decode_sweep_context" --decode-tokens "$decode_tokens" \
             --warmup-tokens "$decode_sweep_warmup" --depths "$decode_sweep_depths" \
-            --modes "$decode_sweep_modes" --sessions "$sessions")
+            --modes "$decode_sweep_modes" --sessions "$sessions" \
+            --prompt-template "$decode_sweep_prompt_template")
         if [[ -n "$decode_sweep_concurrency_levels" ]]; then
             driver_cmd+=(--concurrency-levels "$decode_sweep_concurrency_levels")
+        fi
+        ;;
+    round-robin-decode)
+        if [[ "$parallel" -ne 2 || "$sessions" -ne 3 ]]; then
+            printf 'round-robin-decode requires BENCH_PARALLEL=2 and BENCH_SESSIONS=3\n' >&2
+            exit 2
+        fi
+        if [[ "$slot_state_action" != bootstrap ]]; then
+            printf 'round-robin-decode requires BENCH_SLOT_STATE_ACTION=bootstrap\n' >&2
+            exit 2
+        fi
+        if [[ "$cache_disk" == 0 ]]; then
+            printf 'round-robin-decode requires a non-zero BENCH_CACHE_DISK\n' >&2
+            exit 2
+        fi
+        driver_cmd=(python3 -u scripts/bench-hybrid-round-robin-decode.py \
+            --url "http://127.0.0.1:$port" --corpus "$corpus" --result-dir "$result_dir" \
+            --slot-state-dir "$slot_state_dir" --context-tokens "$round_robin_context" \
+            --decode-tokens "$round_robin_decode_tokens" --physical-slots "$parallel" \
+            --sessions "$sessions" --throughput-target "$round_robin_throughput_target")
+        if [[ -n "$request_mtp_max" ]]; then
+            driver_cmd+=(--speculative-n-max "$request_mtp_max")
         fi
         ;;
     *)
@@ -297,6 +486,22 @@ esac
 "${driver_cmd[@]}" > "$result_dir/driver.log" 2>&1
 status=$?
 set -e
+
+if [[ ( "$slot_state_action" == save || "$slot_state_action" == restore-save ) &&
+        "$status" == 0 ]]; then
+    for id_slot in $(seq 0 $((parallel - 1))); do
+        printf '{"time":"%s","action":"save","id_slot":%s,"response":' \
+            "$(date --iso-8601=seconds)" "$id_slot" >> "$result_dir/slot-state.jsonl"
+        if ! curl --silent --show-error --fail-with-body --max-time 600 \
+                -H 'Content-Type: application/json' \
+                -d "{\"filename\":\"slot-$id_slot.bin\"}" \
+                "http://127.0.0.1:$port/slots/$id_slot?action=save" \
+                >> "$result_dir/slot-state.jsonl"; then
+            status=1
+        fi
+        printf '}\n' >> "$result_dir/slot-state.jsonl"
+    done
+fi
 
 curl --silent --max-time 5 "http://127.0.0.1:$port/slots" > "$result_dir/final-slots.json" || true
 python3 scripts/summarize-hybrid-growth.py "$result_dir" \

@@ -892,6 +892,14 @@ extern "C" {
             struct llama_context * ctx, llama_seq_id seq_id,
             llama_pos n_past, int accepted_step);
 
+    // Queue a direct per-step recurrent restore without synchronizing its
+    // backend.  The caller must synchronize the context before observing the
+    // restored state on the host; a subsequent decode on the same backend is
+    // stream-ordered after the copy.
+    LLAMA_API enum llama_spec_ckpt_restore_result llama_spec_ckpt_restore_ex_deferred(
+            struct llama_context * ctx, llama_seq_id seq_id,
+            llama_pos n_past, int accepted_step);
+
     // Discard the saved checkpoint and reset internal mode state.
     LLAMA_API void llama_spec_ckpt_discard(struct llama_context * ctx);
 

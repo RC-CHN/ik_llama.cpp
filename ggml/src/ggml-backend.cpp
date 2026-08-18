@@ -14,6 +14,7 @@
 #include <vector>
 #include <set>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <barrier>
 #include <condition_variable>
@@ -2352,6 +2353,8 @@ static bool ggml_backend_sched_copy_hybrid_cold_ready(
 
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
 
+    const int64_t compute_splits_start_us = ggml_time_us();
+
     for (auto & item : sched->needs_sync) item = true;
 
     if (sched->is_async && sched->n_backends > 2 && sched->split_mode_graph && sched->has_reduce) {
@@ -2617,6 +2620,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     size_t moe_enq   = 0; // moe_infos entries already enqueued for lookahead
 
     bool hybrid_pending = false;
+    int32_t hybrid_layers = 0;
+    int64_t hybrid_submit_us = 0;
+    int64_t hybrid_cold_compute_us = 0;
+    int64_t hybrid_pre_wait_us = 0;
+    int64_t hybrid_wait_us = 0;
+    int64_t hybrid_ready_us = 0;
     auto mark_split_inputs_in_use = [sched](ggml_backend_sched_split * split) {
         const int backend_id = split->backend_id;
         if (split->n_inputs > 0 && !sched->own_cpy[backend_id]) {
@@ -2634,9 +2643,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         if (!hybrid_pending) {
             return GGML_STATUS_SUCCESS;
         }
+        const int64_t wait_start_us = ggml_time_us();
+        if (hybrid_submit_us > 0) {
+            hybrid_pre_wait_us += std::max<int64_t>(0, wait_start_us - hybrid_submit_us);
+        }
         hybrid_pending = false;
         GGML_ASSERT(sched->hybrid_worker != nullptr);
-        return sched->hybrid_worker->wait();
+        const ggml_status status = sched->hybrid_worker->wait();
+        hybrid_wait_us += ggml_time_us() - wait_start_us;
+        hybrid_submit_us = 0;
+        return status;
     };
 
     for (int i = 0; i < sched->n_splits; i++) {
@@ -2695,7 +2711,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         // copy the input tensors to the split backend.  At the merge boundary,
         // keep the cold H2D transfer on the same stream as hot attention.
-        if (!hybrid_ready_copy || !ggml_backend_sched_copy_hybrid_cold_ready(sched, split)) {
+        bool copied_hybrid_ready = false;
+        if (hybrid_ready_copy) {
+            const int64_t ready_start_us = ggml_time_us();
+            copied_hybrid_ready = ggml_backend_sched_copy_hybrid_cold_ready(sched, split);
+            hybrid_ready_us += ggml_time_us() - ready_start_us;
+        }
+        if (!copied_hybrid_ready) {
             ggml_backend_sched_copy_inputs(sched, split, sched->needs_sync, ids, unique_ids, last_ids_tensor);
         }
 
@@ -2715,10 +2737,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 sched->hybrid_worker = new ggml_backend_sched_hybrid_worker();
                 fprintf(stderr, "ggml_backend_sched: hybrid CPU cold / GPU hot attention overlap enabled\n");
             }
-            sched->hybrid_worker->submit([sched, split_backend, split] {
-                return ggml_backend_sched_eval(sched, split_backend, split);
+            sched->hybrid_worker->submit([sched, split_backend, split, &hybrid_cold_compute_us] {
+                const int64_t cold_start_us = ggml_time_us();
+                const ggml_status status = ggml_backend_sched_eval(sched, split_backend, split);
+                hybrid_cold_compute_us += ggml_time_us() - cold_start_us;
+                return status;
             });
             hybrid_pending = true;
+            hybrid_submit_us = ggml_time_us();
+            ++hybrid_layers;
             continue;
         }
 
@@ -2749,6 +2776,20 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     const ggml_status hybrid_status = wait_hybrid();
     if (hybrid_status != GGML_STATUS_SUCCESS) {
         return hybrid_status;
+    }
+
+    if (hybrid_layers > 0) {
+        static std::atomic<uint64_t> hybrid_profile_graphs{0};
+        const uint64_t graph_index = hybrid_profile_graphs.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (graph_index <= 8 || graph_index % 64 == 0) {
+            fprintf(stderr,
+                    "ggml_backend_sched: hybrid profile graph=%llu layers=%d splits=%d "
+                    "cold_compute_us=%lld pre_wait_us=%lld wait_us=%lld ready_us=%lld total_us=%lld\n",
+                    (unsigned long long) graph_index, hybrid_layers, sched->n_splits,
+                    (long long) hybrid_cold_compute_us, (long long) hybrid_pre_wait_us,
+                    (long long) hybrid_wait_us, (long long) hybrid_ready_us,
+                    (long long) (ggml_time_us() - compute_splits_start_us));
+        }
     }
 
     sched->cur_copy = (sched->cur_copy + 1) % sched->n_copies;

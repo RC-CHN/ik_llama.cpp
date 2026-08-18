@@ -2589,7 +2589,7 @@ static void restore_recurrent_cache_tensors(int ssm_slot, int conv_slot, llama_s
 }
 
 bool llama_kv_cache::per_step_restore(const llama_model & model, ggml_backend_sched_t sched,
-        int step, llama_seq_id seq_id) {
+        int step, llama_seq_id seq_id, bool synchronize) {
     if (ckpt.per_step_ssm.empty() || step < 0) {
         LLAMA_LOG_ERROR("%s: unavailable checkpoint storage for seq_id=%d step=%d (layers=%zu)\n",
                 __func__, (int) seq_id, step, ckpt.per_step_ssm.size());
@@ -2668,9 +2668,10 @@ bool llama_kv_cache::per_step_restore(const llama_model & model, ggml_backend_sc
         }
     }
 
-    // TODO: do we need to synchronize here?
-    for (auto backend : backends_to_sync) {
-        ggml_backend_synchronize(backend);
+    if (synchronize) {
+        for (auto backend : backends_to_sync) {
+            ggml_backend_synchronize(backend);
+        }
     }
 
     return true;
@@ -10192,9 +10193,9 @@ bool llama_spec_ckpt_save(struct llama_context * ctx, llama_seq_id seq_id) {
     }
 }
 
-enum llama_spec_ckpt_restore_result llama_spec_ckpt_restore_ex(
+static enum llama_spec_ckpt_restore_result llama_spec_ckpt_restore_ex_impl(
         struct llama_context * ctx, llama_seq_id seq_id,
-        llama_pos n_past, int accepted_step) {
+        llama_pos n_past, int accepted_step, bool synchronize) {
     auto & kv = ctx->kv_self;
 
     switch (kv.ckpt.selected_spec_mode) {
@@ -10204,7 +10205,7 @@ enum llama_spec_ckpt_restore_result llama_spec_ckpt_restore_ex(
                 llama_kv_cache_seq_rm(kv, seq_id, accepted_pos + 1, -1);
                 return llama_dsv4_spec_ckpt_restore(ctx, true, accepted_step);
             }
-            if (!kv.per_step_restore(ctx->model, ctx->sched, accepted_step, seq_id)) {
+            if (!kv.per_step_restore(ctx->model, ctx->sched, accepted_step, seq_id, synchronize)) {
                 return LLAMA_SPEC_CKPT_RESTORE_FAILED;
             }
             const llama_pos accepted_pos = n_past + accepted_step;
@@ -10259,6 +10260,18 @@ enum llama_spec_ckpt_restore_result llama_spec_ckpt_restore_ex(
         default:
             return LLAMA_SPEC_CKPT_RESTORE_FAILED;
     }
+}
+
+enum llama_spec_ckpt_restore_result llama_spec_ckpt_restore_ex(
+        struct llama_context * ctx, llama_seq_id seq_id,
+        llama_pos n_past, int accepted_step) {
+    return llama_spec_ckpt_restore_ex_impl(ctx, seq_id, n_past, accepted_step, true);
+}
+
+enum llama_spec_ckpt_restore_result llama_spec_ckpt_restore_ex_deferred(
+        struct llama_context * ctx, llama_seq_id seq_id,
+        llama_pos n_past, int accepted_step) {
+    return llama_spec_ckpt_restore_ex_impl(ctx, seq_id, n_past, accepted_step, false);
 }
 
 bool llama_spec_ckpt_restore(struct llama_context * ctx, llama_seq_id seq_id,

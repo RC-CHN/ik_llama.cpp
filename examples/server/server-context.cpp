@@ -111,24 +111,20 @@ struct server_mtp_adaptive_bandit {
         if (selected < 0) {
             double best_score = -std::numeric_limits<double>::infinity();
             if (rate_weighted) {
-                double pooled_m2 = 0.0;
-                uint64_t pooled_degrees = 0;
-                for (const auto & arm : arms) {
-                    if (arm.samples > 1) {
-                        pooled_m2 += arm.rate_sample_m2;
-                        pooled_degrees += arm.samples - 1;
-                    }
-                }
-                const double pooled_variance = pooled_degrees > 0
-                    ? pooled_m2 / pooled_degrees : 0.0;
                 for (int32_t i = 0; i < (int32_t) arms.size(); ++i) {
                     const auto & arm = arms[i];
-                    // Gaussian UCB with variance learned from the current
-                    // workload.  Acceptance-noisy workloads receive longer
-                    // probes automatically; deterministic ones converge
-                    // without a fixed token/time window.
-                    const double confidence = pooled_variance > 0.0
-                        ? std::sqrt(2.0 * pooled_variance *
+                    // Use each arm's own standard error.  Pooling variance
+                    // across depths lets the intrinsically noisy high-depth
+                    // winner lend an enormous confidence bonus to clearly
+                    // slower arms, which keeps them on the critical path long
+                    // after their local measurements have separated.  The
+                    // logarithmic term still revisits overlapping candidates
+                    // as the workload evolves.
+                    const double variance = arm.samples > 1
+                        ? arm.rate_sample_m2 / (double) (arm.samples - 1)
+                        : 0.0;
+                    const double confidence = variance > 0.0
+                        ? std::sqrt(variance *
                             std::log((double) decisions + 1.0) / (double) arm.samples)
                         : 0.0;
                     const double score = arm.reward_ema + confidence;
@@ -160,6 +156,44 @@ struct server_mtp_adaptive_bandit {
         current_idx = selected;
         ++arms[current_idx].selections;
         return arms[current_idx].value;
+    }
+
+    int32_t select_best() {
+        GGML_ASSERT(!arms.empty());
+        ++decisions;
+
+        int32_t selected = -1;
+        for (int32_t i = 0; i < (int32_t) arms.size(); ++i) {
+            if (arms[i].samples == 0) {
+                continue;
+            }
+            if (selected < 0 || arms[i].reward_ema > arms[selected].reward_ema) {
+                selected = i;
+            }
+        }
+        if (selected < 0) {
+            int64_t selected_distance = std::numeric_limits<int64_t>::max();
+            for (int32_t i = 0; i < (int32_t) arms.size(); ++i) {
+                const int64_t distance = std::abs((int64_t) arms[i].value - initial_value);
+                if (distance < selected_distance ||
+                        (distance == selected_distance &&
+                         (selected < 0 || arms[i].value > arms[selected].value))) {
+                    selected = i;
+                    selected_distance = distance;
+                }
+            }
+        }
+
+        current_idx = selected;
+        ++arms[current_idx].selections;
+        return arms[current_idx].value;
+    }
+
+    bool coverage_complete() const {
+        const uint64_t required_local_samples = rate_weighted ? 2 : 1;
+        return std::all_of(arms.begin(), arms.end(), [&](const auto & arm) {
+            return !arm.prior_only && arm.samples >= required_local_samples;
+        });
     }
 
     void update(double reward) {
@@ -211,7 +245,14 @@ struct server_mtp_adaptive_bandit {
         arm.rate_sample_m2 += delta * (sample_rate - arm.rate_sample_mean);
         arm.rate_tokens += tokens;
         arm.rate_seconds += elapsed_s;
-        arm.reward_ema = arm.rate_tokens / arm.rate_seconds;
+        if (arm.samples == 1) {
+            arm.reward_ema = sample_rate;
+        } else {
+            // Context length and acceptance quality drift during a long-lived
+            // session.  Preserve cumulative counters for observability while
+            // ranking arms by a recency-weighted rate.
+            arm.reward_ema += 0.20 * (sample_rate - arm.reward_ema);
+        }
     }
 
     int32_t best_value() const {
@@ -290,6 +331,46 @@ struct server_mtp_adaptive_scheduler {
     uint64_t decode_prior_transfers = 0;
     uint64_t decode_width_prior_transfers = 0;
     size_t decode_round_robin_cursor = 0;
+
+    // Low-overhead critical-path telemetry for pure decode iterations.  These
+    // counters deliberately live with the adaptive controller: the profile is
+    // meaningful only for the same workload classes used by its decisions,
+    // and recording it requires no per-token allocation or tracing.
+    int64_t current_schedule_us = 0;
+    int64_t current_draft_us = 0;
+    int64_t current_batch_prepare_us = 0;
+    int64_t current_checkpoint_us = 0;
+    int64_t current_target_decode_us = 0;
+    int64_t current_post_decode_us = 0;
+    int64_t current_post_sync_us = 0;
+    int64_t current_post_sample_us = 0;
+    int64_t current_post_commit_us = 0;
+    int64_t current_post_restore_flush_us = 0;
+    int64_t current_post_emit_us = 0;
+    int64_t current_post_hidden_readback_us = 0;
+    int64_t current_post_state_restore_us = 0;
+    int64_t current_post_sampler_restore_us = 0;
+    int64_t current_post_mtp_update_us = 0;
+    int64_t current_post_checkpoint_control_us = 0;
+    int64_t current_iteration_us = 0;
+    uint64_t decode_profile_updates = 0;
+    uint64_t decode_profile_schedule_us = 0;
+    uint64_t decode_profile_draft_us = 0;
+    uint64_t decode_profile_batch_prepare_us = 0;
+    uint64_t decode_profile_checkpoint_us = 0;
+    uint64_t decode_profile_target_decode_us = 0;
+    uint64_t decode_profile_post_decode_us = 0;
+    uint64_t decode_profile_post_sync_us = 0;
+    uint64_t decode_profile_post_sample_us = 0;
+    uint64_t decode_profile_post_commit_us = 0;
+    uint64_t decode_profile_post_restore_flush_us = 0;
+    uint64_t decode_profile_post_emit_us = 0;
+    uint64_t decode_profile_post_hidden_readback_us = 0;
+    uint64_t decode_profile_post_state_restore_us = 0;
+    uint64_t decode_profile_post_sampler_restore_us = 0;
+    uint64_t decode_profile_post_mtp_update_us = 0;
+    uint64_t decode_profile_post_checkpoint_control_us = 0;
+    uint64_t decode_profile_iteration_us = 0;
 
     server_mtp_adaptive_scheduler(int32_t max_depth, int32_t n_parallel, int32_t max_draft_rows)
         : max_depth(std::max(0, max_depth)),
@@ -472,11 +553,12 @@ struct server_mtp_adaptive_scheduler {
         return it->second;
     }
 
-    int32_t select_depth(int32_t active_decode, int32_t bucket) {
+    int32_t select_depth(int32_t active_decode, int32_t bucket, bool exploit_only = false) {
         current_active_decode = active_decode;
         current_pending_prompt = 0;
         current_context_bucket = bucket;
-        current_depth = decode_bandit(active_decode, bucket).select();
+        auto & bandit = decode_bandit(active_decode, bucket);
+        current_depth = exploit_only ? bandit.select_best() : bandit.select();
         current_max_feasible_depth = max_draft_rows > 0 && active_decode > 0
             ? std::min(max_depth, max_draft_rows / active_decode)
             : max_depth;
@@ -586,6 +668,57 @@ struct server_mtp_adaptive_scheduler {
     double decode_width_arm_rate(int32_t resident_decode, int32_t bucket) const {
         const auto it = decode_width_bandits.find(workload_key(resident_decode, 0, bucket));
         return it == decode_width_bandits.end() ? 0.0 : it->second.current_reward();
+    }
+
+    void reset_iteration_profile() {
+        current_schedule_us = 0;
+        current_draft_us = 0;
+        current_batch_prepare_us = 0;
+        current_checkpoint_us = 0;
+        current_target_decode_us = 0;
+        current_post_decode_us = 0;
+        current_post_sync_us = 0;
+        current_post_sample_us = 0;
+        current_post_commit_us = 0;
+        current_post_restore_flush_us = 0;
+        current_post_emit_us = 0;
+        current_post_hidden_readback_us = 0;
+        current_post_state_restore_us = 0;
+        current_post_sampler_restore_us = 0;
+        current_post_mtp_update_us = 0;
+        current_post_checkpoint_control_us = 0;
+        current_iteration_us = 0;
+    }
+
+    void observe_decode_profile(
+            int64_t schedule_us, int64_t draft_us, int64_t batch_prepare_us, int64_t checkpoint_us,
+            int64_t target_decode_us, int64_t post_decode_us, int64_t iteration_us) {
+        current_schedule_us = std::max<int64_t>(0, schedule_us);
+        current_draft_us = std::max<int64_t>(0, draft_us);
+        current_batch_prepare_us = std::max<int64_t>(0, batch_prepare_us);
+        current_checkpoint_us = std::max<int64_t>(0, checkpoint_us);
+        current_target_decode_us = std::max<int64_t>(0, target_decode_us);
+        current_post_decode_us = std::max<int64_t>(0, post_decode_us);
+        current_iteration_us = std::max<int64_t>(0, iteration_us);
+
+        ++decode_profile_updates;
+        decode_profile_schedule_us += current_schedule_us;
+        decode_profile_draft_us += current_draft_us;
+        decode_profile_batch_prepare_us += current_batch_prepare_us;
+        decode_profile_checkpoint_us += current_checkpoint_us;
+        decode_profile_target_decode_us += current_target_decode_us;
+        decode_profile_post_decode_us += current_post_decode_us;
+        decode_profile_post_sync_us += current_post_sync_us;
+        decode_profile_post_sample_us += current_post_sample_us;
+        decode_profile_post_commit_us += current_post_commit_us;
+        decode_profile_post_restore_flush_us += current_post_restore_flush_us;
+        decode_profile_post_emit_us += current_post_emit_us;
+        decode_profile_post_hidden_readback_us += current_post_hidden_readback_us;
+        decode_profile_post_state_restore_us += current_post_state_restore_us;
+        decode_profile_post_sampler_restore_us += current_post_sampler_restore_us;
+        decode_profile_post_mtp_update_us += current_post_mtp_update_us;
+        decode_profile_post_checkpoint_control_us += current_post_checkpoint_control_us;
+        decode_profile_iteration_us += current_iteration_us;
     }
 
     void observe_mixed(
@@ -1417,6 +1550,27 @@ json server_slot::get_formatted_timings() const {
             timings["draft_by_depth"] = by_depth;
         }
     }
+    if (spec != nullptr) {
+        const auto snapshot = common_speculative_get_metrics_snapshot(spec);
+        json stages = json::array();
+        for (const auto & stage : snapshot.stages) {
+            stages.push_back({
+                {"type",              common_speculative_type_to_str(stage.type)},
+                {"draft_calls",       stage.n_call_draft},
+                {"accept_calls",      stage.n_call_accept},
+                {"generated_drafts",  stage.n_gen_drafts},
+                {"accepted_drafts",   stage.n_acc_drafts},
+                {"generated_tokens",  stage.n_gen_tokens},
+                {"accepted_tokens",   stage.n_acc_tokens},
+                {"begin_ms",          stage.t_begin_us / 1000.0},
+                {"draft_ms",          stage.t_draft_us / 1000.0},
+                {"accept_ms",         stage.t_accept_us / 1000.0},
+            });
+        }
+        if (!stages.empty()) {
+            timings["speculative_stages"] = std::move(stages);
+        }
+    }
     return timings;
 }
 
@@ -1697,9 +1851,81 @@ void server_context::copy_data_to_cached_prompt(const server_tokens & tokens, se
     slot.server_cached_prompt.state_pos_max_prompt = -1;
 }
 
+void server_context::prepare_slot_prompt_cache(server_slot & slot, const server_task & task) {
+    auto & tokens = slot.cache_tokens;
+    // A topology-aware admission layer knows whether the logical session
+    // currently occupying this physical slot has any queued continuation.
+    // Default to preserving it for backward compatibility; a scheduler may
+    // explicitly retire a completed session and avoid a multi-GiB disk write.
+    const bool preserve_displaced = json_value(task.data, "cache_prompt_preserve", true);
+    float f_keep = 0;
+    bool cached_prompt_is_prefix = true;
+    bool update_cache = false;
+    size_t cache_token_size = tokens.size();
+    if (!tokens.empty()) {
+        if (slot.params.think_tokens.exclude) {
+            server_tokens cache_exclude_think = tokens.get_tokens_exclude_think(
+                    slot.ctx, slot.params.think_tokens);
+            server_tokens prompt_exclude_think = task.tokens.get_tokens_exclude_think(
+                    slot.ctx, slot.params.think_tokens);
+
+            cache_token_size = cache_exclude_think.size();
+            f_keep = calculate_slot_f_keep(slot, slot.ctx, cache_exclude_think, prompt_exclude_think);
+            cached_prompt_is_prefix =
+                cache_exclude_think.get_common_prefix(slot.ctx, prompt_exclude_think).first ==
+                cache_exclude_think.size();
+        } else {
+            f_keep = calculate_slot_f_keep(slot, slot.ctx, tokens, task.tokens);
+            cached_prompt_is_prefix =
+                tokens.get_common_prefix(slot.ctx, task.tokens).first == tokens.size();
+        }
+        // If a request will discard a substantial part of this slot, retain
+        // the old logical session first.  Hybrid and other position-coupled
+        // models must also retain any divergent suffix even when token-set
+        // similarity is high.  This applies equally to an LRU-selected slot
+        // and to an explicitly requested physical slot.
+        if (f_keep < cache_ram_similarity ||
+                ((params_base.hybrid_kv || !llama_model_supports_partial_kv_reuse(model)) &&
+                 !cached_prompt_is_prefix)) {
+            update_cache = true;
+        }
+    }
+
+    update_cache = update_cache && prompt_cache;
+    update_cache = update_cache && task.type == SERVER_TASK_TYPE_COMPLETION;
+    update_cache = update_cache && cache_token_size >= cache_ram_n_min;
+    update_cache = update_cache && preserve_displaced;
+
+    LLAMA_LOG_INFO("======== Prompt cache: cache size: %d, n_keep: %d, n_discarded_prompt: %d, cache_ram_n_min: %d, f_keep: %.2f, cache_ram_similarity: %.2f, full_replace: %s, preserve_displaced: %s\n",
+        (int) tokens.size(), slot.n_kept_prompt, slot.n_discarded_prompt,
+        cache_ram_n_min, f_keep, cache_ram_similarity,
+        cached_prompt_is_prefix ? "false" : "true",
+        preserve_displaced ? "true" : "false");
+    if (update_cache) {
+        const int64_t t_start = ggml_time_us();
+        LLAMA_LOG_INFO("updating prompt cache\n");
+        copy_data_to_cached_prompt(tokens, slot);
+
+        slot.prompt_save(*prompt_cache);
+        LLAMA_LOG_INFO("prompt cache save took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
+    }
+    if (prompt_cache && !prompt_cache->states.empty()) {
+        const int64_t t_start = ggml_time_us();
+        copy_data_to_cached_prompt(tokens, slot);
+
+        slot.prompt_load(*prompt_cache, task.tokens, cache_ram_similarity);
+        prompt_cache->update();
+
+        slot.cache_tokens = slot.server_cached_prompt.tokens.clone();
+        slot.n_discarded_prompt = slot.server_cached_prompt.n_discarded_prompt;
+        slot.n_kept_prompt = slot.server_cached_prompt.n_kept_prompt;
+
+        LLAMA_LOG_INFO("prompt cache load took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
+    }
+}
+
 server_slot* server_context::get_available_slot(const server_task& task) {
     server_slot* ret = nullptr;
-    bool update_cache = false;
 
     // A tiered/hybrid cache must not choose an LRU slot while another idle
     // slot already owns a much longer prefix of this request.  That would
@@ -1813,73 +2039,7 @@ server_slot* server_context::get_available_slot(const server_task& task) {
         }
     }
     if (ret) {
-        auto& tokens = ret->cache_tokens;
-        float f_keep = 0;
-        bool cached_prompt_is_prefix = true;
-        size_t cache_token_size = tokens.size();
-        if (!tokens.empty()) {
-            if (ret->params.think_tokens.exclude) {
-                server_tokens cache_exclude_think = tokens.get_tokens_exclude_think(ret->ctx, ret->params.think_tokens);
-                server_tokens prompt_exclude_think = task.tokens.get_tokens_exclude_think(ret->ctx, ret->params.think_tokens);
-
-                cache_token_size = cache_exclude_think.size();
-                f_keep = calculate_slot_f_keep(*ret, ret->ctx, cache_exclude_think, prompt_exclude_think);
-                cached_prompt_is_prefix =
-                    cache_exclude_think.get_common_prefix(ret->ctx, prompt_exclude_think).first == cache_exclude_think.size();
-            }
-            else {
-                f_keep = calculate_slot_f_keep(*ret, ret->ctx, tokens, task.tokens);
-                cached_prompt_is_prefix =
-                    tokens.get_common_prefix(ret->ctx, task.tokens).first == tokens.size();
-            }
-            // if we are about to lose a large portion of the existing context - save it in the prompt cache
-            // Hybrid mode and models with position-coupled private state
-            // cannot safely reuse an arbitrary divergent cached suffix.  Save
-            // that slot even when the divergent request has a very high token
-            // similarity; otherwise apply_checkpoint() may throw the whole
-            // sequence away and the tiered cache never gets a chance to
-            // restore it later.  Exact extensions retain the ordinary in-slot
-            // append fast path.
-            if (f_keep < cache_ram_similarity ||
-                    ((params_base.hybrid_kv || !llama_model_supports_partial_kv_reuse(model)) &&
-                     !cached_prompt_is_prefix)) {
-                update_cache = true;
-            }
-        }
-
-        update_cache = update_cache && prompt_cache;
-        // cache prompts only for completion tasks
-        update_cache = update_cache && task.type == SERVER_TASK_TYPE_COMPLETION;
-
-        // don't update the cache if the slot's context is above cache_ram_n_min
-        update_cache = update_cache && cache_token_size >= cache_ram_n_min;
-
-        LLAMA_LOG_INFO("======== Prompt cache: cache size: %d, n_keep: %d, n_discarded_prompt: %d, cache_ram_n_min: %d, f_keep: %.2f, cache_ram_similarity: %.2f, full_replace: %s\n",
-            (int)tokens.size(), ret->n_kept_prompt, ret->n_discarded_prompt, cache_ram_n_min, f_keep, cache_ram_similarity,
-            cached_prompt_is_prefix ? "false" : "true");
-        if (update_cache) {
-            const int64_t t_start = ggml_time_us();
-            LLAMA_LOG_INFO("updating prompt cache\n");
-            // copy cache tokens
-            copy_data_to_cached_prompt(tokens, *ret);
-
-            ret->prompt_save(*prompt_cache);
-            LLAMA_LOG_INFO("prompt cache save took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
-        }
-        // has prompts saved earlier to load
-        if (prompt_cache && !prompt_cache->states.empty()) {
-            const int64_t t_start = ggml_time_us();
-            copy_data_to_cached_prompt(tokens, *ret);
-
-            ret->prompt_load(*prompt_cache, task.tokens, cache_ram_similarity);
-            prompt_cache->update();
-
-            ret->cache_tokens = ret->server_cached_prompt.tokens.clone(); // recover cache tokens
-            ret->n_discarded_prompt = ret->server_cached_prompt.n_discarded_prompt;
-            ret->n_kept_prompt = ret->server_cached_prompt.n_kept_prompt;
-
-            LLAMA_LOG_INFO("prompt cache load took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
-        }
+        prepare_slot_prompt_cache(*ret, task);
     }
     return ret;
 }
@@ -3630,6 +3790,15 @@ void server_context::process_single_task(server_task&& task) {
             break;
         }
 
+        // Explicit slot routing is used by topology-aware schedulers to keep
+        // the other resident request running.  It must retain exactly the
+        // same tiered-cache save/load semantics as automatic LRU selection;
+        // otherwise replacing a slot silently loses the displaced logical
+        // context and a later continuation reprocesses the entire prompt.
+        if (id_slot != -1) {
+            prepare_slot_prompt_cache(*slot, task);
+        }
+
         if (task.data.contains("system_prompt")) {
             std::string sys_prompt = json_value(task.data, "system_prompt", std::string());
             if (!system_prompt_set(sys_prompt)) {
@@ -3781,6 +3950,41 @@ void server_context::process_single_task(server_task&& task) {
             { "mtp_adaptive_prompt_censored",     mtp_scheduler ? mtp_scheduler->prompt_censored : 0},
             { "mtp_adaptive_decode_prior_transfers", mtp_scheduler ? mtp_scheduler->decode_prior_transfers : 0},
             { "mtp_adaptive_decode_width_prior_transfers", mtp_scheduler ? mtp_scheduler->decode_width_prior_transfers : 0},
+            { "mtp_decode_profile_updates",        mtp_scheduler ? mtp_scheduler->decode_profile_updates : 0},
+            { "mtp_decode_profile_schedule_us",    mtp_scheduler ? mtp_scheduler->current_schedule_us : 0},
+            { "mtp_decode_profile_draft_us",       mtp_scheduler ? mtp_scheduler->current_draft_us : 0},
+            { "mtp_decode_profile_batch_prepare_us", mtp_scheduler ? mtp_scheduler->current_batch_prepare_us : 0},
+            { "mtp_decode_profile_checkpoint_us",  mtp_scheduler ? mtp_scheduler->current_checkpoint_us : 0},
+            { "mtp_decode_profile_target_us",      mtp_scheduler ? mtp_scheduler->current_target_decode_us : 0},
+            { "mtp_decode_profile_post_us",        mtp_scheduler ? mtp_scheduler->current_post_decode_us : 0},
+            { "mtp_decode_profile_post_sync_us",   mtp_scheduler ? mtp_scheduler->current_post_sync_us : 0},
+            { "mtp_decode_profile_post_sample_us", mtp_scheduler ? mtp_scheduler->current_post_sample_us : 0},
+            { "mtp_decode_profile_post_commit_us", mtp_scheduler ? mtp_scheduler->current_post_commit_us : 0},
+            { "mtp_decode_profile_post_restore_flush_us", mtp_scheduler ? mtp_scheduler->current_post_restore_flush_us : 0},
+            { "mtp_decode_profile_post_emit_us",   mtp_scheduler ? mtp_scheduler->current_post_emit_us : 0},
+            { "mtp_decode_profile_post_hidden_readback_us", mtp_scheduler ? mtp_scheduler->current_post_hidden_readback_us : 0},
+            { "mtp_decode_profile_post_state_restore_us", mtp_scheduler ? mtp_scheduler->current_post_state_restore_us : 0},
+            { "mtp_decode_profile_post_sampler_restore_us", mtp_scheduler ? mtp_scheduler->current_post_sampler_restore_us : 0},
+            { "mtp_decode_profile_post_mtp_update_us", mtp_scheduler ? mtp_scheduler->current_post_mtp_update_us : 0},
+            { "mtp_decode_profile_post_checkpoint_control_us", mtp_scheduler ? mtp_scheduler->current_post_checkpoint_control_us : 0},
+            { "mtp_decode_profile_iteration_us",   mtp_scheduler ? mtp_scheduler->current_iteration_us : 0},
+            { "mtp_decode_profile_schedule_us_total", mtp_scheduler ? mtp_scheduler->decode_profile_schedule_us : 0},
+            { "mtp_decode_profile_draft_us_total", mtp_scheduler ? mtp_scheduler->decode_profile_draft_us : 0},
+            { "mtp_decode_profile_batch_prepare_us_total", mtp_scheduler ? mtp_scheduler->decode_profile_batch_prepare_us : 0},
+            { "mtp_decode_profile_checkpoint_us_total", mtp_scheduler ? mtp_scheduler->decode_profile_checkpoint_us : 0},
+            { "mtp_decode_profile_target_us_total", mtp_scheduler ? mtp_scheduler->decode_profile_target_decode_us : 0},
+            { "mtp_decode_profile_post_us_total",  mtp_scheduler ? mtp_scheduler->decode_profile_post_decode_us : 0},
+            { "mtp_decode_profile_post_sync_us_total", mtp_scheduler ? mtp_scheduler->decode_profile_post_sync_us : 0},
+            { "mtp_decode_profile_post_sample_us_total", mtp_scheduler ? mtp_scheduler->decode_profile_post_sample_us : 0},
+            { "mtp_decode_profile_post_commit_us_total", mtp_scheduler ? mtp_scheduler->decode_profile_post_commit_us : 0},
+            { "mtp_decode_profile_post_restore_flush_us_total", mtp_scheduler ? mtp_scheduler->decode_profile_post_restore_flush_us : 0},
+            { "mtp_decode_profile_post_emit_us_total", mtp_scheduler ? mtp_scheduler->decode_profile_post_emit_us : 0},
+            { "mtp_decode_profile_post_hidden_readback_us_total", mtp_scheduler ? mtp_scheduler->decode_profile_post_hidden_readback_us : 0},
+            { "mtp_decode_profile_post_state_restore_us_total", mtp_scheduler ? mtp_scheduler->decode_profile_post_state_restore_us : 0},
+            { "mtp_decode_profile_post_sampler_restore_us_total", mtp_scheduler ? mtp_scheduler->decode_profile_post_sampler_restore_us : 0},
+            { "mtp_decode_profile_post_mtp_update_us_total", mtp_scheduler ? mtp_scheduler->decode_profile_post_mtp_update_us : 0},
+            { "mtp_decode_profile_post_checkpoint_control_us_total", mtp_scheduler ? mtp_scheduler->decode_profile_post_checkpoint_control_us : 0},
+            { "mtp_decode_profile_iteration_us_total", mtp_scheduler ? mtp_scheduler->decode_profile_iteration_us : 0},
 
             { "slots",                           slots_data },
         };
@@ -4832,35 +5036,11 @@ bool server_context::create_checkpoint(server_slot & slot, int64_t n_tokens_over
         server_prompt_checkpoint_update(cur, ctx, slot.id, checkpoint_n_tokens,
                 checkpoint_pos_min, pos_max, slot.n_past_offset);
 
-        if (params_base.hybrid_kv && prompt_cache &&
-                checkpoint_n_tokens < slot.n_prompt_tokens) {
-            size_t replaceable_disk_size = 0;
-            for (const auto & previous : slot.server_cached_prompt.checkpoints) {
-                if (&previous != &cur) {
-                    replaceable_disk_size += previous.state_file_size;
-                }
-            }
-
-            if (prompt_cache->stage_checkpoint(
-                    cur, slot.cache_tokens, slot.id, replaceable_disk_size)) {
-                size_t released_disk_size = 0;
-                int32_t released_files = 0;
-                for (auto & previous : slot.server_cached_prompt.checkpoints) {
-                    if (&previous == &cur || previous.state_file.empty()) {
-                        continue;
-                    }
-                    released_disk_size += previous.state_file_size;
-                    ++released_files;
-                    server_prompt_checkpoint_remove_state_file(previous);
-                }
-                if (released_files > 0) {
-                    SLT_WRN(slot,
-                        "released %d superseded staged snapshot%s (%.3f MiB) after atomic replacement\n",
-                        released_files, released_files == 1 ? "" : "s",
-                        released_disk_size / (1024.0 * 1024.0));
-                }
-            }
-        }
+        // Hybrid full-state snapshots are intentionally created lazily by
+        // server_prompt_cache::save() when this slot is actually displaced.
+        // Eagerly streaming one here blocks the server for every prompt-tail
+        // checkpoint, even when the request remains resident and the snapshot
+        // is never consumed.
 
         SLT_WRN(slot, "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB, took %.2f ms)\n",
             (int)slot.server_cached_prompt.checkpoints.size(), params_base.ctx_checkpoints_n, cur.pos_min, cur.pos_max, cur.n_tokens, (float)cur.data.size() / 1024 / 1024,
@@ -5339,6 +5519,15 @@ void server_context::extend_context(const int32_t n_tokens) {
 }
 
 void server_context::speculative_decoding_accept() {
+    bool deferred_restore_possible = false;
+    if (mtp_scheduler && std::any_of(slots.begin(), slots.end(), [](const server_slot & slot) {
+            return slot.state == SLOT_STATE_PROCESSING && !slot.i_batch_dft.empty();
+        })) {
+        const int64_t post_sync_start_us = ggml_time_us();
+        llama_synchronize(ctx);
+        mtp_scheduler->current_post_sync_us += ggml_time_us() - post_sync_start_us;
+    }
+
     for (auto& slot : slots) {
         if (slot.state != SLOT_STATE_PROCESSING || slot.i_batch_dft.empty()) {
             continue;
@@ -5357,6 +5546,7 @@ void server_context::speculative_decoding_accept() {
         apply_server_biases(slot);
 
         // the accepted tokens from the speculation
+        const int64_t post_sample_start_us = mtp_scheduler ? ggml_time_us() : 0;
         std::vector<llama_token> ids;
         try {
             ids = common_sampler_sample_and_accept_n(slot.ctx_sampling, ctx, slot.i_batch_dft, slot.drafted);
@@ -5372,6 +5562,9 @@ void server_context::speculative_decoding_accept() {
             slot.i_batch_dft.clear();
             slot.drafted.clear();
             continue;
+        }
+        if (mtp_scheduler) {
+            mtp_scheduler->current_post_sample_us += ggml_time_us() - post_sample_start_us;
         }
 
         std::vector<int32_t> accepted_output_indices;
@@ -5410,6 +5603,8 @@ void server_context::speculative_decoding_accept() {
         slot.sampled = ids.back(); // last accepted token
         slot.n_past = slot.cache_tokens.n_tokens();
 
+        const int64_t post_commit_start_us = mtp_scheduler ? ggml_time_us() : 0;
+        deferred_restore_possible = deferred_restore_possible || ids.size() - 1 < n_draft;
         if (!common_speculative_commit(
             slot.spec,
             ctx,
@@ -5419,7 +5614,8 @@ void server_context::speculative_decoding_accept() {
             ids,
             n_draft,
             spec_pos_base,
-            accepted_output_indices)) {
+            accepted_output_indices,
+            true)) {
             LOG_ERROR("speculative checkpoint restore/commit failed, releasing slot", {
                 {"id_slot", slot.id},
                 {"id_task", slot.id_task},
@@ -5431,8 +5627,18 @@ void server_context::speculative_decoding_accept() {
             slot.drafted.clear();
             continue;
         }
+        if (mtp_scheduler) {
+            mtp_scheduler->current_post_commit_us += ggml_time_us() - post_commit_start_us;
+            const auto commit_profile = common_speculative_get_last_commit_profile(slot.spec);
+            mtp_scheduler->current_post_hidden_readback_us += commit_profile.hidden_readback_us;
+            mtp_scheduler->current_post_state_restore_us += commit_profile.state_restore_us;
+            mtp_scheduler->current_post_sampler_restore_us += commit_profile.sampler_restore_us;
+            mtp_scheduler->current_post_mtp_update_us += commit_profile.mtp_hidden_update_us;
+            mtp_scheduler->current_post_checkpoint_control_us += commit_profile.checkpoint_control_us;
+        }
         slot.spec_target_only = false;
 
+        const int64_t post_emit_start_us = mtp_scheduler ? ggml_time_us() : 0;
         for (size_t i = 0; i < ids.size(); ++i) {
             completion_token_output result;
 
@@ -5462,6 +5668,9 @@ void server_context::speculative_decoding_accept() {
 
             update_allowlist_state(slot);
         }
+        if (mtp_scheduler) {
+            mtp_scheduler->current_post_emit_us += ggml_time_us() - post_emit_start_us;
+        }
         SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int)ids.size() - 1, (int)slot.drafted.size(), slot.n_past);
         LOG_VERBOSE("speculative decoding result", {
             {"id_slot", slot.id},
@@ -5469,6 +5678,14 @@ void server_context::speculative_decoding_accept() {
             {"total", (int)slot.drafted.size()},
             {"new_n_past", slot.n_past}
             });
+    }
+
+    if (deferred_restore_possible) {
+        const int64_t flush_start_us = mtp_scheduler ? ggml_time_us() : 0;
+        llama_synchronize(ctx);
+        if (mtp_scheduler) {
+            mtp_scheduler->current_post_restore_flush_us += ggml_time_us() - flush_start_us;
+        }
     }
 }
 
@@ -5760,7 +5977,11 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
             0, 0, 0, // unused
         };
 
+        const int64_t target_decode_start_us = mtp_scheduler ? ggml_time_us() : 0;
         const int ret = server_decode(ctx, batch_view);
+        if (mtp_scheduler) {
+            mtp_scheduler->current_target_decode_us += ggml_time_us() - target_decode_start_us;
+        }
         if (ret != 0) {
             if (n_batch == 1 || ret < 0) {
                 int user_cancel = -3;
@@ -6013,10 +6234,16 @@ void server_context::update_slots() {
     int32_t adaptive_max_n_past = 0;
     int32_t adaptive_width_bucket = 0;
     bool adaptive_depth_selected = false;
+    bool adaptive_depth_exploit_only = false;
     bool adaptive_width_selected = false;
     bool adaptive_width_observed = false;
+    int64_t adaptive_draft_start_us = adaptive_iteration_start_us;
+    int64_t adaptive_draft_end_us = adaptive_iteration_start_us;
+    int64_t adaptive_batch_prepare_end_us = adaptive_iteration_start_us;
+    int64_t adaptive_checkpoint_end_us = adaptive_iteration_start_us;
 
     if (adaptive_enabled) {
+        mtp_scheduler->reset_iteration_profile();
         adaptive_decoded_before.reserve(slots.size());
         adaptive_prompt_before.reserve(slots.size());
         std::vector<size_t> runnable_decode;
@@ -6049,7 +6276,10 @@ void server_context::update_slots() {
                 all_decode_slots_auto_mtp) {
             const int32_t previous_width = mtp_scheduler->current_decode_width;
             int32_t decode_width = adaptive_resident_decode;
-            if (adaptive_resident_decode > 1) {
+            const bool full_width_depth_ready =
+                mtp_scheduler->decode_bandit(
+                    adaptive_resident_decode, adaptive_width_bucket).coverage_complete();
+            if (adaptive_resident_decode > 1 && full_width_depth_ready) {
                 decode_width = mtp_scheduler->select_decode_width(
                     adaptive_resident_decode, adaptive_width_bucket);
                 adaptive_width_selected = true;
@@ -6075,6 +6305,13 @@ void server_context::update_slots() {
             if (adaptive_width_selected) {
                 auto & width_bandit = mtp_scheduler->decode_width_bandit(
                     adaptive_resident_decode, adaptive_width_bucket);
+                // Width and depth form a hierarchy.  When the selected width
+                // still needs a comparable local sample, hold its nested
+                // controller at the best depth known for that workload.  This
+                // prevents one width probe from expanding into a full sweep of
+                // every depth before the outer controller can reject it.
+                adaptive_depth_exploit_only = !width_bandit.coverage_complete() ||
+                    decode_width != width_bandit.best_value();
                 if (decode_width != previous_width ||
                         width_bandit.decisions <= width_bandit.arms.size() ||
                         width_bandit.decisions % 64 == 0) {
@@ -6097,7 +6334,8 @@ void server_context::update_slots() {
             }
             const int32_t bucket = server_mtp_adaptive_scheduler::context_bucket(adaptive_max_n_past);
             const int32_t previous_depth = mtp_scheduler->current_depth;
-            const int32_t depth = mtp_scheduler->select_depth(adaptive_active_decode, bucket);
+            const int32_t depth = mtp_scheduler->select_depth(
+                adaptive_active_decode, bucket, adaptive_depth_exploit_only);
             for (size_t slot_index = 0; slot_index < slots.size(); ++slot_index) {
                 auto & slot = slots[slot_index];
                 if (slot.state != SLOT_STATE_PROCESSING || !adaptive_decode_schedule[slot_index]) {
@@ -6132,6 +6370,7 @@ void server_context::update_slots() {
                     {"draft_row_budget", mtp_scheduler->max_draft_rows},
                     {"max_feasible_depth", mtp_scheduler->current_max_feasible_depth},
                     {"best_depth", bandit.best_value()},
+                    {"exploit_only", adaptive_depth_exploit_only},
                     {"decisions", bandit.decisions},
                 });
             }
@@ -6204,12 +6443,19 @@ void server_context::update_slots() {
             return slot.state == SLOT_STATE_PROCESSING;
         });
 
+    if (adaptive_enabled) {
+        adaptive_draft_start_us = ggml_time_us();
+    }
+
     // first, add sampled tokens from any ongoing sequences
     if (piggyback_parallel_mtp_prompt) {
         add_sampled_tokens(true);
     } else if (!isolate_parallel_mtp_prompt) {
         add_sampled_tokens(false, adaptive_enabled ? &adaptive_decode_schedule : nullptr);
         align_parallel_mtp_drafts();
+    }
+    if (adaptive_enabled) {
+        adaptive_draft_end_us = ggml_time_us();
     }
 
     // Process in chunks of params.n_batch. Prompt admission is additionally
@@ -6316,6 +6562,10 @@ void server_context::update_slots() {
     if (batch.n_tokens == 0) {
         LOG_VERBOSE("no tokens to decode", {});
         return;
+    }
+
+    if (adaptive_enabled) {
+        adaptive_batch_prepare_end_us = ggml_time_us();
     }
 
     LOG_VERBOSE("decoding batch", {
@@ -6433,8 +6683,14 @@ void server_context::update_slots() {
         }
     }
 
+    if (adaptive_enabled) {
+        adaptive_checkpoint_end_us = ggml_time_us();
+    }
+
     // process the created batch of tokens
+    const int64_t adaptive_process_start_us = adaptive_enabled ? ggml_time_us() : 0;
     process_batch_tokens(n_batch); // Decode with batch
+    const int64_t adaptive_process_end_us = adaptive_enabled ? ggml_time_us() : 0;
 
     if (adaptive_enabled) {
         const double elapsed_s = (ggml_time_us() - adaptive_iteration_start_us) / 1e6;
@@ -6446,6 +6702,63 @@ void server_context::update_slots() {
         }
         const int32_t bucket = server_mtp_adaptive_scheduler::context_bucket(adaptive_max_n_past);
 
+        if (adaptive_active_decode > 0 && adaptive_pending_prompt == 0) {
+            const int64_t target_decode_us = mtp_scheduler->current_target_decode_us;
+            const int64_t process_us = adaptive_process_end_us - adaptive_process_start_us;
+            mtp_scheduler->observe_decode_profile(
+                adaptive_draft_start_us - adaptive_iteration_start_us,
+                adaptive_draft_end_us - adaptive_draft_start_us,
+                adaptive_batch_prepare_end_us - adaptive_draft_end_us,
+                adaptive_checkpoint_end_us - adaptive_batch_prepare_end_us,
+                target_decode_us,
+                std::max<int64_t>(0, process_us - target_decode_us),
+                adaptive_process_end_us - adaptive_iteration_start_us);
+
+            if (mtp_scheduler->decode_profile_updates <= 8 ||
+                    mtp_scheduler->decode_profile_updates % 64 == 0) {
+                const double denom = (double) mtp_scheduler->decode_profile_updates;
+                LOG_INFO("adaptive MTP decode critical-path profile", {
+                    {"active_decode", adaptive_active_decode},
+                    {"context_bucket", bucket},
+                    {"schedule_us", mtp_scheduler->current_schedule_us},
+                    {"draft_us", mtp_scheduler->current_draft_us},
+                    {"batch_prepare_us", mtp_scheduler->current_batch_prepare_us},
+                    {"checkpoint_us", mtp_scheduler->current_checkpoint_us},
+                    {"target_us", mtp_scheduler->current_target_decode_us},
+                    {"post_us", mtp_scheduler->current_post_decode_us},
+                    {"post_sync_us", mtp_scheduler->current_post_sync_us},
+                    {"post_sample_us", mtp_scheduler->current_post_sample_us},
+                    {"post_commit_us", mtp_scheduler->current_post_commit_us},
+                    {"post_restore_flush_us", mtp_scheduler->current_post_restore_flush_us},
+                    {"post_emit_us", mtp_scheduler->current_post_emit_us},
+                    {"post_hidden_readback_us", mtp_scheduler->current_post_hidden_readback_us},
+                    {"post_state_restore_us", mtp_scheduler->current_post_state_restore_us},
+                    {"post_sampler_restore_us", mtp_scheduler->current_post_sampler_restore_us},
+                    {"post_mtp_update_us", mtp_scheduler->current_post_mtp_update_us},
+                    {"post_checkpoint_control_us", mtp_scheduler->current_post_checkpoint_control_us},
+                    {"iteration_us", mtp_scheduler->current_iteration_us},
+                    {"schedule_us_mean", mtp_scheduler->decode_profile_schedule_us / denom},
+                    {"draft_us_mean", mtp_scheduler->decode_profile_draft_us / denom},
+                    {"batch_prepare_us_mean", mtp_scheduler->decode_profile_batch_prepare_us / denom},
+                    {"checkpoint_us_mean", mtp_scheduler->decode_profile_checkpoint_us / denom},
+                    {"target_us_mean", mtp_scheduler->decode_profile_target_decode_us / denom},
+                    {"post_us_mean", mtp_scheduler->decode_profile_post_decode_us / denom},
+                    {"post_sync_us_mean", mtp_scheduler->decode_profile_post_sync_us / denom},
+                    {"post_sample_us_mean", mtp_scheduler->decode_profile_post_sample_us / denom},
+                    {"post_commit_us_mean", mtp_scheduler->decode_profile_post_commit_us / denom},
+                    {"post_restore_flush_us_mean", mtp_scheduler->decode_profile_post_restore_flush_us / denom},
+                    {"post_emit_us_mean", mtp_scheduler->decode_profile_post_emit_us / denom},
+                    {"post_hidden_readback_us_mean", mtp_scheduler->decode_profile_post_hidden_readback_us / denom},
+                    {"post_state_restore_us_mean", mtp_scheduler->decode_profile_post_state_restore_us / denom},
+                    {"post_sampler_restore_us_mean", mtp_scheduler->decode_profile_post_sampler_restore_us / denom},
+                    {"post_mtp_update_us_mean", mtp_scheduler->decode_profile_post_mtp_update_us / denom},
+                    {"post_checkpoint_control_us_mean", mtp_scheduler->decode_profile_post_checkpoint_control_us / denom},
+                    {"iteration_us_mean", mtp_scheduler->decode_profile_iteration_us / denom},
+                    {"updates", mtp_scheduler->decode_profile_updates},
+                });
+            }
+        }
+
         if (elapsed_s > 0.0 && adaptive_active_decode == 0 && adaptive_pending_prompt > 0 &&
                 prompt_tokens > 0) {
             mtp_scheduler->observe_prefill(prompt_tokens / elapsed_s);
@@ -6456,15 +6769,13 @@ void server_context::update_slots() {
                 adaptive_active_decode, bucket,
                 decoded_tokens, elapsed_s, adaptive_depth_selected);
 
-            // Width and depth are hierarchical actions.  Do not blame a width
-            // for throughput measured while its depth controller is still
-            // covering inherited/cold arms, or while deliberately exploring
-            // a non-best depth.  Leaving the width arm locally unobserved makes
-            // select() keep serving it until a comparable sample is available.
+            // Width and depth are hierarchical actions.  Compare widths only
+            // at the best depth currently known for each workload.  Cold width
+            // arms are explicitly held at that depth above, so they obtain a
+            // useful sample without forcing a nested exhaustive depth sweep.
             const auto & depth_bandit = mtp_scheduler->decode_bandit(
                 adaptive_active_decode, bucket);
-            const bool width_sample_comparable = depth_bandit.locally_mature() &&
-                depth_bandit.current_is_best();
+            const bool width_sample_comparable = depth_bandit.current_is_best();
             const bool tune_width = adaptive_width_selected && width_sample_comparable;
             adaptive_width_observed = tune_width;
             if (adaptive_width_selected && !tune_width) {

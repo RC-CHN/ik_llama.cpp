@@ -147,6 +147,16 @@ def load_events(path: Path):
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
 
 
+def load_json(path: Path):
+    if not path.exists():
+        return {}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
 def pcie_rows(path: Path):
     rows = []
     if not path.exists():
@@ -639,6 +649,14 @@ def main():
         float(value)
         for value in re.findall(r"staged self-consistent hybrid checkpoint.*?in\s+([0-9.]+) ms", server_log)
     ]
+    cache_lazy_stream_ms = [
+        float(value)
+        for value in re.findall(
+            r"lazily streamed displaced hybrid prompt tail.*?in\s+([0-9.]+) ms",
+            server_log,
+        )
+    ]
+    capacity_plan = load_json(root / "capacity-plan.json")
     output = {
         "result_dir": str(root.resolve()),
         "completed": any(event.get("event") == "driver_complete" for event in events),
@@ -653,6 +671,17 @@ def main():
             "irregular_mixed_batch_warnings": server_log.count("irregular mixed-sequence batch"),
             "full_prompt_reprocess_count": server_log.count("forcing full prompt re-processing"),
             "prompt_cache_full_replace_decision_count": server_log.count("full_replace: true"),
+            "prompt_cache_preserve_decision_count": server_log.count(
+                "preserve_displaced: true"
+            ),
+            "prompt_cache_retire_decision_count": server_log.count(
+                "preserve_displaced: false"
+            ),
+            "prompt_cache_load_count": server_log.count("prompt cache load took"),
+            "prompt_cache_save_count": server_log.count("prompt cache save took"),
+            "prompt_cache_lazy_hybrid_stream_count": server_log.count(
+                "lazily streamed displaced hybrid prompt tail"
+            ),
             "checkpoint_created_count": server_log.count("created context checkpoint"),
             "checkpoint_restore_count": server_log.count("restored context checkpoint"),
             "superseded_staged_snapshot_release_count": server_log.count(
@@ -716,7 +745,9 @@ def main():
             "load_ms": value_summary(cache_load_ms),
             "save_ms": value_summary(cache_save_ms),
             "stage_ms": value_summary(cache_stage_ms),
+            "lazy_stream_ms": value_summary(cache_lazy_stream_ms),
         },
+        "hybrid_hot_window_selection": capacity_plan,
         "hbm_counters": {
             "available": False,
             "reason": "uncore PMU access is unavailable to the benchmark user; use the documented LIKWID root recipe",

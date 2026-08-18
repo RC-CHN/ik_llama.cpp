@@ -144,6 +144,65 @@ inline bool mask_page_all_invisible(
     return true;
 }
 
+template <int q_step>
+inline int mask_visible_query_tile_plan(
+        uint64_t visible_queries, int n_queries, bool compact_gqa_mask,
+        int * tile_starts) {
+    if constexpr (q_step < 16 || q_step > 64) {
+        if (visible_queries == 0 || n_queries <= 0) {
+            return 0;
+        }
+        tile_starts[0] = 0;
+        return 1;
+    }
+
+    constexpr int tile_rows = 16;
+
+    auto low_bits = [](int count) -> uint64_t {
+        return count >= 64 ? ~uint64_t{0} : (uint64_t{1} << count) - 1;
+    };
+    auto fixed_plan = [&]() {
+        int n_tiles = 0;
+        for (int first = 0; first < n_queries; first += tile_rows) {
+            const int count = std::min(tile_rows, n_queries - first);
+            if (visible_queries & (low_bits(count) << first)) {
+                tile_starts[n_tiles++] = first;
+            }
+        }
+        return n_tiles;
+    };
+
+    if (!compact_gqa_mask) {
+        return fixed_plan();
+    }
+
+    // Compact GQA masks make visibility occur in six-row runs.  Start each
+    // AMX tile at the first still-visible row instead of a global multiple of
+    // 16, so a boundary such as 30+30 rows is represented by 0/16 and 30/46
+    // rather than a half-empty tile shared by both sequences.
+    uint64_t remaining = visible_queries;
+    uint64_t processed = 0;
+    int n_tiles = 0;
+    while (remaining != 0) {
+        const int first = __builtin_ctzll(remaining);
+        int start = first;
+        if (start + tile_rows > q_step) {
+            start = q_step - tile_rows;
+        }
+        const uint64_t window = low_bits(tile_rows) << start;
+        // A shifted tail tile must not recompute a visible row accumulated by
+        // an earlier tile.  Rare fragmented layouts fall back to fixed tiles.
+        if ((processed & visible_queries & window) != 0 ||
+                n_tiles >= (q_step + tile_rows - 1)/tile_rows) {
+            return fixed_plan();
+        }
+        tile_starts[n_tiles++] = start;
+        processed |= window;
+        remaining &= ~window;
+    }
+    return n_tiles;
+}
+
 struct BaseHelper {
     BaseHelper(const char * data, int stride) : data(data), block(data), stride(stride) {}
 
@@ -1116,85 +1175,120 @@ struct FlashQKV {
     // V remains in the canonical token-major cache and is paired in a small
     // L1 scratch tile, so this path adds no persistent KV mirror.
     inline void prepare_qkv_amx(int nq) {
-        if (nq < q_step) {
-            std::memset(qkv_cache + D*nq, 0, (q_step - nq)*D*sizeof(float));
-        }
+        // A query tile can now be skipped until the first K/V page visible to
+        // it.  Initialize the whole accumulator once so a worker whose shard
+        // contains no visible page still returns the neutral (M=-inf, S=0,
+        // R=0) partial.  The old path performed the same clears piecemeal on
+        // each query's first page through need_scaling == 2.
+        (void) nq;
+        std::memset(qkv_cache, 0, q_step*D*sizeof(float));
     }
 
     template <typename VHelper, typename FMS>
-    inline void accumulate_qkv_amx(int nq, const VHelper& vh, const FMS& fms) {
+    inline void accumulate_qkv_amx(
+            int nq, uint64_t visible_queries, bool compact_gqa_mask,
+            const VHelper& vh, const FMS& fms) {
         static_assert(D == 256);
-        static_assert(q_step >= 16 && q_step <= 32);
+        static_assert(q_step >= 16 && q_step <= 64);
         static_assert(k_step % 32 == 0);
 
         for (int j = 0; j < nq; ++j) {
+            if ((visible_queries & (uint64_t{1} << j)) == 0) {
+                continue;
+            }
             float * R = qkv_cache + D*j;
-            if (fms.need_scaling[j] == 2) {
-                std::memset(R, 0, D*sizeof(float));
-            } else if (fms.need_scaling[j] == 1) {
+            if (fms.need_scaling[j] == 1) {
                 const __m512 scale = _mm512_set1_ps(fms.vms[j]);
                 for (int i = 0; i < D; i += 16) {
                     _mm512_storeu_ps(R + i, _mm512_mul_ps(scale, _mm512_loadu_ps(R + i)));
                 }
             }
         }
+        int tile_starts[(q_step + 15)/16];
+        const int n_tiles = mask_visible_query_tile_plan<q_step>(
+            visible_queries, nq, compact_gqa_mask, tile_starts);
         alignas(64) uint16_t prob[q_step*k_step];
-        for (int j = 0; j < nq; ++j) {
-            for (int k0 = 0; k0 < k_step; k0 += 32) {
-                const float * src = fms.cache + j*k_step + k0;
-                const __m512 lo = _mm512_loadu_ps(src + 0);
-                const __m512 hi = _mm512_loadu_ps(src + 16);
-                _mm512_store_si512((__m512i *) (prob + j*k_step + k0),
-                    (__m512i) _mm512_cvtne2ps_pbh(hi, lo));
+        for (int tile = 0; tile < n_tiles; ++tile) {
+            for (int offset = 0; offset < 16; ++offset) {
+                const int j = tile_starts[tile] + offset;
+                if (j >= nq || (visible_queries & (uint64_t{1} << j)) == 0) {
+                    std::memset(prob + j*k_step, 0, k_step*sizeof(uint16_t));
+                    continue;
+                }
+                for (int k0 = 0; k0 < k_step; k0 += 32) {
+                    const float * src = fms.cache + j*k_step + k0;
+                    const __m512 lo = _mm512_loadu_ps(src + 0);
+                    const __m512 hi = _mm512_loadu_ps(src + 16);
+                    _mm512_store_si512((__m512i *) (prob + j*k_step + k0),
+                        (__m512i) _mm512_cvtne2ps_pbh(hi, lo));
+                }
             }
-        }
-        if (nq < q_step) {
-            std::memset(prob + nq*k_step, 0, (q_step - nq)*k_step*sizeof(uint16_t));
         }
 
         constexpr int value_cols = 32;
         alignas(64) uint16_t value_pairs[16*value_cols*2];
-        const bool have_q1 = nq > 16;
         constexpr int c_stride = D*sizeof(float);
         constexpr int a_stride = k_step*sizeof(uint16_t);
         constexpr int b_stride = value_cols*2*sizeof(uint16_t);
+        alignas(64) static constexpr uint16_t interleave_lo_indices[32] = {
+             0, 32,  1, 33,  2, 34,  3, 35,  4, 36,  5, 37,  6, 38,  7, 39,
+             8, 40,  9, 41, 10, 42, 11, 43, 12, 44, 13, 45, 14, 46, 15, 47,
+        };
+        alignas(64) static constexpr uint16_t interleave_hi_indices[32] = {
+            16, 48, 17, 49, 18, 50, 19, 51, 20, 52, 21, 53, 22, 54, 23, 55,
+            24, 56, 25, 57, 26, 58, 27, 59, 28, 60, 29, 61, 30, 62, 31, 63,
+        };
+        const __m512i interleave_lo = _mm512_load_si512(interleave_lo_indices);
+        const __m512i interleave_hi = _mm512_load_si512(interleave_hi_indices);
 
-        for (int d0 = 0; d0 < D; d0 += value_cols) {
-            _tile_loadd(0, qkv_cache + d0, c_stride);
-            _tile_loadd(1, qkv_cache + d0 + 16, c_stride);
-            if (have_q1) {
-                _tile_loadd(2, qkv_cache + 16*D + d0, c_stride);
-                _tile_loadd(3, qkv_cache + 16*D + d0 + 16, c_stride);
-            }
+        // Four query tiles do not fit in the eight AMX registers together
+        // with the V tiles. Process visible tiles in pairs; V is revisited
+        // only when more than two visible query tiles remain.
+        for (int tile = 0; tile < n_tiles; tile += 2) {
+            const int q0 = tile_starts[tile];
+            const bool have_q1 = tile + 1 < n_tiles;
+            const int q1 = have_q1 ? tile_starts[tile + 1] : 0;
+            for (int d0 = 0; d0 < D; d0 += value_cols) {
+                _tile_loadd(0, qkv_cache + (size_t) q0*D + d0, c_stride);
+                _tile_loadd(1, qkv_cache + (size_t) q0*D + d0 + 16, c_stride);
+                if (have_q1) {
+                    _tile_loadd(2, qkv_cache + (size_t) q1*D + d0, c_stride);
+                    _tile_loadd(3, qkv_cache + (size_t) q1*D + d0 + 16, c_stride);
+                }
 
-            for (int k0 = 0; k0 < k_step; k0 += 32) {
-                for (int kp = 0; kp < 16; ++kp) {
-                    const uint16_t * v0 = (const uint16_t *) (vh.block + (k0 + 2*kp + 0)*vh.stride) + d0;
-                    const uint16_t * v1 = (const uint16_t *) (vh.block + (k0 + 2*kp + 1)*vh.stride) + d0;
-                    uint16_t * dst = value_pairs + kp*value_cols*2;
-                    for (int d = 0; d < value_cols; ++d) {
-                        dst[2*d + 0] = v0[d];
-                        dst[2*d + 1] = v1[d];
+                for (int k0 = 0; k0 < k_step; k0 += 32) {
+                    for (int kp = 0; kp < 16; ++kp) {
+                        const uint16_t * v0 = (const uint16_t *)
+                            (vh.block + (k0 + 2*kp + 0)*vh.stride) + d0;
+                        const uint16_t * v1 = (const uint16_t *)
+                            (vh.block + (k0 + 2*kp + 1)*vh.stride) + d0;
+                        uint16_t * dst = value_pairs + kp*value_cols*2;
+                        const __m512i row0 = _mm512_loadu_si512(v0);
+                        const __m512i row1 = _mm512_loadu_si512(v1);
+                        _mm512_store_si512(dst,
+                            _mm512_permutex2var_epi16(row0, interleave_lo, row1));
+                        _mm512_store_si512(dst + 32,
+                            _mm512_permutex2var_epi16(row0, interleave_hi, row1));
+                    }
+
+                    _tile_loadd(6, value_pairs, b_stride);
+                    _tile_loadd(7, value_pairs + 16*2, b_stride);
+                    _tile_loadd(4, prob + (size_t) q0*k_step + k0, a_stride);
+                    _tile_dpbf16ps(0, 4, 6);
+                    _tile_dpbf16ps(1, 4, 7);
+                    if (have_q1) {
+                        _tile_loadd(5, prob + (size_t) q1*k_step + k0, a_stride);
+                        _tile_dpbf16ps(2, 5, 6);
+                        _tile_dpbf16ps(3, 5, 7);
                     }
                 }
 
-                _tile_loadd(4, prob + k0, a_stride);
-                _tile_loadd(6, value_pairs, b_stride);
-                _tile_loadd(7, value_pairs + 16*2, b_stride);
-                _tile_dpbf16ps(0, 4, 6);
-                _tile_dpbf16ps(1, 4, 7);
+                _tile_stored(0, qkv_cache + (size_t) q0*D + d0, c_stride);
+                _tile_stored(1, qkv_cache + (size_t) q0*D + d0 + 16, c_stride);
                 if (have_q1) {
-                    _tile_loadd(5, prob + 16*k_step + k0, a_stride);
-                    _tile_dpbf16ps(2, 5, 6);
-                    _tile_dpbf16ps(3, 5, 7);
+                    _tile_stored(2, qkv_cache + (size_t) q1*D + d0, c_stride);
+                    _tile_stored(3, qkv_cache + (size_t) q1*D + d0 + 16, c_stride);
                 }
-            }
-
-            _tile_stored(0, qkv_cache + d0, c_stride);
-            _tile_stored(1, qkv_cache + d0 + 16, c_stride);
-            if (have_q1) {
-                _tile_stored(2, qkv_cache + 16*D + d0, c_stride);
-                _tile_stored(3, qkv_cache + 16*D + d0 + 16, c_stride);
             }
         }
     }
@@ -1855,6 +1949,38 @@ struct FlashQKbf16 {
         return mask + (size_t) (query/6)*(-stride_m);
     }
 
+    static inline uint64_t mask_visible_queries(
+            const char * mask, int stride_m, int n_queries) {
+        if (mask == nullptr) {
+            return n_queries >= 64 ? ~uint64_t{0} : (uint64_t{1} << n_queries) - 1;
+        }
+
+        constexpr uint16_t fp16_neg_inf = 0xfc00u;
+        int previous_mask_row = -1;
+        bool previous_visible = false;
+        uint64_t visible_queries = 0;
+        for (int query = 0; query < n_queries; ++query) {
+            const int source_row = stride_m >= 0 ? query : query/6;
+            bool visible = previous_visible;
+            if (source_row != previous_mask_row) {
+                visible = false;
+                const auto * row = (const uint16_t *) mask_row(mask, stride_m, query);
+                for (int token = 0; token < k_step; ++token) {
+                    if (row[token] != fp16_neg_inf) {
+                        visible = true;
+                        break;
+                    }
+                }
+                previous_mask_row = source_row;
+                previous_visible = visible;
+            }
+            if (visible) {
+                visible_queries |= uint64_t{1} << query;
+            }
+        }
+        return visible_queries;
+    }
+
 #if defined(GGML_AMX_BF16) && defined(__AMX_TILE__) && defined(__AMX_BF16__) && defined(__x86_64__)
     constexpr static int amx_m = 16;
     constexpr static int amx_n = 16;
@@ -1863,39 +1989,73 @@ struct FlashQKbf16 {
     constexpr static int amx_q_groups = (q_step + amx_n - 1)/amx_n;
     constexpr static int amx_k_groups = D/amx_k;
     constexpr static int amx_b_block_u16 = amx_b_rows*amx_n*2;
+    constexpr static int amx_query_tile_u16 = amx_k_groups*amx_b_block_u16;
+    constexpr static int amx_extra_query_tiles = 2*amx_q_groups;
 
     struct amx_q_storage {
         // B is stored in AMX BF16 pair order: [K/2][N][2]. Keeping a
         // fixed 16-column stride lets partial query groups reuse one config.
         alignas(64) uint16_t data[amx_q_groups*amx_k_groups*amx_b_block_u16];
+        int extra_count;
+        int extra_first[amx_extra_query_tiles];
+        alignas(64) uint16_t extra[amx_extra_query_tiles*amx_query_tile_u16];
     };
 
+    static inline void pack_query_tile(
+            int nq, const ggml_bf16_t * q, int first_query, uint16_t * dst) {
+        std::memset(dst, 0, amx_query_tile_u16*sizeof(uint16_t));
+        const int this_n = std::min(amx_n, nq - first_query);
+        for (int kb = 0; kb < amx_k_groups; ++kb) {
+            uint16_t * block = dst + kb*amx_b_block_u16;
+            for (int ik = 0; ik < amx_b_rows; ++ik) {
+                for (int in = 0; in < this_n; ++in) {
+                    const ggml_bf16_t * qr =
+                        q + (first_query + in)*D + kb*amx_k;
+                    block[(ik*amx_n + in)*2 + 0] = qr[2*ik + 0].bits;
+                    block[(ik*amx_n + in)*2 + 1] = qr[2*ik + 1].bits;
+                }
+            }
+        }
+    }
+
+    static inline const uint16_t * query_tile(
+            int nq, const ggml_bf16_t * q, int first_query,
+            amx_q_storage& packed, uint16_t * scratch) {
+        if (first_query % amx_n == 0) {
+            return packed.data + (first_query/amx_n)*amx_query_tile_u16;
+        }
+        for (int i = 0; i < packed.extra_count; ++i) {
+            if (packed.extra_first[i] == first_query) {
+                return packed.extra + i*amx_query_tile_u16;
+            }
+        }
+        if (packed.extra_count < amx_extra_query_tiles) {
+            const int index = packed.extra_count++;
+            packed.extra_first[index] = first_query;
+            uint16_t * dst = packed.extra + index*amx_query_tile_u16;
+            pack_query_tile(nq, q, first_query, dst);
+            return dst;
+        }
+        pack_query_tile(nq, q, first_query, scratch);
+        return scratch;
+    }
+
     static bool amx_begin(int nq, const ggml_bf16_t * q, amx_q_storage& packed) {
-        // The fused Qwen GQA path has 6--30 rows per mask-compatible query
-        // group. Larger prefill tiles need a different register schedule and
-        // remain on AVX-512 BF16.
+        // Process up to four 16-row query tiles.  Only two tiles fit beside
+        // the two K tiles and four accumulators at once, so larger cohorts are
+        // handled in pairs while the current K block remains cache-resident.
         if constexpr (D != 256 || q_step < 16) {
             return false;
         }
-        if (nq < 6 || nq > 32 || !fa_amx_bf16_runtime_available()) {
+        if (nq < 6 || nq > q_step || nq > 4*amx_n || !fa_amx_bf16_runtime_available()) {
             return false;
         }
 
-        std::memset(packed.data, 0, sizeof(packed.data));
+        packed.extra_count = 0;
         const int n_groups = (nq + amx_n - 1)/amx_n;
         for (int ng = 0; ng < n_groups; ++ng) {
-            const int this_n = std::min(amx_n, nq - ng*amx_n);
-            for (int kb = 0; kb < amx_k_groups; ++kb) {
-                uint16_t * block = packed.data +
-                    (ng*amx_k_groups + kb)*amx_b_block_u16;
-                for (int ik = 0; ik < amx_b_rows; ++ik) {
-                    for (int in = 0; in < this_n; ++in) {
-                        const ggml_bf16_t * qr = q + (ng*amx_n + in)*D + kb*amx_k;
-                        block[(ik*amx_n + in)*2 + 0] = qr[2*ik + 0].bits;
-                        block[(ik*amx_n + in)*2 + 1] = qr[2*ik + 1].bits;
-                    }
-                }
-            }
+            pack_query_tile(nq, q, ng*amx_n,
+                packed.data + ng*amx_query_tile_u16);
         }
 
         alignas(64) fa_amx_tile_config config = {};
@@ -1909,51 +2069,71 @@ struct FlashQKbf16 {
     }
 
     template <typename KHelper>
-    static inline void multiply_mask_kq_amx(const KHelper& kh, int nq, int stride_m,
-            const amx_q_storage& packed, const char * mask, FlashMS<q_step, k_step>& fms) {
+    static inline uint64_t multiply_mask_kq_amx(
+            const KHelper& kh, int nq, int stride_m, const ggml_bf16_t * q,
+            amx_q_storage& packed, const char * mask, FlashMS<q_step, k_step>& fms) {
         alignas(64) float result[32*32];
-        const bool have_n1 = nq > amx_n;
+        const uint64_t visible_queries = mask_visible_queries(mask, stride_m, nq);
+        int tile_starts[amx_q_groups];
+        const int n_tiles = mask_visible_query_tile_plan<q_step>(
+            visible_queries, nq, stride_m < 0, tile_starts);
+        alignas(64) uint16_t scratch[amx_q_groups][amx_query_tile_u16];
+        const uint16_t * tile_data[amx_q_groups];
+        for (int tile = 0; tile < n_tiles; ++tile) {
+            tile_data[tile] = query_tile(
+                nq, q, tile_starts[tile], packed, scratch[tile]);
+        }
 
         for (int m0 = 0; m0 < k_step; m0 += 2*amx_m) {
-            _tile_zero(0);
-            _tile_zero(2);
-            if (have_n1) {
-                _tile_zero(1);
-                _tile_zero(3);
-            }
-
-            for (int kb = 0; kb < amx_k_groups; ++kb) {
-                const char * a0 = kh.block + static_cast<size_t>(m0 + 0)*kh.stride +
-                    static_cast<size_t>(kb*amx_k)*sizeof(uint16_t);
-                const char * a1 = kh.block + static_cast<size_t>(m0 + amx_m)*kh.stride +
-                    static_cast<size_t>(kb*amx_k)*sizeof(uint16_t);
-                const uint16_t * b0 = packed.data + kb*amx_b_block_u16;
-                _tile_loadd(4, a0, kh.stride);
-                _tile_loadd(5, a1, kh.stride);
-                _tile_loadd(6, b0, amx_n*2*sizeof(uint16_t));
-                _tile_dpbf16ps(0, 4, 6);
-                _tile_dpbf16ps(2, 5, 6);
+            for (int tile = 0; tile < n_tiles; tile += 2) {
+                const bool have_n1 = tile + 1 < n_tiles;
+                _tile_zero(0);
+                _tile_zero(2);
                 if (have_n1) {
-                    const uint16_t * b1 = packed.data +
-                        amx_k_groups*amx_b_block_u16 + kb*amx_b_block_u16;
-                    _tile_loadd(7, b1, amx_n*2*sizeof(uint16_t));
-                    _tile_dpbf16ps(1, 4, 7);
-                    _tile_dpbf16ps(3, 5, 7);
+                    _tile_zero(1);
+                    _tile_zero(3);
                 }
-            }
 
-            _tile_stored(0, result + 0*32 + 0, 32*sizeof(float));
-            _tile_stored(2, result + amx_m*32 + 0, 32*sizeof(float));
-            if (have_n1) {
-                _tile_stored(1, result + 0*32 + amx_n, 32*sizeof(float));
-                _tile_stored(3, result + amx_m*32 + amx_n, 32*sizeof(float));
-            }
+                for (int kb = 0; kb < amx_k_groups; ++kb) {
+                    const char * a0 = kh.block + static_cast<size_t>(m0 + 0)*kh.stride +
+                        static_cast<size_t>(kb*amx_k)*sizeof(uint16_t);
+                    const char * a1 = kh.block + static_cast<size_t>(m0 + amx_m)*kh.stride +
+                        static_cast<size_t>(kb*amx_k)*sizeof(uint16_t);
+                    _tile_loadd(4, a0, kh.stride);
+                    _tile_loadd(5, a1, kh.stride);
+                    const uint16_t * b0 = tile_data[tile] + kb*amx_b_block_u16;
+                    _tile_loadd(6, b0, amx_n*2*sizeof(uint16_t));
+                    _tile_dpbf16ps(0, 4, 6);
+                    _tile_dpbf16ps(2, 5, 6);
+                    if (have_n1) {
+                        const uint16_t * b1 = tile_data[tile + 1] + kb*amx_b_block_u16;
+                        _tile_loadd(7, b1, amx_n*2*sizeof(uint16_t));
+                        _tile_dpbf16ps(1, 4, 7);
+                        _tile_dpbf16ps(3, 5, 7);
+                    }
+                }
 
-            // AMX produces [K token][query], while FlashMS is query-major.
-            // This is only a 32x(<=32) L1-resident transpose per K block.
-            for (int j = 0; j < nq; ++j) {
-                for (int l = 0; l < 2*amx_m; ++l) {
-                    fms.cache[j*k_step + m0 + l] = result[l*32 + j];
+                _tile_stored(0, result + 0*32 + 0, 32*sizeof(float));
+                _tile_stored(2, result + amx_m*32 + 0, 32*sizeof(float));
+                if (have_n1) {
+                    _tile_stored(1, result + 0*32 + amx_n, 32*sizeof(float));
+                    _tile_stored(3, result + amx_m*32 + amx_n, 32*sizeof(float));
+                }
+
+                // AMX produces [K token][query], while FlashMS is query-major.
+                for (int pair_tile = 0; pair_tile < (have_n1 ? 2 : 1); ++pair_tile) {
+                    const int first_query = tile_starts[tile + pair_tile];
+                    const int this_nq = std::min(amx_n, nq - first_query);
+                    for (int j = 0; j < this_nq; ++j) {
+                        const int query = first_query + j;
+                        if ((visible_queries & (uint64_t{1} << query)) == 0) {
+                            continue;
+                        }
+                        for (int l = 0; l < 2*amx_m; ++l) {
+                            fms.cache[query*k_step + m0 + l] =
+                                result[l*32 + pair_tile*amx_n + j];
+                        }
+                    }
                 }
             }
         }
@@ -1962,6 +2142,7 @@ struct FlashQKbf16 {
         for (int j = 0; j < nq; ++j) {
             fms.update_M_S(j, vk, mask_row(mask, stride_m, j));
         }
+        return visible_queries;
     }
 
     static inline void amx_end() {
@@ -2307,7 +2488,7 @@ struct FlashAttnBF16 {
 #if defined(GGML_AMX_BF16) && defined(__AMX_TILE__) && defined(__AMX_BF16__) && defined(__x86_64__)
             const bool use_amx = FlashQKbf16<Dk, q_step, k_step>::amx_begin(q_step, q_bf16, q_amx);
             bool use_amx_pv = false;
-            if constexpr (Dk == 256 && Dv == 256 && q_step >= 16 && q_step <= 32) {
+            if constexpr (Dk == 256 && Dv == 256 && q_step >= 16 && q_step <= 64) {
                 use_amx_pv = use_amx && fa_amx_pv_enabled();
                 if (use_amx_pv) {
                     fqkv.prepare_qkv_amx(q_step);
@@ -2320,6 +2501,7 @@ struct FlashAttnBF16 {
             auto mr = mask;
             int nk1_eff = mask_effective_nk1(mr, q_step, stride_m, nk1, k_step);
             for (int k1 = 0; k1 < nk1_eff/k_step; ++k1) {
+                uint64_t visible_queries = 0;
                 ++pages_checked;
                 if (mask_page_all_invisible(mr, q_step, stride_m, k_step)) {
                     ++pages_skipped;
@@ -2333,8 +2515,8 @@ struct FlashAttnBF16 {
 #if FA_TIMING
                     t1 = Perf::cur_time();
 #endif
-                    FlashQKbf16<Dk, q_step, k_step>::multiply_mask_kq_amx(
-                        kh, q_step, stride_m, q_amx, mr, fms);
+                    visible_queries = FlashQKbf16<Dk, q_step, k_step>::multiply_mask_kq_amx(
+                        kh, q_step, stride_m, q_bf16, q_amx, mr, fms);
 #if FA_TIMING
                     perf.accum_nolock(1, t1);
 #endif
@@ -2351,9 +2533,10 @@ struct FlashAttnBF16 {
                 t1 = Perf::cur_time();
 #endif
 #if defined(GGML_AMX_BF16) && defined(__AMX_TILE__) && defined(__AMX_BF16__) && defined(__x86_64__)
-                if constexpr (Dk == 256 && Dv == 256 && q_step >= 16 && q_step <= 32) {
+                if constexpr (Dk == 256 && Dv == 256 && q_step >= 16 && q_step <= 64) {
                     if (use_amx_pv) {
-                        fqkv.accumulate_qkv_amx(q_step, vh, fms);
+                        fqkv.accumulate_qkv_amx(
+                            q_step, visible_queries, stride_m < 0, vh, fms);
                     } else {
                         fqkv.accumulate_qkv(vh, fms);
                     }
@@ -2397,7 +2580,7 @@ struct FlashAttnBF16 {
 #if defined(GGML_AMX_BF16) && defined(__AMX_TILE__) && defined(__AMX_BF16__) && defined(__x86_64__)
             const bool use_amx = FlashQKbf16<Dk, q_step, k_step>::amx_begin(n_left, q_bf16, q_amx);
             bool use_amx_pv = false;
-            if constexpr (Dk == 256 && Dv == 256 && q_step >= 16 && q_step <= 32) {
+            if constexpr (Dk == 256 && Dv == 256 && q_step >= 16 && q_step <= 64) {
                 use_amx_pv = use_amx && fa_amx_pv_enabled();
                 if (use_amx_pv) {
                     fqkv.prepare_qkv_amx(n_left);
@@ -2406,6 +2589,7 @@ struct FlashAttnBF16 {
 #endif
             auto mr = mask;
             for (int k1 = 0; k1 < nk1/k_step; ++k1) {
+                uint64_t visible_queries = 0;
                 ++pages_checked;
                 if (mask_page_all_invisible(mr, n_left, stride_m, k_step)) {
                     ++pages_skipped;
@@ -2416,17 +2600,18 @@ struct FlashAttnBF16 {
                 }
 #if defined(GGML_AMX_BF16) && defined(__AMX_TILE__) && defined(__AMX_BF16__) && defined(__x86_64__)
                 if (use_amx) {
-                    FlashQKbf16<Dk, q_step, k_step>::multiply_mask_kq_amx(
-                        kh, n_left, stride_m, q_amx, mr, fms);
+                    visible_queries = FlashQKbf16<Dk, q_step, k_step>::multiply_mask_kq_amx(
+                        kh, n_left, stride_m, q_bf16, q_amx, mr, fms);
                 } else
 #endif
                 {
                 FlashQKbf16<Dk, q_step, k_step>::multiply_mask_kq(n_left, kh, stride_m, q_bf16, mr, fms);
                 }
 #if defined(GGML_AMX_BF16) && defined(__AMX_TILE__) && defined(__AMX_BF16__) && defined(__x86_64__)
-                if constexpr (Dk == 256 && Dv == 256 && q_step >= 16 && q_step <= 32) {
+                if constexpr (Dk == 256 && Dv == 256 && q_step >= 16 && q_step <= 64) {
                     if (use_amx_pv) {
-                        fqkv.accumulate_qkv_amx(n_left, vh, fms);
+                        fqkv.accumulate_qkv_amx(
+                            n_left, visible_queries, stride_m < 0, vh, fms);
                     } else {
                         fqkv.accumulate_qkv(n_left, vh, fms);
                     }
@@ -2535,9 +2720,19 @@ inline void iqk_flash_helper_T(int nq1, int nk1, int stride_q, int stride_k, int
                         float scale, float softcap, float * qkv, const float * sinkf, int sink_stride, float * M, float * S) {
     HelperBF16<Dk, k_step> kh(k, stride_k);
     HelperBF16<Dv, k_step> vh(v, stride_v);
-    // A fused Qwen MTP/GQA batch contains 12, 18, 24, or 30 query rows.
-    // Pick a q_step that covers the complete batch so K/V is traversed once,
-    // even when each NUMA worker owns less than 4096 cache rows.
+    // Pick a q_step that covers the complete fused GQA cohort so each NUMA
+    // worker traverses its K/V chunk once. AMX handles four 16-row query tiles
+    // in two register-resident waves.
+    if (nq1 > 48 && nq1 <= 64) {
+        FlashAttnBF16<Dk, Dv, 64, k_step> fa(scale, softcap, sinkf, sink_stride);
+        fa.compute(kh, vh, nq1, nk1, stride_q, stride_m, stride_qkv, q, (const char *)mask, qkv, M, S);
+        return;
+    }
+    if (nq1 > 32 && nq1 <= 48) {
+        FlashAttnBF16<Dk, Dv, 48, k_step> fa(scale, softcap, sinkf, sink_stride);
+        fa.compute(kh, vh, nq1, nk1, stride_q, stride_m, stride_qkv, q, (const char *)mask, qkv, M, S);
+        return;
+    }
     if (nq1 > 16 && nq1 <= 32) {
         FlashAttnBF16<Dk, Dv, 32, k_step> fa(scale, softcap, sinkf, sink_stride);
         fa.compute(kh, vh, nq1, nk1, stride_q, stride_m, stride_qkv, q, (const char *)mask, qkv, M, S);
