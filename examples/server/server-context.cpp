@@ -16,8 +16,602 @@
 #include <fstream>
 #include <filesystem>
 #include <iostream>
+#include <cmath>
+#include <map>
+#include <limits>
 #include <regex>
 #include <exception>
+
+struct server_mtp_adaptive_arm {
+    int32_t value = 0;
+    double reward_ema = 0.0;
+    double rate_tokens = 0.0;
+    double rate_seconds = 0.0;
+    double rate_sample_mean = 0.0;
+    double rate_sample_m2 = 0.0;
+    uint64_t samples = 0;
+    uint64_t selections = 0;
+    bool prior_only = false;
+};
+
+struct server_mtp_adaptive_bandit {
+    std::vector<server_mtp_adaptive_arm> arms;
+    int32_t initial_value = 0;
+    int32_t current_idx = -1;
+    uint64_t decisions = 0;
+    uint64_t updates = 0;
+    bool rate_weighted = false;
+
+    server_mtp_adaptive_bandit() = default;
+
+    server_mtp_adaptive_bandit(std::vector<int32_t> values, int32_t initial) : initial_value(initial) {
+        std::sort(values.begin(), values.end());
+        values.erase(std::unique(values.begin(), values.end()), values.end());
+        arms.reserve(values.size());
+        for (int32_t value : values) {
+            arms.push_back({ value, 0.0, 0.0, 0.0, 0.0, 0.0, 0, 0, false });
+        }
+    }
+
+    void seed_relative_prior(const server_mtp_adaptive_bandit & source) {
+        double source_scale = 0.0;
+        for (const auto & arm : source.arms) {
+            if (arm.samples > 0) {
+                source_scale = std::max(source_scale, arm.reward_ema);
+            }
+        }
+        if (!(source_scale > 0.0) || !std::isfinite(source_scale)) {
+            return;
+        }
+
+        initial_value = source.best_value();
+        for (auto & arm : arms) {
+            const auto it = std::find_if(source.arms.begin(), source.arms.end(), [&](const auto & candidate) {
+                return candidate.value == arm.value && candidate.samples > 0;
+            });
+            if (it == source.arms.end()) {
+                continue;
+            }
+
+            // Workload classes have different absolute token rates.  Transfer
+            // only the relative arm ordering, with one pseudo-observation, so
+            // the first local measurements can override it immediately.
+            arm.reward_ema = it->reward_ema / source_scale;
+            arm.samples = 1;
+            arm.prior_only = true;
+        }
+    }
+
+    int32_t select() {
+        GGML_ASSERT(!arms.empty());
+        ++decisions;
+
+        // Cold-start around the topology/user-derived initial value, then
+        // cover every arm before using a confidence bonus.  This avoids
+        // baking a machine-specific MTP depth or prompt quantum into code.
+        int32_t selected = -1;
+        int64_t selected_distance = std::numeric_limits<int64_t>::max();
+        const uint64_t required_local_samples = rate_weighted ? 2 : 1;
+        for (int32_t i = 0; i < (int32_t) arms.size(); ++i) {
+            // A transferred prior is deliberately weak and must not count as
+            // local coverage.  Re-measure every inherited arm once in the new
+            // workload before confidence-based selection begins.
+            if (arms[i].samples >= required_local_samples && !arms[i].prior_only) {
+                continue;
+            }
+            const int64_t distance = std::abs((int64_t) arms[i].value - initial_value);
+            if (distance < selected_distance ||
+                    (distance == selected_distance &&
+                     (selected < 0 || arms[i].value > arms[selected].value))) {
+                selected = i;
+                selected_distance = distance;
+            }
+        }
+
+        if (selected < 0) {
+            double best_score = -std::numeric_limits<double>::infinity();
+            if (rate_weighted) {
+                double pooled_m2 = 0.0;
+                uint64_t pooled_degrees = 0;
+                for (const auto & arm : arms) {
+                    if (arm.samples > 1) {
+                        pooled_m2 += arm.rate_sample_m2;
+                        pooled_degrees += arm.samples - 1;
+                    }
+                }
+                const double pooled_variance = pooled_degrees > 0
+                    ? pooled_m2 / pooled_degrees : 0.0;
+                for (int32_t i = 0; i < (int32_t) arms.size(); ++i) {
+                    const auto & arm = arms[i];
+                    // Gaussian UCB with variance learned from the current
+                    // workload.  Acceptance-noisy workloads receive longer
+                    // probes automatically; deterministic ones converge
+                    // without a fixed token/time window.
+                    const double confidence = pooled_variance > 0.0
+                        ? std::sqrt(2.0 * pooled_variance *
+                            std::log((double) decisions + 1.0) / (double) arm.samples)
+                        : 0.0;
+                    const double score = arm.reward_ema + confidence;
+                    if (score > best_score) {
+                        best_score = score;
+                        selected = i;
+                    }
+                }
+            } else {
+                double reward_scale = 0.0;
+                for (const auto & arm : arms) {
+                    reward_scale = std::max(reward_scale, arm.reward_ema);
+                }
+                reward_scale = std::max(reward_scale, 1e-9);
+
+                for (int32_t i = 0; i < (int32_t) arms.size(); ++i) {
+                    const auto & arm = arms[i];
+                    const double confidence = std::sqrt(
+                        2.0 * std::log((double) decisions + 1.0) / (double) arm.samples);
+                    const double score = arm.reward_ema + 0.15 * reward_scale * confidence;
+                    if (score > best_score) {
+                        best_score = score;
+                        selected = i;
+                    }
+                }
+            }
+        }
+
+        current_idx = selected;
+        ++arms[current_idx].selections;
+        return arms[current_idx].value;
+    }
+
+    void update(double reward) {
+        if (current_idx < 0 || !std::isfinite(reward) || reward <= 0.0) {
+            return;
+        }
+        auto & arm = arms[current_idx];
+        if (arm.prior_only) {
+            arm.reward_ema = reward;
+            arm.prior_only = false;
+            ++updates;
+            return;
+        }
+        ++arm.samples;
+        ++updates;
+        if (arm.samples == 1) {
+            arm.reward_ema = reward;
+        } else {
+            // A recency-weighted score follows context growth and changing
+            // acceptance distributions without throwing away prior samples.
+            arm.reward_ema += 0.20 * (reward - arm.reward_ema);
+        }
+    }
+
+    void update_rate(double tokens, double elapsed_s) {
+        if (current_idx < 0 || !std::isfinite(tokens) || !std::isfinite(elapsed_s) ||
+                tokens <= 0.0 || elapsed_s <= 0.0) {
+            return;
+        }
+
+        rate_weighted = true;
+        auto & arm = arms[current_idx];
+        if (arm.prior_only) {
+            // A transferred relative prior orders the cold start but carries
+            // no time base.  Replace it with the first local rate sample.
+            arm.samples = 0;
+            arm.rate_tokens = 0.0;
+            arm.rate_seconds = 0.0;
+            arm.rate_sample_mean = 0.0;
+            arm.rate_sample_m2 = 0.0;
+            arm.prior_only = false;
+        }
+
+        const double sample_rate = tokens / elapsed_s;
+        ++arm.samples;
+        ++updates;
+        const double delta = sample_rate - arm.rate_sample_mean;
+        arm.rate_sample_mean += delta / arm.samples;
+        arm.rate_sample_m2 += delta * (sample_rate - arm.rate_sample_mean);
+        arm.rate_tokens += tokens;
+        arm.rate_seconds += elapsed_s;
+        arm.reward_ema = arm.rate_tokens / arm.rate_seconds;
+    }
+
+    int32_t best_value() const {
+        int32_t best = current_idx >= 0 ? current_idx : 0;
+        for (int32_t i = 0; i < (int32_t) arms.size(); ++i) {
+            if (arms[i].samples > 0 &&
+                    (arms[best].samples == 0 || arms[i].reward_ema > arms[best].reward_ema)) {
+                best = i;
+            }
+        }
+        return arms.empty() ? 0 : arms[best].value;
+    }
+
+    double current_reward() const {
+        return current_idx >= 0 ? arms[current_idx].reward_ema : 0.0;
+    }
+
+    bool locally_mature() const {
+        return std::all_of(arms.begin(), arms.end(), [](const auto & arm) {
+            return arm.samples > 0 && !arm.prior_only;
+        });
+    }
+
+    bool current_is_best() const {
+        return current_idx >= 0 && arms[current_idx].value == best_value();
+    }
+
+    json state_json() const {
+        json result = json::array();
+        for (const auto & arm : arms) {
+            result.push_back({
+                {"value", arm.value},
+                {"reward_ema", arm.reward_ema},
+                {"rate_tokens", arm.rate_tokens},
+                {"rate_seconds", arm.rate_seconds},
+                {"rate_sample_mean", arm.rate_sample_mean},
+                {"rate_sample_stddev", arm.samples > 1
+                    ? std::sqrt(arm.rate_sample_m2 / (arm.samples - 1)) : 0.0},
+                {"samples", arm.samples},
+                {"selections", arm.selections},
+                {"prior_only", arm.prior_only},
+            });
+        }
+        return result;
+    }
+};
+
+struct server_mtp_adaptive_scheduler {
+    int32_t max_depth = 0;
+    int32_t n_parallel = 1;
+    int32_t max_draft_rows = 0;
+
+    std::map<uint64_t, server_mtp_adaptive_bandit> decode_bandits;
+    std::map<uint64_t, server_mtp_adaptive_bandit> decode_width_bandits;
+    std::map<uint64_t, server_mtp_adaptive_bandit> prompt_bandits;
+    std::map<uint64_t, double> decode_reference_tps;
+    std::map<uint64_t, double> decode_width_reference_tps;
+
+    double prefill_reference_tps = 0.0;
+    double last_reward = 0.0;
+    int32_t current_depth = -1;
+    int32_t current_prompt_chunk = 0;
+    int32_t current_active_decode = 0;
+    int32_t current_resident_decode = 0;
+    int32_t current_decode_width = 0;
+    int32_t current_decode_width_context_bucket = 0;
+    int32_t current_pending_prompt = 0;
+    int32_t current_context_bucket = 0;
+    int32_t current_max_feasible_depth = 0;
+    int32_t current_draft_rows = 0;
+    uint64_t decode_updates = 0;
+    uint64_t decode_width_updates = 0;
+    uint64_t decode_width_deferred = 0;
+    uint64_t prompt_updates = 0;
+    uint64_t prompt_censored = 0;
+    uint64_t decode_prior_transfers = 0;
+    uint64_t decode_width_prior_transfers = 0;
+    size_t decode_round_robin_cursor = 0;
+
+    server_mtp_adaptive_scheduler(int32_t max_depth, int32_t n_parallel, int32_t max_draft_rows)
+        : max_depth(std::max(0, max_depth)),
+          n_parallel(std::max(1, n_parallel)),
+          max_draft_rows(std::max(0, max_draft_rows)) {}
+
+    static int32_t context_bucket(int32_t n_past) {
+        uint32_t value = (uint32_t) std::max(1, n_past);
+        int32_t bucket = 0;
+        while (value > 1) {
+            value >>= 1;
+            ++bucket;
+        }
+        return bucket;
+    }
+
+    static uint64_t workload_key(int32_t active_decode, int32_t pending_prompt, int32_t bucket) {
+        return ((uint64_t) (uint32_t) active_decode << 40) |
+               ((uint64_t) (uint32_t) pending_prompt << 24) |
+               (uint32_t) bucket;
+    }
+
+    server_mtp_adaptive_bandit & decode_bandit(int32_t active_decode, int32_t bucket) {
+        const uint64_t key = workload_key(active_decode, 0, bucket);
+        auto it = decode_bandits.find(key);
+        if (it == decode_bandits.end()) {
+            const int32_t feasible_max_depth = max_draft_rows > 0 && active_decode > 0
+                ? std::min(max_depth, max_draft_rows / active_decode)
+                : max_depth;
+            std::vector<int32_t> depths;
+            depths.reserve((size_t) feasible_max_depth + 1);
+            for (int32_t depth = 0; depth <= feasible_max_depth; ++depth) {
+                depths.push_back(depth);
+            }
+            const int32_t initial = feasible_max_depth > 0
+                ? std::max(1, feasible_max_depth / 2)
+                : 0;
+            server_mtp_adaptive_bandit created(std::move(depths), initial);
+
+            // Reuse only a weak, dimensionless prior from the closest mature
+            // workload.  Same-concurrency history at an adjacent context size
+            // wins; otherwise the nearest active-request count is used.  The
+            // controller still measures and can reverse every inherited rank.
+            const server_mtp_adaptive_bandit * prior = nullptr;
+            int32_t prior_active = 0;
+            int32_t prior_bucket = 0;
+            std::tuple<int32_t, int32_t, int32_t, int32_t, int64_t> prior_score = {
+                std::numeric_limits<int32_t>::max(),
+                std::numeric_limits<int32_t>::max(),
+                std::numeric_limits<int32_t>::max(),
+                std::numeric_limits<int32_t>::max(),
+                std::numeric_limits<int64_t>::max(),
+            };
+            for (const auto & entry : decode_bandits) {
+                const auto & candidate = entry.second;
+                if (candidate.updates == 0) {
+                    continue;
+                }
+                const int32_t candidate_active = (int32_t) (entry.first >> 40);
+                const int32_t candidate_bucket = (int32_t) (entry.first & 0x00ffffffu);
+                const int32_t immature = candidate.updates < candidate.arms.size() ? 1 : 0;
+                const auto score = std::make_tuple(
+                    immature,
+                    candidate_active == active_decode ? 0 : 1,
+                    std::abs(candidate_bucket - bucket),
+                    std::abs(candidate_active - active_decode),
+                    -(int64_t) candidate.updates);
+                if (score < prior_score) {
+                    prior_score = score;
+                    prior = &candidate;
+                    prior_active = candidate_active;
+                    prior_bucket = candidate_bucket;
+                }
+            }
+            if (prior != nullptr) {
+                created.seed_relative_prior(*prior);
+                ++decode_prior_transfers;
+                LOG_INFO("adaptive MTP decode prior transferred", {
+                    {"active_decode", active_decode},
+                    {"context_bucket", bucket},
+                    {"source_active_decode", prior_active},
+                    {"source_context_bucket", prior_bucket},
+                    {"source_best_depth", prior->best_value()},
+                    {"source_updates", prior->updates},
+                    {"prior_arms", created.state_json()},
+                });
+            }
+            it = decode_bandits.emplace(key, std::move(created)).first;
+        }
+        return it->second;
+    }
+
+    server_mtp_adaptive_bandit & decode_width_bandit(int32_t resident_decode, int32_t bucket) {
+        const uint64_t key = workload_key(resident_decode, 0, bucket);
+        auto it = decode_width_bandits.find(key);
+        if (it == decode_width_bandits.end()) {
+            std::vector<int32_t> widths;
+            widths.reserve((size_t) std::max(1, resident_decode));
+            for (int32_t width = 1; width <= std::max(1, resident_decode); ++width) {
+                widths.push_back(width);
+            }
+
+            // Start work-conserving, then measure every narrower cohort.  The
+            // arm set comes entirely from the number of runnable slots; no
+            // context-length-to-width policy is encoded here.
+            server_mtp_adaptive_bandit created(std::move(widths), std::max(1, resident_decode));
+
+            const server_mtp_adaptive_bandit * prior = nullptr;
+            int32_t prior_resident = 0;
+            int32_t prior_bucket = 0;
+            std::tuple<int32_t, int32_t, int32_t, int32_t, int64_t> prior_score = {
+                std::numeric_limits<int32_t>::max(),
+                std::numeric_limits<int32_t>::max(),
+                std::numeric_limits<int32_t>::max(),
+                std::numeric_limits<int32_t>::max(),
+                std::numeric_limits<int64_t>::max(),
+            };
+            for (const auto & entry : decode_width_bandits) {
+                const auto & candidate = entry.second;
+                if (candidate.updates == 0) {
+                    continue;
+                }
+                const int32_t candidate_resident = (int32_t) (entry.first >> 40);
+                const int32_t candidate_bucket = (int32_t) (entry.first & 0x00ffffffu);
+                const int32_t immature = candidate.updates < candidate.arms.size() ? 1 : 0;
+                const auto score = std::make_tuple(
+                    immature,
+                    candidate_resident == resident_decode ? 0 : 1,
+                    std::abs(candidate_bucket - bucket),
+                    std::abs(candidate_resident - resident_decode),
+                    -(int64_t) candidate.updates);
+                if (score < prior_score) {
+                    prior_score = score;
+                    prior = &candidate;
+                    prior_resident = candidate_resident;
+                    prior_bucket = candidate_bucket;
+                }
+            }
+            if (prior != nullptr) {
+                created.seed_relative_prior(*prior);
+                ++decode_width_prior_transfers;
+                LOG_INFO("adaptive decode-width prior transferred", {
+                    {"resident_decode", resident_decode},
+                    {"context_bucket", bucket},
+                    {"source_resident_decode", prior_resident},
+                    {"source_context_bucket", prior_bucket},
+                    {"source_best_width", prior->best_value()},
+                    {"source_updates", prior->updates},
+                    {"prior_arms", created.state_json()},
+                });
+            }
+            it = decode_width_bandits.emplace(key, std::move(created)).first;
+        }
+        return it->second;
+    }
+
+    server_mtp_adaptive_bandit & prompt_bandit(
+            int32_t active_decode, int32_t pending_prompt, int32_t bucket,
+            int32_t n_batch, int32_t n_ubatch) {
+        const uint64_t key = workload_key(active_decode, pending_prompt, bucket);
+        auto it = prompt_bandits.find(key);
+        if (it == prompt_bandits.end()) {
+            std::vector<int32_t> chunks;
+            const int32_t min_chunk = std::max(1, std::min(n_batch, n_ubatch / n_parallel));
+            int32_t chunk = std::max(1, n_batch);
+            while (true) {
+                chunks.push_back(chunk);
+                if (chunk <= min_chunk) {
+                    break;
+                }
+                const int32_t next = std::max(min_chunk, (chunk + 1) / 2);
+                if (next == chunk) {
+                    break;
+                }
+                chunk = next;
+            }
+            it = prompt_bandits.emplace(key,
+                server_mtp_adaptive_bandit(std::move(chunks), n_batch)).first;
+        }
+        return it->second;
+    }
+
+    int32_t select_depth(int32_t active_decode, int32_t bucket) {
+        current_active_decode = active_decode;
+        current_pending_prompt = 0;
+        current_context_bucket = bucket;
+        current_depth = decode_bandit(active_decode, bucket).select();
+        current_max_feasible_depth = max_draft_rows > 0 && active_decode > 0
+            ? std::min(max_depth, max_draft_rows / active_decode)
+            : max_depth;
+        current_draft_rows = active_decode * current_depth;
+        return current_depth;
+    }
+
+    int32_t select_decode_width(int32_t resident_decode, int32_t bucket) {
+        current_resident_decode = resident_decode;
+        current_pending_prompt = 0;
+        current_context_bucket = bucket;
+        current_decode_width_context_bucket = bucket;
+        current_decode_width = decode_width_bandit(resident_decode, bucket).select();
+        return current_decode_width;
+    }
+
+    void set_decode_width(int32_t resident_decode, int32_t width, int32_t bucket) {
+        current_resident_decode = resident_decode;
+        current_decode_width = width;
+        current_active_decode = width;
+        current_pending_prompt = 0;
+        current_context_bucket = bucket;
+        current_decode_width_context_bucket = bucket;
+    }
+
+    int32_t select_prompt_chunk(
+            int32_t active_decode, int32_t pending_prompt, int32_t bucket,
+            int32_t n_batch, int32_t n_ubatch) {
+        current_active_decode = active_decode;
+        current_pending_prompt = pending_prompt;
+        current_context_bucket = bucket;
+        current_prompt_chunk = prompt_bandit(
+            active_decode, pending_prompt, bucket, n_batch, n_ubatch).select();
+        return current_prompt_chunk;
+    }
+
+    void observe_prefill(double prompt_tps) {
+        if (!std::isfinite(prompt_tps) || prompt_tps <= 0.0) {
+            return;
+        }
+        if (prefill_reference_tps <= 0.0) {
+            prefill_reference_tps = prompt_tps;
+        } else {
+            prefill_reference_tps += 0.20 * (prompt_tps - prefill_reference_tps);
+        }
+    }
+
+    void observe_decode(
+            int32_t active_decode, int32_t bucket,
+            int32_t decoded_tokens, double elapsed_s, bool tune_depth) {
+        const double decode_tps = elapsed_s > 0.0 ? decoded_tokens / elapsed_s : 0.0;
+        if (!std::isfinite(decode_tps) || decode_tps <= 0.0) {
+            return;
+        }
+        const uint64_t key = workload_key(active_decode, 0, bucket);
+        auto & reference = decode_reference_tps[key];
+        if (reference <= 0.0) {
+            reference = decode_tps;
+        } else {
+            reference += 0.20 * (decode_tps - reference);
+        }
+        if (tune_depth) {
+            auto & bandit = decode_bandit(active_decode, bucket);
+            bandit.update_rate(decoded_tokens, elapsed_s);
+            ++decode_updates;
+        }
+        last_reward = decode_tps;
+    }
+
+    void observe_decode_width(
+            int32_t resident_decode, int32_t bucket,
+            int32_t decoded_tokens, double elapsed_s, bool tune_width) {
+        const double decode_tps = elapsed_s > 0.0 ? decoded_tokens / elapsed_s : 0.0;
+        // A width sample is meaningful only after the nested depth action is
+        // comparable.  Do not move the width telemetry reference on a
+        // deferred sample either, so it continues to describe comparable
+        // iterations rather than cold/non-best depth probes.
+        if (!tune_width || !std::isfinite(decode_tps) || decode_tps <= 0.0) {
+            return;
+        }
+        const uint64_t key = workload_key(resident_decode, 0, bucket);
+        auto & reference = decode_width_reference_tps[key];
+        if (reference <= 0.0) {
+            reference = decode_tps;
+        } else {
+            reference += 0.20 * (decode_tps - reference);
+        }
+        decode_width_bandit(resident_decode, bucket).update_rate(decoded_tokens, elapsed_s);
+        ++decode_width_updates;
+    }
+
+    double decode_reference(int32_t active_decode, int32_t bucket) const {
+        const auto it = decode_reference_tps.find(workload_key(active_decode, 0, bucket));
+        return it == decode_reference_tps.end() ? 0.0 : it->second;
+    }
+
+    double decode_width_reference(int32_t resident_decode, int32_t bucket) const {
+        const auto it = decode_width_reference_tps.find(workload_key(resident_decode, 0, bucket));
+        return it == decode_width_reference_tps.end() ? 0.0 : it->second;
+    }
+
+    double decode_arm_rate(int32_t active_decode, int32_t bucket) const {
+        const auto it = decode_bandits.find(workload_key(active_decode, 0, bucket));
+        return it == decode_bandits.end() ? 0.0 : it->second.current_reward();
+    }
+
+    double decode_width_arm_rate(int32_t resident_decode, int32_t bucket) const {
+        const auto it = decode_width_bandits.find(workload_key(resident_decode, 0, bucket));
+        return it == decode_width_bandits.end() ? 0.0 : it->second.current_reward();
+    }
+
+    void observe_mixed(
+            int32_t active_decode, int32_t pending_prompt, int32_t bucket,
+            int32_t n_batch, int32_t n_ubatch,
+            int32_t prompt_tokens, int32_t decoded_tokens, double elapsed_s) {
+        if (elapsed_s <= 0.0 || prompt_tokens < 0 || decoded_tokens < 0) {
+            return;
+        }
+        const double decode_tps = decode_reference(active_decode, bucket);
+        if (prefill_reference_tps <= 0.0 || decode_tps <= 0.0) {
+            return;
+        }
+
+        // Convert both classes of useful work to the isolated service time
+        // they would have consumed.  Maximizing this dimensionless overlap
+        // reward maximizes aggregate service rather than privileging raw
+        // prefill token counts over much costlier decode tokens.
+        const double isolated_service_s =
+            prompt_tokens / prefill_reference_tps + decoded_tokens / decode_tps;
+        const double reward = isolated_service_s / elapsed_s;
+        prompt_bandit(active_decode, pending_prompt, bucket, n_batch, n_ubatch).update(reward);
+        last_reward = reward;
+        ++prompt_updates;
+    }
+};
 
 static void server_prompt_checkpoint_update(server_prompt_checkpoint & ckpt, llama_context * ctx, int id, int64_t n_tokens, llama_pos pos_min, llama_pos pos_max, int32_t offset) {
     ckpt.pos_min = pos_min;
@@ -199,6 +793,8 @@ static common_speculative_stage_params server_parse_speculative_stage_json(const
     return stage;
 }
 
+server_context::server_context() {}
+
 server_context::~server_context() {
     // Speculative state may reference the live target context during teardown.
     for (server_slot& slot : slots) {
@@ -264,6 +860,29 @@ bool server_context::load_model(const gpt_params& params_) {
     // isolation guarantees.
     const bool allow_parallel_mtp = params_base.hybrid_kv &&
         server_speculative_is_pure_mtp(params_base.speculative);
+    if (params_base.mtp_adaptive_scheduling && !allow_parallel_mtp) {
+        LOG_ERROR("--mtp-adaptive-scheduling requires --hybrid-kv with a pure MTP speculative stage\n", {});
+        return false;
+    }
+    if (params_base.mtp_adaptive_scheduling && params_base.speculative.autotune) {
+        LOG_WARNING("disabling per-slot --spec-autotune because aggregate MTP scheduling is enabled\n", {});
+        params_base.speculative.autotune = false;
+    }
+    int32_t adaptive_checkpoint_draft_rows = 0;
+    if (params_base.mtp_adaptive_scheduling && allow_parallel_mtp &&
+            common_speculative_needs_checkpoint(model)) {
+        // Reserve one configured request's worth of recurrent draft rows and
+        // let the runtime controller trade that shared budget between cohort
+        // width and MTP depth.  This removes the static depth x parallel
+        // allocation without encoding a device- or context-specific limit.
+        adaptive_checkpoint_draft_rows = params_base.speculative.get_max_stage_n_max();
+        if (!llama_spec_ckpt_set_max_draft_rows(ctx, adaptive_checkpoint_draft_rows)) {
+            LOG_ERROR("failed to configure adaptive aggregate checkpoint budget\n", {
+                {"max_draft_rows", adaptive_checkpoint_draft_rows},
+            });
+            return false;
+        }
+    }
     common_speculative_prepare_startup(params_base, allow_parallel_mtp);
 
     if (!allow_parallel_mtp &&
@@ -317,6 +936,17 @@ bool server_context::load_model(const gpt_params& params_) {
 
     if (!common_speculative_finalize_startup(params_base, model)) {
         return false;
+    }
+
+    if (params_base.mtp_adaptive_scheduling) {
+        mtp_scheduler = std::make_unique<server_mtp_adaptive_scheduler>(
+            params_base.speculative.get_max_stage_n_max(), params_base.n_parallel,
+            adaptive_checkpoint_draft_rows);
+        LOG_INFO("adaptive aggregate-throughput MTP scheduler initialized", {
+            {"max_depth", params_base.speculative.get_max_stage_n_max()},
+            {"parallel", params_base.n_parallel},
+            {"checkpoint_draft_row_budget", adaptive_checkpoint_draft_rows},
+        });
     }
 
     return true;
@@ -550,7 +1180,38 @@ void server_slot::prompt_save(server_prompt_cache& prompt_cache) {
     assert(server_cached_prompt.data.size() == 0);
     LLAMA_LOG_INFO(" - saving prompt with length %d to tiered cache\n",
             (int) server_cached_prompt.tokens.size());
-    prompt_cache.save(server_cached_prompt, id);
+
+    // Hybrid prompt-cache save adopts the staged full-state file and moves the
+    // checkpoint list into the cache entry.  Keep a data-only copy of the
+    // newest checkpoint before the staged tail so the still-live slot can
+    // handle a small tokenizer-boundary rewrite without loading its own disk
+    // entry again.  This matters for text-level prompt extensions: appending
+    // generated text and tokenizing the concatenation can change a few tokens
+    // at the join even though the request is logically an extension.
+    server_prompt_checkpoint local_rewind = {};
+    bool have_local_rewind = false;
+    if (prompt_cache.rewind_to_checkpoint_on_save) {
+        const auto checkpoint = std::find_if(
+                server_cached_prompt.checkpoints.rbegin(),
+                server_cached_prompt.checkpoints.rend(),
+                [&](const server_prompt_checkpoint & cur) {
+                    return cur.n_tokens < server_cached_prompt.tokens.n_tokens() && !cur.data.empty();
+                });
+        if (checkpoint != server_cached_prompt.checkpoints.rend()) {
+            local_rewind = *checkpoint;
+            local_rewind.state_file.clear();
+            local_rewind.state_file_size = 0;
+            have_local_rewind = true;
+        }
+    }
+
+    if (prompt_cache.save(server_cached_prompt, id) && have_local_rewind) {
+        const float size_mib = (float) local_rewind.data.size() / 1024 / 1024;
+        const int64_t n_tokens = local_rewind.n_tokens;
+        server_cached_prompt.checkpoints.push_back(std::move(local_rewind));
+        LLAMA_LOG_INFO(" - retained local hybrid rewind checkpoint at token %" PRId64
+                " (%.3f MiB) after prompt-cache save\n", n_tokens, size_mib);
+    }
 }
 
 void server_slot::prompt_load(server_prompt_cache& prompt_cache, const server_tokens& tokens, float min_reusable_fraction) {
@@ -616,6 +1277,8 @@ void server_slot::reset() {
     n_draft_accepted = 0;
     n_draft_by_depth.clear();
     n_draft_accepted_by_depth.clear();
+    speculative_n_max_explicit = false;
+    speculative_adaptive_base = {};
     chat_msg = {};
     json_schema = json();
     generated_tool_call_ids.clear();
@@ -1038,14 +1701,28 @@ server_slot* server_context::get_available_slot(const server_task& task) {
     server_slot* ret = nullptr;
     bool update_cache = false;
 
-    // find the slot that has at least n% prompt similarity
-    if (ret == nullptr && slot_prompt_similarity != 0.0f) {
-        int max_lcp_len = 0;
-        float sim_best = 0;
+    // A tiered/hybrid cache must not choose an LRU slot while another idle
+    // slot already owns a much longer prefix of this request.  That would
+    // first displace the wrong sequence and can make the desired live state
+    // unavailable to prompt_cache::load().  For ordinary serving, preserve
+    // the explicit similarity-threshold behavior.
+    const bool prefer_prefix_affinity = params_base.hybrid_kv || prompt_cache != nullptr;
+    if (ret == nullptr && (slot_prompt_similarity != 0.0f || prefer_prefix_affinity)) {
+        size_t max_lcp_len = 0;
+        float sim_best = -1.0f;
+        size_t releasing_lcp_len = 0;
+        float releasing_sim_best = -1.0f;
+        int releasing_slot_id = -1;
 
         for (server_slot& slot : slots) {
-            // skip the slot if it is not available
-            if (!slot.available()) {
+            // A completed request sends its response before release_slots()
+            // changes SLOT_COMMAND_RELEASE to SLOT_COMMAND_NONE.  Include that
+            // short-lived state in the affinity comparison: assigning an
+            // extension to a different idle slot during this window can hide
+            // the only live copy of its prefix from the tiered cache.
+            const bool pending_release = slot.state == SLOT_STATE_IDLE &&
+                slot.command == SLOT_COMMAND_RELEASE;
+            if (!slot.available() && !pending_release) {
                 continue;
             }
             auto& cache_tokens = slot.cache_tokens;
@@ -1054,26 +1731,58 @@ server_slot* server_context::get_available_slot(const server_task& task) {
                 continue;
             }
             std::pair<common_prefix, float> sim;
+            size_t strict_lcp_len = 0;
             if (slot.params.think_tokens.exclude) {
                 server_tokens cache_tokens_exclude_think = slot.cache_tokens.get_tokens_exclude_think(slot.ctx, slot.params.think_tokens);
                 server_tokens prompt_tokens_exclude_think = task.tokens.get_tokens_exclude_think(slot.ctx, slot.params.think_tokens);
                 sim = calculate_slot_similarity(slot, ctx, cache_tokens_exclude_think, prompt_tokens_exclude_think);
+                strict_lcp_len = cache_tokens_exclude_think.get_common_prefix_exact(prompt_tokens_exclude_think);
             }
             else {
                 sim = calculate_slot_similarity(slot, ctx, cache_tokens, task.tokens);
+                strict_lcp_len = cache_tokens.get_common_prefix_exact(task.tokens);
             }
             common_prefix lcp_len = sim.first;
             float sim_cur = sim.second;
+            const size_t affinity_lcp_len = prefer_prefix_affinity ? strict_lcp_len : lcp_len.first;
 
-            // select the current slot if the criteria match
-            if (sim_cur > sim_best && sim_cur > slot_prompt_similarity) {
+            if (pending_release) {
+                if (releasing_slot_id < 0 || affinity_lcp_len > releasing_lcp_len ||
+                        (affinity_lcp_len == releasing_lcp_len && sim_cur > releasing_sim_best)) {
+                    releasing_lcp_len = affinity_lcp_len;
+                    releasing_sim_best = sim_cur;
+                    releasing_slot_id = slot.id;
+                }
+                continue;
+            }
+
+            const bool passes_threshold = prefer_prefix_affinity ||
+                sim_cur > slot_prompt_similarity;
+            const bool better = prefer_prefix_affinity
+                ? (ret == nullptr || affinity_lcp_len > max_lcp_len ||
+                   (affinity_lcp_len == max_lcp_len && sim_cur > sim_best))
+                : sim_cur > sim_best;
+            if (passes_threshold && better) {
                 sim_best = sim_cur;
-                max_lcp_len = lcp_len.first;
+                max_lcp_len = affinity_lcp_len;
                 ret = &slot;
             }
         }
+        const bool releasing_is_better = releasing_slot_id >= 0 &&
+            (ret == nullptr || releasing_lcp_len > max_lcp_len ||
+             (releasing_lcp_len == max_lcp_len && releasing_sim_best > sim_best));
+        if (releasing_is_better) {
+            LOG_INFO("deferring task for prefix-affine slot pending release", {
+                {"id_slot", releasing_slot_id},
+                {"release_lcp_len", releasing_lcp_len},
+                {"available_lcp_len", ret != nullptr ? (int64_t) max_lcp_len : -1},
+                {"release_similarity", releasing_sim_best},
+                {"available_similarity", sim_best},
+                });
+            return nullptr;
+        }
         if (ret != nullptr) {
-            LOG_VERBOSE("selected slot by lcp similarity", {
+            LOG_INFO("selected slot by prefix affinity", {
                 {"id_slot", ret->id},
                 {"max_lcp_len", max_lcp_len},
                 {"similarity", sim_best},
@@ -1106,6 +1815,7 @@ server_slot* server_context::get_available_slot(const server_task& task) {
     if (ret) {
         auto& tokens = ret->cache_tokens;
         float f_keep = 0;
+        bool cached_prompt_is_prefix = true;
         size_t cache_token_size = tokens.size();
         if (!tokens.empty()) {
             if (ret->params.think_tokens.exclude) {
@@ -1114,12 +1824,25 @@ server_slot* server_context::get_available_slot(const server_task& task) {
 
                 cache_token_size = cache_exclude_think.size();
                 f_keep = calculate_slot_f_keep(*ret, ret->ctx, cache_exclude_think, prompt_exclude_think);
+                cached_prompt_is_prefix =
+                    cache_exclude_think.get_common_prefix(ret->ctx, prompt_exclude_think).first == cache_exclude_think.size();
             }
             else {
                 f_keep = calculate_slot_f_keep(*ret, ret->ctx, tokens, task.tokens);
+                cached_prompt_is_prefix =
+                    tokens.get_common_prefix(ret->ctx, task.tokens).first == tokens.size();
             }
             // if we are about to lose a large portion of the existing context - save it in the prompt cache
-            if (f_keep < cache_ram_similarity) {
+            // Hybrid mode and models with position-coupled private state
+            // cannot safely reuse an arbitrary divergent cached suffix.  Save
+            // that slot even when the divergent request has a very high token
+            // similarity; otherwise apply_checkpoint() may throw the whole
+            // sequence away and the tiered cache never gets a chance to
+            // restore it later.  Exact extensions retain the ordinary in-slot
+            // append fast path.
+            if (f_keep < cache_ram_similarity ||
+                    ((params_base.hybrid_kv || !llama_model_supports_partial_kv_reuse(model)) &&
+                     !cached_prompt_is_prefix)) {
                 update_cache = true;
             }
         }
@@ -1131,8 +1854,9 @@ server_slot* server_context::get_available_slot(const server_task& task) {
         // don't update the cache if the slot's context is above cache_ram_n_min
         update_cache = update_cache && cache_token_size >= cache_ram_n_min;
 
-        LLAMA_LOG_INFO("======== Prompt cache: cache size: %d, n_keep: %d, n_discarded_prompt: %d, cache_ram_n_min: %d, f_keep: %.2f, cache_ram_similarity: %.2f\n",
-            (int)tokens.size(), ret->n_kept_prompt, ret->n_discarded_prompt, cache_ram_n_min, f_keep, cache_ram_similarity);
+        LLAMA_LOG_INFO("======== Prompt cache: cache size: %d, n_keep: %d, n_discarded_prompt: %d, cache_ram_n_min: %d, f_keep: %.2f, cache_ram_similarity: %.2f, full_replace: %s\n",
+            (int)tokens.size(), ret->n_kept_prompt, ret->n_discarded_prompt, cache_ram_n_min, f_keep, cache_ram_similarity,
+            cached_prompt_is_prefix ? "false" : "true");
         if (update_cache) {
             const int64_t t_start = ggml_time_us();
             LLAMA_LOG_INFO("updating prompt cache\n");
@@ -1251,6 +1975,7 @@ bool server_context::launch_slot_with_task(server_slot& slot, server_task& task)
         slot.params.speculative.n_max = json_value(data, "speculative.n_max", params_base.speculative.n_max);
         slot.params.speculative.n_min = json_value(data, "speculative.n_min", params_base.speculative.n_min);
         slot.params.speculative.p_min = json_value(data, "speculative.p_min", params_base.speculative.p_min);
+        slot.speculative_n_max_explicit = has_flat_n_max;
 
         server_reject_dead_speculative_request_overrides(data);
 
@@ -1288,6 +2013,7 @@ bool server_context::launch_slot_with_task(server_slot& slot, server_task& task)
 
                 if (stage_override.has_n_max_override()) {
                     slot.params.speculative.stages[i].n_max = stage_override.n_max;
+                    slot.speculative_n_max_explicit = true;
                 }
                 if (stage_override.has_n_min_override()) {
                     slot.params.speculative.stages[i].n_min = stage_override.n_min;
@@ -1335,6 +2061,7 @@ bool server_context::launch_slot_with_task(server_slot& slot, server_task& task)
         if (!common_speculative_validate_chain(slot.params.speculative, &spec_error)) {
             throw std::runtime_error("Error: invalid speculative request configuration: " + spec_error);
         }
+        slot.speculative_adaptive_base = slot.params.speculative;
         common_speculative_prepare_request(slot.spec, slot.params.speculative);
     } catch (const std::exception & e) {
         send_error(task, e.what(), ERROR_TYPE_INVALID_REQUEST);
@@ -2992,6 +3719,13 @@ void server_context::process_single_task(server_task&& task) {
         res.id_multi = task.id_multi;
         res.stop = true;
         res.error = false;
+        const int32_t kv_cache_used_cells = llama_get_kv_cache_used_cells(ctx);
+        const int32_t kv_cache_free_cells = std::max(0, n_ctx - kv_cache_used_cells);
+        const int32_t kv_cache_max_contiguous = llama_get_kv_cache_max_contiguous(ctx);
+        uint64_t hybrid_fa_pages_checked = 0;
+        uint64_t hybrid_fa_pages_skipped = 0;
+        ggml_flash_attn_ext_get_page_stats(
+            &hybrid_fa_pages_checked, &hybrid_fa_pages_skipped);
         res.data = {
             { "idle",                            n_idle_slots       },
             { "processing",                      n_processing_slots },
@@ -3009,7 +3743,44 @@ void server_context::process_single_task(server_task&& task) {
             { "t_tokens_generation",             metrics.t_tokens_generation},
 
             { "kv_cache_tokens_count",           llama_get_kv_cache_token_count(ctx)},
-            { "kv_cache_used_cells",             llama_get_kv_cache_used_cells(ctx)},
+            { "kv_cache_used_cells",             kv_cache_used_cells},
+            { "kv_cache_free_cells",             kv_cache_free_cells},
+            { "kv_cache_max_contiguous",          kv_cache_max_contiguous},
+            { "kv_batch_effective_cap",           metrics.kv_batch_effective_cap},
+            { "kv_batch_capacity_caps_total",     metrics.kv_batch_capacity_caps_total},
+            { "kv_batch_retries_total",           metrics.kv_batch_retries_total},
+            { "hybrid_kv_fa_pages_checked",       hybrid_fa_pages_checked},
+            { "hybrid_kv_fa_pages_skipped",       hybrid_fa_pages_skipped},
+
+            { "mtp_adaptive_enabled",             mtp_scheduler != nullptr ? 1 : 0},
+            { "mtp_adaptive_depth",               mtp_scheduler ? mtp_scheduler->current_depth : -1},
+            { "mtp_adaptive_prompt_chunk",        mtp_scheduler ? mtp_scheduler->current_prompt_chunk : 0},
+            { "mtp_adaptive_active_decode",       mtp_scheduler ? mtp_scheduler->current_active_decode : 0},
+            { "mtp_adaptive_resident_decode",     mtp_scheduler ? mtp_scheduler->current_resident_decode : 0},
+            { "mtp_adaptive_decode_width",        mtp_scheduler ? mtp_scheduler->current_decode_width : 0},
+            { "mtp_adaptive_decode_width_context_bucket", mtp_scheduler ? mtp_scheduler->current_decode_width_context_bucket : 0},
+            { "mtp_adaptive_pending_prompt",      mtp_scheduler ? mtp_scheduler->current_pending_prompt : 0},
+            { "mtp_adaptive_context_bucket",      mtp_scheduler ? mtp_scheduler->current_context_bucket : 0},
+            { "mtp_adaptive_checkpoint_draft_row_budget", mtp_scheduler ? mtp_scheduler->max_draft_rows : 0},
+            { "mtp_adaptive_checkpoint_draft_rows", mtp_scheduler ? mtp_scheduler->current_draft_rows : 0},
+            { "mtp_adaptive_max_feasible_depth",  mtp_scheduler ? mtp_scheduler->current_max_feasible_depth : 0},
+            { "mtp_adaptive_reward",              mtp_scheduler ? mtp_scheduler->last_reward : 0.0},
+            { "mtp_adaptive_prefill_reference_tps", mtp_scheduler ? mtp_scheduler->prefill_reference_tps : 0.0},
+            { "mtp_adaptive_decode_reference_tps", mtp_scheduler ? mtp_scheduler->decode_reference(
+                mtp_scheduler->current_active_decode, mtp_scheduler->current_context_bucket) : 0.0},
+            { "mtp_adaptive_decode_width_reference_tps", mtp_scheduler ? mtp_scheduler->decode_width_reference(
+                mtp_scheduler->current_resident_decode, mtp_scheduler->current_decode_width_context_bucket) : 0.0},
+            { "mtp_adaptive_decode_arm_rate_tps", mtp_scheduler ? mtp_scheduler->decode_arm_rate(
+                mtp_scheduler->current_active_decode, mtp_scheduler->current_context_bucket) : 0.0},
+            { "mtp_adaptive_decode_width_arm_rate_tps", mtp_scheduler ? mtp_scheduler->decode_width_arm_rate(
+                mtp_scheduler->current_resident_decode, mtp_scheduler->current_decode_width_context_bucket) : 0.0},
+            { "mtp_adaptive_decode_updates",      mtp_scheduler ? mtp_scheduler->decode_updates : 0},
+            { "mtp_adaptive_decode_width_updates", mtp_scheduler ? mtp_scheduler->decode_width_updates : 0},
+            { "mtp_adaptive_decode_width_deferred", mtp_scheduler ? mtp_scheduler->decode_width_deferred : 0},
+            { "mtp_adaptive_prompt_updates",      mtp_scheduler ? mtp_scheduler->prompt_updates : 0},
+            { "mtp_adaptive_prompt_censored",     mtp_scheduler ? mtp_scheduler->prompt_censored : 0},
+            { "mtp_adaptive_decode_prior_transfers", mtp_scheduler ? mtp_scheduler->decode_prior_transfers : 0},
+            { "mtp_adaptive_decode_width_prior_transfers", mtp_scheduler ? mtp_scheduler->decode_width_prior_transfers : 0},
 
             { "slots",                           slots_data },
         };
@@ -3590,13 +4361,33 @@ void server_context::context_shift() {
     }
 }
 
-void server_context::add_sampled_tokens() {
-    for (auto& slot : slots) {
+void server_context::add_sampled_tokens(
+        bool force_target_only,
+        const std::vector<uint8_t> * decode_schedule) {
+    for (size_t slot_index = 0; slot_index < slots.size(); ++slot_index) {
+        auto & slot = slots[slot_index];
         slot.released = false;
         if (slot.state == SLOT_STATE_IDLE) {
             continue;
         }
+        if (decode_schedule != nullptr &&
+                (slot_index >= decode_schedule->size() || !(*decode_schedule)[slot_index])) {
+            continue;
+        }
         slot.spec_target_only = false;
+
+        // When a new long prompt is admitted alongside an established MTP
+        // generation, add only the generation root.  Draft rows require a
+        // recurrent checkpoint rectangle and cannot safely share a batch with
+        // prompt rows, while a root-only row can be updated from the target
+        // hidden state after the mixed batch completes.
+        if (force_target_only) {
+            slot.spec_target_only = slot.uses_mtp();
+            slot.i_batch = batch.n_tokens;
+            common_batch_add(batch, slot.sampled, slot.cache_tokens.pos_next(), { slot.id }, true);
+            slot.cache_tokens.push_back(slot.sampled);
+            continue;
+        }
 
         // generate draft tokens in speculative decoding mode
         // TODO: rework to have a single draft llama_context shared across all slots [TAG_SERVER_SPEC_REWORK]
@@ -3674,6 +4465,12 @@ void server_context::add_sampled_tokens() {
         }
         else {
             // no speculative decoding
+            // An adaptive MTP depth of zero is a real target-only arm, not a
+            // request to abandon the private recurrent context.  Mark it so
+            // process_batch_tokens() commits the target hidden/state row and
+            // a later non-zero arm can resume drafting without a re-warmup.
+            slot.spec_target_only = slot.uses_mtp() &&
+                slot.params.speculative.get_max_stage_n_max() == 0;
             slot.i_batch = batch.n_tokens;
 
             common_batch_add(batch, slot.sampled, slot.cache_tokens.pos_next(), { slot.id }, true);
@@ -4037,7 +4834,32 @@ bool server_context::create_checkpoint(server_slot & slot, int64_t n_tokens_over
 
         if (params_base.hybrid_kv && prompt_cache &&
                 checkpoint_n_tokens < slot.n_prompt_tokens) {
-            prompt_cache->stage_checkpoint(cur, slot.cache_tokens, slot.id);
+            size_t replaceable_disk_size = 0;
+            for (const auto & previous : slot.server_cached_prompt.checkpoints) {
+                if (&previous != &cur) {
+                    replaceable_disk_size += previous.state_file_size;
+                }
+            }
+
+            if (prompt_cache->stage_checkpoint(
+                    cur, slot.cache_tokens, slot.id, replaceable_disk_size)) {
+                size_t released_disk_size = 0;
+                int32_t released_files = 0;
+                for (auto & previous : slot.server_cached_prompt.checkpoints) {
+                    if (&previous == &cur || previous.state_file.empty()) {
+                        continue;
+                    }
+                    released_disk_size += previous.state_file_size;
+                    ++released_files;
+                    server_prompt_checkpoint_remove_state_file(previous);
+                }
+                if (released_files > 0) {
+                    SLT_WRN(slot,
+                        "released %d superseded staged snapshot%s (%.3f MiB) after atomic replacement\n",
+                        released_files, released_files == 1 ? "" : "s",
+                        released_disk_size / (1024.0 * 1024.0));
+                }
+            }
         }
 
         SLT_WRN(slot, "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB, took %.2f ms)\n",
@@ -4049,12 +4871,45 @@ bool server_context::create_checkpoint(server_slot & slot, int64_t n_tokens_over
 
 void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t n_batch,  int32_t & batch_type) {
     if (params_base.cont_batching || batch.n_tokens == 0) {
-        for (auto& slot : slots) {
-            slot.prompt_batch_i0 = -1;
-            slot.prompt_batch_i1 = -1;
+        int32_t fair_text_slots_remaining = 0;
+        int32_t fair_prompt_batch_limit = n_batch;
+        if (params_base.prompt_fair_share) {
+            fair_text_slots_remaining = std::count_if(slots.begin(), slots.end(), [](const server_slot & slot) {
+                return slot.state == SLOT_STATE_IDLE &&
+                    slot.command == SLOT_COMMAND_LOAD_PROMPT && !slot.embedding;
+            });
+            if (fair_text_slots_remaining > 1) {
+                // Keep all equal-share sequence runs in the same recurrent
+                // microbatch.  The caller can invoke us again to pack another
+                // fair rectangle into the same logical batch; this preserves
+                // n_batch-sized submission amortization even when n_ubatch is
+                // deliberately reduced to save CUDA workspace.
+                const int32_t used_in_ubatch = batch.n_tokens % n_ubatch;
+                const int32_t ubatch_room = n_ubatch - used_in_ubatch;
+                fair_prompt_batch_limit = std::min(n_batch, batch.n_tokens + ubatch_room);
+            }
+        }
 
+        for (auto& slot : slots) {
             // this slot still has a prompt to be processed
             if (slot.state == SLOT_STATE_IDLE && slot.command == SLOT_COMMAND_LOAD_PROMPT) {
+                int32_t slot_prompt_batch_limit = n_batch;
+                if (params_base.prompt_fair_share && !slot.embedding && fair_text_slots_remaining > 0) {
+                    const int32_t remaining_budget = std::max(0, fair_prompt_batch_limit - batch.n_tokens);
+                    const int32_t slot_budget = (remaining_budget + fair_text_slots_remaining - 1) /
+                        fair_text_slots_remaining;
+                    slot_prompt_batch_limit = std::min(
+                        fair_prompt_batch_limit, batch.n_tokens + slot_budget);
+                    --fair_text_slots_remaining;
+
+                    LOG_VERBOSE("fair-share prompt budget", {
+                        {"id_slot", slot.id},
+                        {"slot_budget", slot_budget},
+                        {"batch_limit", slot_prompt_batch_limit},
+                        {"remaining_slots", fair_text_slots_remaining},
+                    });
+                }
+
                 auto& prompt_tokens = slot.prompt_tokens;
 
                 // we haven't tokenized the prompt yet - do it now:
@@ -4371,7 +5226,8 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
 
                 // add prompt tokens for processing in the current batch
                 // TODO: the self-extend stuff here is a mess - simplify and/or abstract it somehow
-                while (slot.n_past_prompt < slot.n_prompt_tokens && batch.n_tokens < n_batch) {
+                while (slot.n_past_prompt < slot.n_prompt_tokens &&
+                        batch.n_tokens < slot_prompt_batch_limit) {
                     // get next token to process
                     llama_token cur_tok = slot.prompt_tokens[slot.n_past_prompt];
                     if (cur_tok == LLAMA_TOKEN_NULL) {
@@ -4402,7 +5258,9 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                     }
 
                 }
-                slot.prompt_batch_i0 = prompt_batch_i0;
+                if (slot.prompt_batch_i0 < 0) {
+                    slot.prompt_batch_i0 = prompt_batch_i0;
+                }
                 slot.prompt_batch_i1 = batch.n_tokens;
 
                 LOG_VERBOSE("prompt processing progress", {
@@ -4938,6 +5796,8 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
             // retry with half the batch size to try to find a free slot in the KV cache
             n_batch /= 2;
             i -= n_batch;
+            ++metrics.kv_batch_retries_total;
+            metrics.kv_batch_effective_cap = n_batch;
 
             LOG_WARNING("failed to find free space in the KV cache, retrying with smaller batch size - try increasing it via the context size or enable defragmentation", {
                 {"i",   i},
@@ -4972,6 +5832,21 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
         }
     }
 
+    // Keep the private MTP context contiguous when an established generation
+    // contributes a root-only token to a mixed prompt batch.  The helper
+    // extracts just this slot's row before applying the accepted-token update.
+    for (auto & slot : slots) {
+        if (!slot.spec_target_only || slot.i_batch < i || slot.i_batch >= i + n_tokens ||
+                !slot.spec || !slot.uses_mtp()) {
+            continue;
+        }
+
+        if (common_speculative_on_target_seq_batch(slot.spec, ctx, batch_view, slot.id, false) != 0) {
+            common_speculative_clear_sequence_hidden(slot.spec, slot.id);
+            LOG_ERROR("failed to update target-only MTP state for slot %d\n", slot.id);
+        }
+    }
+
         for (auto& slot : slots) {
             bool is_active_slot = (slot.state == SLOT_STATE_PROCESSING);
 
@@ -4979,7 +5854,14 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
                 // save checkpoint during prompt processing
                 if (slot.command == SLOT_COMMAND_LOAD_PROMPT) {
                     if (slot.do_checkpoint) {
-                        create_checkpoint(slot);
+                        // A logical n_batch may contain several physical
+                        // n_ubatch rectangles.  cache_tokens already contains
+                        // every row queued in the logical batch, so snapshot
+                        // only after the physical slice containing this
+                        // slot's final queued prompt row has executed.
+                        if (slot.prompt_batch_i1 > 0 && i + n_tokens >= slot.prompt_batch_i1) {
+                            slot.do_checkpoint = !create_checkpoint(slot);
+                        }
                     } else {
                         create_checkpoint_at_interval(slot);
                     }
@@ -5120,6 +6002,183 @@ void server_context::update_slots() {
     // TODO: simplify and improve
     context_shift();
 
+    const bool adaptive_enabled = mtp_scheduler != nullptr;
+    const int64_t adaptive_iteration_start_us = adaptive_enabled ? ggml_time_us() : 0;
+    std::vector<int32_t> adaptive_decoded_before;
+    std::vector<int32_t> adaptive_prompt_before;
+    std::vector<uint8_t> adaptive_decode_schedule(slots.size(), 1);
+    int32_t adaptive_active_decode = 0;
+    int32_t adaptive_resident_decode = 0;
+    int32_t adaptive_pending_prompt = 0;
+    int32_t adaptive_max_n_past = 0;
+    int32_t adaptive_width_bucket = 0;
+    bool adaptive_depth_selected = false;
+    bool adaptive_width_selected = false;
+    bool adaptive_width_observed = false;
+
+    if (adaptive_enabled) {
+        adaptive_decoded_before.reserve(slots.size());
+        adaptive_prompt_before.reserve(slots.size());
+        std::vector<size_t> runnable_decode;
+        runnable_decode.reserve(slots.size());
+        bool all_decode_slots_auto_mtp = true;
+        for (size_t slot_index = 0; slot_index < slots.size(); ++slot_index) {
+            const auto & slot = slots[slot_index];
+            adaptive_decoded_before.push_back(slot.n_decoded);
+            adaptive_prompt_before.push_back(slot.n_prompt_tokens_processed);
+            adaptive_max_n_past = std::max(adaptive_max_n_past, slot.n_past);
+            if (slot.state == SLOT_STATE_PROCESSING) {
+                runnable_decode.push_back(slot_index);
+                all_decode_slots_auto_mtp = all_decode_slots_auto_mtp &&
+                    slot.uses_mtp() && !slot.speculative_n_max_explicit;
+            } else if (slot.command == SLOT_COMMAND_LOAD_PROMPT) {
+                ++adaptive_pending_prompt;
+            }
+        }
+        adaptive_resident_decode = (int32_t) runnable_decode.size();
+        adaptive_active_decode = adaptive_resident_decode;
+        adaptive_width_bucket = server_mtp_adaptive_scheduler::context_bucket(adaptive_max_n_past);
+
+        // In a pure-decode interval, first choose how many resident sequences
+        // participate in this microstep, then choose their common MTP depth.
+        // A narrow cohort rotates over all runnable slots, retaining every KV
+        // context while learning whether time-slicing beats a wider rectangle.
+        // Explicit per-request n_max remains authoritative and disables both
+        // group controls for that iteration.
+        if (adaptive_active_decode > 0 && adaptive_pending_prompt == 0 &&
+                all_decode_slots_auto_mtp) {
+            const int32_t previous_width = mtp_scheduler->current_decode_width;
+            int32_t decode_width = adaptive_resident_decode;
+            if (adaptive_resident_decode > 1) {
+                decode_width = mtp_scheduler->select_decode_width(
+                    adaptive_resident_decode, adaptive_width_bucket);
+                adaptive_width_selected = true;
+            } else {
+                mtp_scheduler->set_decode_width(
+                    adaptive_resident_decode, decode_width, adaptive_width_bucket);
+            }
+            decode_width = std::max(1, std::min(decode_width, adaptive_resident_decode));
+
+            if (decode_width < adaptive_resident_decode) {
+                for (size_t slot_index : runnable_decode) {
+                    adaptive_decode_schedule[slot_index] = 0;
+                }
+                const size_t start = mtp_scheduler->decode_round_robin_cursor % runnable_decode.size();
+                for (int32_t i = 0; i < decode_width; ++i) {
+                    adaptive_decode_schedule[runnable_decode[(start + (size_t) i) % runnable_decode.size()]] = 1;
+                }
+                mtp_scheduler->decode_round_robin_cursor =
+                    (start + (size_t) decode_width) % runnable_decode.size();
+            }
+            adaptive_active_decode = decode_width;
+
+            if (adaptive_width_selected) {
+                auto & width_bandit = mtp_scheduler->decode_width_bandit(
+                    adaptive_resident_decode, adaptive_width_bucket);
+                if (decode_width != previous_width ||
+                        width_bandit.decisions <= width_bandit.arms.size() ||
+                        width_bandit.decisions % 64 == 0) {
+                    LOG_INFO("adaptive decode-width arm selected", {
+                        {"resident_decode", adaptive_resident_decode},
+                        {"scheduled_decode", adaptive_active_decode},
+                        {"context_bucket", adaptive_width_bucket},
+                        {"best_width", width_bandit.best_value()},
+                        {"round_robin_cursor", mtp_scheduler->decode_round_robin_cursor},
+                        {"decisions", width_bandit.decisions},
+                    });
+                }
+            }
+
+            adaptive_max_n_past = 0;
+            for (size_t slot_index : runnable_decode) {
+                if (adaptive_decode_schedule[slot_index]) {
+                    adaptive_max_n_past = std::max(adaptive_max_n_past, slots[slot_index].n_past);
+                }
+            }
+            const int32_t bucket = server_mtp_adaptive_scheduler::context_bucket(adaptive_max_n_past);
+            const int32_t previous_depth = mtp_scheduler->current_depth;
+            const int32_t depth = mtp_scheduler->select_depth(adaptive_active_decode, bucket);
+            for (size_t slot_index = 0; slot_index < slots.size(); ++slot_index) {
+                auto & slot = slots[slot_index];
+                if (slot.state != SLOT_STATE_PROCESSING || !adaptive_decode_schedule[slot_index]) {
+                    continue;
+                }
+                // Start from the request's immutable configuration on every
+                // decision.  Otherwise an exploratory low-depth arm would
+                // permanently lower n_min (including a stage override) after
+                // the controller raises n_max again.
+                slot.params.speculative = slot.speculative_adaptive_base;
+                slot.params.speculative.n_max = depth;
+                slot.params.speculative.n_min = std::min(slot.params.speculative.n_min, depth);
+                for (auto & stage : slot.params.speculative.stages) {
+                    if (stage.type == COMMON_SPECULATIVE_TYPE_MTP) {
+                        stage.n_max = -1;
+                        if (stage.has_n_min_override() && stage.n_min > depth) {
+                            stage.n_min = depth;
+                        }
+                    }
+                }
+            }
+            adaptive_depth_selected = true;
+
+            auto & bandit = mtp_scheduler->decode_bandit(adaptive_active_decode, bucket);
+            if (depth != previous_depth || bandit.decisions <= bandit.arms.size() ||
+                    bandit.decisions % 64 == 0) {
+                LOG_INFO("adaptive MTP decode arm selected", {
+                    {"active_decode", adaptive_active_decode},
+                    {"context_bucket", bucket},
+                    {"depth", depth},
+                    {"draft_rows", mtp_scheduler->current_draft_rows},
+                    {"draft_row_budget", mtp_scheduler->max_draft_rows},
+                    {"max_feasible_depth", mtp_scheduler->current_max_feasible_depth},
+                    {"best_depth", bandit.best_value()},
+                    {"decisions", bandit.decisions},
+                });
+            }
+        } else if (adaptive_active_decode > 0 && adaptive_pending_prompt == 0 &&
+                mtp_scheduler->max_draft_rows > 0) {
+            // Explicit request depths remain authoritative, but they share the
+            // same physical checkpoint row budget.  Admit a fair rotating
+            // cohort whose worst-case aggregate drafts fit; do not train the
+            // width/depth bandits on these caller-selected actions.
+            std::fill(adaptive_decode_schedule.begin(), adaptive_decode_schedule.end(), 0);
+            const size_t start = mtp_scheduler->decode_round_robin_cursor % runnable_decode.size();
+            int32_t scheduled = 0;
+            int32_t draft_rows = 0;
+            for (size_t offset = 0; offset < runnable_decode.size(); ++offset) {
+                const size_t slot_index = runnable_decode[(start + offset) % runnable_decode.size()];
+                const int32_t requested_depth =
+                    slots[slot_index].params.speculative.get_max_stage_n_max();
+                if (requested_depth > mtp_scheduler->max_draft_rows - draft_rows) {
+                    continue;
+                }
+                adaptive_decode_schedule[slot_index] = 1;
+                draft_rows += requested_depth;
+                ++scheduled;
+            }
+            GGML_ASSERT(scheduled > 0);
+            mtp_scheduler->decode_round_robin_cursor = (start + 1) % runnable_decode.size();
+            adaptive_active_decode = scheduled;
+            mtp_scheduler->set_decode_width(
+                adaptive_resident_decode, adaptive_active_decode, adaptive_width_bucket);
+            mtp_scheduler->current_depth = -1;
+            mtp_scheduler->current_draft_rows = draft_rows;
+            mtp_scheduler->current_max_feasible_depth =
+                mtp_scheduler->max_draft_rows / std::max(1, adaptive_active_decode);
+
+            LOG_INFO("adaptive checkpoint budget scheduled explicit-depth cohort", {
+                {"resident_decode", adaptive_resident_decode},
+                {"scheduled_decode", adaptive_active_decode},
+                {"draft_rows", draft_rows},
+                {"draft_row_budget", mtp_scheduler->max_draft_rows},
+                {"round_robin_cursor", mtp_scheduler->decode_round_robin_cursor},
+            });
+        } else {
+            mtp_scheduler->set_decode_width(
+                adaptive_resident_decode, adaptive_resident_decode, adaptive_width_bucket);
+        }
+    }
+
     // start populating the batch for this iteration
     common_batch_clear(batch);
 
@@ -5129,35 +6188,130 @@ void server_context::update_slots() {
     }
 
     // A Qwen3.5 recurrent per-step checkpoint must be produced by one
-    // sequence-major verification rectangle. Do not mix that rectangle with
-    // prompt admission for a newly recycled slot: the decoder has to split
-    // such a batch, and a later prompt/verification ubatch can replace the
-    // shared checkpoint layout before every old slot has restored from it.
-    // Admission gets one prompt-only turn; established generations resume in
-    // the next turn, once the new slot is ready to join their rectangle.
+    // sequence-major verification rectangle.  While a new prompt is being
+    // admitted, established generations therefore contribute root-only rows:
+    // this preserves decode progress without mixing draft checkpoints with
+    // prompt rows.  Their private MTP contexts are updated after the target
+    // batch and resume normal speculative decoding once admission finishes.
     const bool isolate_parallel_mtp_prompt =
         params_base.hybrid_kv && server_speculative_is_pure_mtp(params_base.speculative) &&
         std::any_of(slots.begin(), slots.end(), [](const server_slot & slot) {
             return slot.state == SLOT_STATE_IDLE && slot.command == SLOT_COMMAND_LOAD_PROMPT;
         });
+    const bool piggyback_parallel_mtp_prompt =
+        params_base.mtp_prompt_piggyback && isolate_parallel_mtp_prompt &&
+        std::any_of(slots.begin(), slots.end(), [](const server_slot & slot) {
+            return slot.state == SLOT_STATE_PROCESSING;
+        });
 
     // first, add sampled tokens from any ongoing sequences
-    if (!isolate_parallel_mtp_prompt) {
-        add_sampled_tokens(); // Prepare batch for inference
+    if (piggyback_parallel_mtp_prompt) {
+        add_sampled_tokens(true);
+    } else if (!isolate_parallel_mtp_prompt) {
+        add_sampled_tokens(false, adaptive_enabled ? &adaptive_decode_schedule : nullptr);
         align_parallel_mtp_drafts();
     }
 
-    // process in chunks of params.n_batch
-    int32_t n_batch = llama_n_batch(ctx);
+    // Process in chunks of params.n_batch. Prompt admission is additionally
+    // bounded by the largest hole that exists now. This avoids repeatedly
+    // proposing a fixed-size microbatch that the fragmented KV allocator
+    // cannot place, without encoding a context-length-specific cutoff.
+    const int32_t configured_n_batch = llama_n_batch(ctx);
+    int32_t n_batch = configured_n_batch;
     int32_t n_ubatch = llama_n_ubatch(ctx);
+    const bool has_pending_prompt = std::any_of(slots.begin(), slots.end(), [](const server_slot & slot) {
+        return slot.command == SLOT_COMMAND_LOAD_PROMPT;
+    });
+    const int32_t previous_batch_cap = metrics.kv_batch_effective_cap;
+    int32_t kv_max_contiguous = configured_n_batch;
+    if (has_pending_prompt) {
+        kv_max_contiguous = llama_get_kv_cache_max_contiguous(ctx);
+        const int32_t allocatable = std::max(1, std::min(configured_n_batch, kv_max_contiguous));
+        n_batch = std::max(batch.n_tokens, allocatable);
+        n_batch = std::min(n_batch, configured_n_batch);
+        if (n_batch < configured_n_batch) {
+            ++metrics.kv_batch_capacity_caps_total;
+            if (n_batch != previous_batch_cap || metrics.kv_batch_capacity_caps_total <= 8 ||
+                    metrics.kv_batch_capacity_caps_total % 64 == 0) {
+                LOG_INFO("KV-fragmentation-aware prompt batch cap", {
+                    {"configured_batch", configured_n_batch},
+                    {"effective_batch", n_batch},
+                    {"root_tokens", batch.n_tokens},
+                    {"free_cells", std::max(0, n_ctx - llama_get_kv_cache_used_cells(ctx))},
+                    {"max_contiguous", kv_max_contiguous},
+                    {"caps", metrics.kv_batch_capacity_caps_total},
+                });
+            }
+        }
+    }
+    metrics.kv_batch_effective_cap = n_batch;
+
+    bool adaptive_prompt_selected = false;
+    int32_t selected_prompt_chunk = params_base.mtp_prompt_chunk;
+    if (piggyback_parallel_mtp_prompt && adaptive_enabled && selected_prompt_chunk == 0) {
+        const int32_t bucket = server_mtp_adaptive_scheduler::context_bucket(adaptive_max_n_past);
+        const int32_t previous_chunk = mtp_scheduler->current_prompt_chunk;
+        selected_prompt_chunk = mtp_scheduler->select_prompt_chunk(
+            adaptive_active_decode, adaptive_pending_prompt, bucket, configured_n_batch, n_ubatch);
+
+        // A throughput-selected quantum is only an action inside the current
+        // physical feasibility region. Do not train that arm on a sample that
+        // had to be clipped by KV fragmentation.
+        const int32_t selected_prompt_arm = selected_prompt_chunk;
+        const int32_t natural_prompt_capacity = std::max(0, configured_n_batch - batch.n_tokens);
+        const int32_t natural_prompt_chunk = std::min(selected_prompt_arm, natural_prompt_capacity);
+        const int32_t prompt_capacity = std::max(0, n_batch - batch.n_tokens);
+        selected_prompt_chunk = std::min(natural_prompt_chunk, prompt_capacity);
+        const bool capacity_limited = selected_prompt_chunk != natural_prompt_chunk;
+        adaptive_prompt_selected = !capacity_limited;
+
+        auto & bandit = mtp_scheduler->prompt_bandit(
+            adaptive_active_decode, adaptive_pending_prompt, bucket, configured_n_batch, n_ubatch);
+        if (selected_prompt_chunk != previous_chunk || bandit.decisions <= bandit.arms.size() ||
+                bandit.decisions % 32 == 0 || capacity_limited) {
+            LOG_INFO("adaptive MTP prompt arm selected", {
+                {"active_decode", adaptive_active_decode},
+                {"pending_prompt", adaptive_pending_prompt},
+                {"context_bucket", bucket},
+                {"prompt_arm", selected_prompt_arm},
+                {"prompt_chunk", selected_prompt_chunk},
+                {"kv_batch_cap", n_batch},
+                {"kv_max_contiguous", kv_max_contiguous},
+                {"capacity_limited", capacity_limited},
+                {"best_prompt_chunk", bandit.best_value()},
+                {"decisions", bandit.decisions},
+            });
+        }
+    }
+    if (piggyback_parallel_mtp_prompt && selected_prompt_chunk > 0) {
+        // Keep the ordinary large prefill batch for prompt-only work, but use
+        // a smaller scheduling quantum while latency-sensitive generations
+        // are sharing the iteration.  batch.n_tokens is the number of
+        // piggyback roots already present.
+        n_batch = std::min(n_batch, batch.n_tokens + selected_prompt_chunk);
+    }
 
     // track if this is an embedding or non-embedding batch
     // if we've added sampled tokens above, we are in non-embedding mode
     // -1: none, 0: non-embedding, 1: embedding
     int32_t batch_type = batch.n_tokens > 0 ? 0 : -1;
 
-    // next, batch any pending prompts without exceeding n_batch
-    batch_pending_prompt(n_ubatch, n_batch, batch_type); // Prepare batch for prompt process
+    // Next, batch pending prompts without exceeding n_batch.  Fair-share
+    // admission fills one recurrent-safe physical microbatch per call, so
+    // keep packing rectangles until the logical batch is full.  This lets a
+    // memory-saving n_ubatch retain the launch amortization of a larger
+    // n_batch (for example four [seq0 x 64, seq1 x 64] rectangles in 512).
+    while (true) {
+        const int32_t n_tokens_before = batch.n_tokens;
+        batch_pending_prompt(n_ubatch, n_batch, batch_type); // Prepare batch for prompt process
+        if (!params_base.prompt_fair_share || batch.n_tokens >= n_batch ||
+                batch.n_tokens == n_tokens_before ||
+                std::any_of(slots.begin(), slots.end(), [](const server_slot & slot) {
+                    return slot.command == SLOT_COMMAND_LOAD_PROMPT && slot.do_checkpoint;
+                })) {
+            break;
+        }
+    }
 
     if (batch.n_tokens == 0) {
         LOG_VERBOSE("no tokens to decode", {});
@@ -5281,6 +6435,138 @@ void server_context::update_slots() {
 
     // process the created batch of tokens
     process_batch_tokens(n_batch); // Decode with batch
+
+    if (adaptive_enabled) {
+        const double elapsed_s = (ggml_time_us() - adaptive_iteration_start_us) / 1e6;
+        int32_t decoded_tokens = 0;
+        int32_t prompt_tokens = 0;
+        for (size_t i = 0; i < slots.size(); ++i) {
+            decoded_tokens += std::max(0, slots[i].n_decoded - adaptive_decoded_before[i]);
+            prompt_tokens += std::max(0, slots[i].n_prompt_tokens_processed - adaptive_prompt_before[i]);
+        }
+        const int32_t bucket = server_mtp_adaptive_scheduler::context_bucket(adaptive_max_n_past);
+
+        if (elapsed_s > 0.0 && adaptive_active_decode == 0 && adaptive_pending_prompt > 0 &&
+                prompt_tokens > 0) {
+            mtp_scheduler->observe_prefill(prompt_tokens / elapsed_s);
+        } else if (elapsed_s > 0.0 && adaptive_active_decode > 0 && adaptive_pending_prompt == 0 &&
+                decoded_tokens > 0) {
+            const double aggregate_tps = decoded_tokens / elapsed_s;
+            mtp_scheduler->observe_decode(
+                adaptive_active_decode, bucket,
+                decoded_tokens, elapsed_s, adaptive_depth_selected);
+
+            // Width and depth are hierarchical actions.  Do not blame a width
+            // for throughput measured while its depth controller is still
+            // covering inherited/cold arms, or while deliberately exploring
+            // a non-best depth.  Leaving the width arm locally unobserved makes
+            // select() keep serving it until a comparable sample is available.
+            const auto & depth_bandit = mtp_scheduler->decode_bandit(
+                adaptive_active_decode, bucket);
+            const bool width_sample_comparable = depth_bandit.locally_mature() &&
+                depth_bandit.current_is_best();
+            const bool tune_width = adaptive_width_selected && width_sample_comparable;
+            adaptive_width_observed = tune_width;
+            if (adaptive_width_selected && !tune_width) {
+                ++mtp_scheduler->decode_width_deferred;
+                if (mtp_scheduler->decode_width_deferred <= 8 ||
+                        mtp_scheduler->decode_width_deferred % 64 == 0) {
+                    LOG_INFO("adaptive decode-width observation deferred", {
+                        {"resident_decode", adaptive_resident_decode},
+                        {"scheduled_decode", adaptive_active_decode},
+                        {"context_bucket", adaptive_width_bucket},
+                        {"depth", depth_bandit.current_idx >= 0
+                            ? depth_bandit.arms[depth_bandit.current_idx].value : -1},
+                        {"best_depth", depth_bandit.best_value()},
+                        {"depth_locally_mature", depth_bandit.locally_mature()},
+                        {"deferred", mtp_scheduler->decode_width_deferred},
+                    });
+                }
+            }
+            mtp_scheduler->observe_decode_width(
+                adaptive_resident_decode, adaptive_width_bucket,
+                decoded_tokens, elapsed_s, tune_width);
+        } else if (adaptive_prompt_selected) {
+            // A final short tail or a recurrent single-token fallback did not
+            // execute the selected quantum.  It is a censored observation of
+            // that action, not evidence that the full arm is slow.
+            const bool action_completed = elapsed_s > 0.0 && selected_prompt_chunk > 0 &&
+                prompt_tokens >= selected_prompt_chunk;
+            if (!action_completed) {
+                ++mtp_scheduler->prompt_censored;
+                if (mtp_scheduler->prompt_censored <= 8 ||
+                        mtp_scheduler->prompt_censored % 64 == 0) {
+                    LOG_INFO("adaptive MTP prompt arm censored", {
+                        {"active_decode", adaptive_active_decode},
+                        {"pending_prompt", adaptive_pending_prompt},
+                        {"context_bucket", bucket},
+                        {"prompt_chunk", selected_prompt_chunk},
+                        {"prompt_tokens", prompt_tokens},
+                        {"decoded_tokens", decoded_tokens},
+                        {"elapsed_ms", elapsed_s * 1000.0},
+                        {"censored", mtp_scheduler->prompt_censored},
+                    });
+                }
+            } else {
+                mtp_scheduler->observe_mixed(
+                    adaptive_active_decode, adaptive_pending_prompt, bucket,
+                    configured_n_batch, n_ubatch, prompt_tokens, decoded_tokens, elapsed_s);
+
+                auto & bandit = mtp_scheduler->prompt_bandit(
+                    adaptive_active_decode, adaptive_pending_prompt, bucket,
+                    configured_n_batch, n_ubatch);
+                if (bandit.updates <= bandit.arms.size() || bandit.updates % 32 == 0) {
+                    LOG_INFO("adaptive MTP prompt arm observed", {
+                        {"active_decode", adaptive_active_decode},
+                        {"pending_prompt", adaptive_pending_prompt},
+                        {"context_bucket", bucket},
+                        {"prompt_chunk", selected_prompt_chunk},
+                        {"prompt_tokens", prompt_tokens},
+                        {"decoded_tokens", decoded_tokens},
+                        {"elapsed_ms", elapsed_s * 1000.0},
+                        {"overlap_reward", mtp_scheduler->last_reward},
+                        {"best_prompt_chunk", bandit.best_value()},
+                        {"updates", bandit.updates},
+                    });
+                }
+            }
+        }
+
+        if (adaptive_depth_selected) {
+            auto & bandit = mtp_scheduler->decode_bandit(adaptive_active_decode, bucket);
+            if (bandit.updates <= bandit.arms.size() || bandit.updates % 64 == 0) {
+                LOG_INFO("adaptive MTP decode arm observed", {
+                    {"active_decode", adaptive_active_decode},
+                    {"context_bucket", bucket},
+                    {"depth", mtp_scheduler->current_depth},
+                    {"decoded_tokens", decoded_tokens},
+                    {"elapsed_ms", elapsed_s * 1000.0},
+                    {"aggregate_tps", elapsed_s > 0.0 ? decoded_tokens / elapsed_s : 0.0},
+                    {"best_depth", bandit.best_value()},
+                    {"arms", bandit.state_json()},
+                    {"updates", bandit.updates},
+                });
+            }
+        }
+
+        if (adaptive_width_observed) {
+            auto & bandit = mtp_scheduler->decode_width_bandit(
+                adaptive_resident_decode, adaptive_width_bucket);
+            if (bandit.updates <= bandit.arms.size() || bandit.updates % 64 == 0) {
+                LOG_INFO("adaptive decode-width arm observed", {
+                    {"resident_decode", adaptive_resident_decode},
+                    {"scheduled_decode", adaptive_active_decode},
+                    {"context_bucket", adaptive_width_bucket},
+                    {"decoded_tokens", decoded_tokens},
+                    {"elapsed_ms", elapsed_s * 1000.0},
+                    {"aggregate_tps", elapsed_s > 0.0 ? decoded_tokens / elapsed_s : 0.0},
+                    {"best_width", bandit.best_value()},
+                    {"arms", bandit.state_json()},
+                    {"updates", bandit.updates},
+                });
+            }
+        }
+    }
 
     LOG_VERBOSE("run slots completed", {});
 }

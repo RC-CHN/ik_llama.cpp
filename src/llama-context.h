@@ -186,6 +186,13 @@ struct llama_kv_cache {
         std::vector<llama_seq_id> per_step_capture_seq_ids;
         int32_t per_step_max_allocated = 0;
         int32_t per_step_max_seqs_allocated = 0;
+        // Optional aggregate draft-row budget.  A zero value preserves the
+        // Cartesian max_tokens x max_seqs allocation used by ordinary callers.
+        // The adaptive server sets this to the configured single-request draft
+        // depth and trades depth for decode width at runtime instead.
+        int32_t per_step_max_draft_rows = 0;
+        int32_t per_step_ssm_rows_allocated = 0;
+        int32_t per_step_conv_rows_allocated = 0;
         int64_t per_step_ssm_state_size = 0;
         int64_t per_step_conv_state_dim = 0;
         int64_t per_step_conv_dim = 0;
@@ -272,6 +279,8 @@ struct llama_kv_cache {
             per_step_n_seqs = 0;
             per_step_max_allocated = 0;
             per_step_max_seqs_allocated = 0;
+            per_step_ssm_rows_allocated = 0;
+            per_step_conv_rows_allocated = 0;
         }
 
         ~gpu_checkpoint() {

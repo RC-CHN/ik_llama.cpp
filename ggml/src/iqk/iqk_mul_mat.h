@@ -42,6 +42,12 @@ struct ggml_tensor;
 
 IQK_API size_t iqk_fa_work_buffer_size(const struct ggml_tensor * dst, int nthread);
 
+// Cumulative BF16 flash-attention K-page pruning counters.  Updates are
+// aggregated once per kernel invocation, so observing them does not add an
+// atomic operation to the hot per-page loop.
+IQK_API void iqk_fa_page_stats_add(uint64_t pages_checked, uint64_t pages_skipped);
+IQK_API void iqk_fa_page_stats_get(uint64_t * pages_checked, uint64_t * pages_skipped);
+
 typedef void (*barrier_t) (void *);
 
 IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float max_bias,

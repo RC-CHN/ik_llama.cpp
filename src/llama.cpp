@@ -643,6 +643,9 @@ struct llama_context::Prev {
     int n_tokens;
     int save_per_step_ssm;
     int per_step_max_allocated;
+    int per_step_max_seqs_allocated;
+    int per_step_ssm_rows_allocated;
+    int per_step_conv_rows_allocated;
     llama_mtp_op_type mtp_op_type;
     int32_t mtp_step_idx;
     int32_t mtp_n_heads;
@@ -722,7 +725,10 @@ static void why_not_reuse_previous(const llama_batch & u_batch, const llama_cont
     auto & kv_self_used = (ctx.model.arch == LLM_ARCH_GEMMA4_MTP || ctx.model.arch == LLM_ARCH_GEMMA4_ASSISTANT) &&
         ctx.mtp_target_ctx != nullptr ? ctx.mtp_target_ctx->kv_self : ctx.kv_self;
     if (the_prev->save_per_step_ssm != kv_self_used.save_per_step_ssm ||
-        the_prev->per_step_max_allocated != kv_self_used.ckpt.per_step_max_allocated) { printf("    ssm not the same\n"); return; }
+        the_prev->per_step_max_allocated != kv_self_used.ckpt.per_step_max_allocated ||
+        the_prev->per_step_max_seqs_allocated != kv_self_used.ckpt.per_step_max_seqs_allocated ||
+        the_prev->per_step_ssm_rows_allocated != kv_self_used.ckpt.per_step_ssm_rows_allocated ||
+        the_prev->per_step_conv_rows_allocated != kv_self_used.ckpt.per_step_conv_rows_allocated) { printf("    ssm not the same\n"); return; }
     if (kv_self_used.any_compacted()) {
         const auto view = llama_swa_calc_window_view_compact(
                 (int64_t) kv_self_used.live_swa() + u_batch.n_tokens, kv_self_used.sink_rows,
@@ -752,7 +758,10 @@ bool llama_context::can_reuse_graph(const llama_batch & u_batch, uint64_t seq_fi
     auto & kv_self_used = (model.arch == LLM_ARCH_GEMMA4_MTP || model.arch == LLM_ARCH_GEMMA4_ASSISTANT) &&
                           mtp_target_ctx != nullptr ? mtp_target_ctx->kv_self : kv_self;
     if (the_prev->save_per_step_ssm != kv_self_used.save_per_step_ssm ||
-        the_prev->per_step_max_allocated != kv_self_used.ckpt.per_step_max_allocated) return false;
+        the_prev->per_step_max_allocated != kv_self_used.ckpt.per_step_max_allocated ||
+        the_prev->per_step_max_seqs_allocated != kv_self_used.ckpt.per_step_max_seqs_allocated ||
+        the_prev->per_step_ssm_rows_allocated != kv_self_used.ckpt.per_step_ssm_rows_allocated ||
+        the_prev->per_step_conv_rows_allocated != kv_self_used.ckpt.per_step_conv_rows_allocated) return false;
     if (kv_self_used.any_compacted()) {
         const auto view = llama_swa_calc_window_view_compact(
                 (int64_t) kv_self_used.live_swa() + u_batch.n_tokens, kv_self_used.sink_rows,
@@ -2391,8 +2400,20 @@ void llama_kv_cache::checkpoint_delete() {
 }
 
 bool llama_kv_cache::per_step_alloc(const llama_model & model, int max_tokens, int max_seqs) {
+    const int64_t full_ssm_rows = (int64_t) std::max(0, max_tokens - 1) * std::max(1, max_seqs);
+    const int64_t draft_row_limit = ckpt.per_step_max_draft_rows > 0
+        ? ckpt.per_step_max_draft_rows
+        : full_ssm_rows;
+    const int32_t ssm_rows = (int32_t) std::min<int64_t>(full_ssm_rows, draft_row_limit);
+    // Conv reconstruction also needs the root row for every participating
+    // sequence.  The scheduler limits only draft rows, so reserve those roots
+    // in addition to the aggregate draft-row budget.
+    const int32_t conv_rows = ssm_rows + std::max(1, max_seqs);
+
     if (ckpt.per_step_max_allocated >= max_tokens &&
-            ckpt.per_step_max_seqs_allocated >= max_seqs) {
+            ckpt.per_step_max_seqs_allocated >= max_seqs &&
+            ckpt.per_step_ssm_rows_allocated >= ssm_rows &&
+            ckpt.per_step_conv_rows_allocated >= conv_rows) {
         return true;
     }
 
@@ -2409,6 +2430,8 @@ bool llama_kv_cache::per_step_alloc(const llama_model & model, int max_tokens, i
         ckpt.per_step_conv.clear();
         ckpt.per_step_max_allocated = 0;
         ckpt.per_step_max_seqs_allocated = 0;
+        ckpt.per_step_ssm_rows_allocated = 0;
+        ckpt.per_step_conv_rows_allocated = 0;
     }
 
     const uint32_t n_layer = (uint32_t)s_l.size();
@@ -2462,20 +2485,21 @@ bool llama_kv_cache::per_step_alloc(const llama_model & model, int max_tokens, i
 
         for (auto & [p, bt] : layers) {
             auto [il, id] = p;
-            // SSM state: max_tokens * ssm_state_dim
+            // SSM state: one row per aggregate draft token.  In compact mode
+            // this is a shared physical budget rather than depth x sequences.
             if (id < 0) {
-                if (max_tokens > 1) {
+                if (ssm_rows > 0) {
                     GGML_ASSERT(ckpt.per_step_ssm[il].empty());
                     GGML_ASSERT(ckpt.per_step_conv[il].empty());
                     ggml_tensor * t_ssm = ggml_new_tensor_1d(ctx, GGML_TYPE_F32,
-                            (int64_t)(max_tokens - 1) * max_seqs * ssm_state_dim);
+                            (int64_t) ssm_rows * ssm_state_dim);
                     ggml_format_name(t_ssm, "per_step_ssm_l%d", il);
                     ckpt.per_step_ssm[il].push_back(t_ssm);
                 }
 
-                // Conv features (qkv_mixed): max_tokens * conv_dim
+                // Conv features include one root row for each sequence.
                 ggml_tensor * t_qkv = ggml_new_tensor_1d(ctx, GGML_TYPE_F32,
-                        (int64_t)max_tokens * max_seqs * conv_state_dim);
+                        (int64_t) conv_rows * conv_state_dim);
                 ggml_format_name(t_qkv, "per_step_qkv_l%d", il);
                 ckpt.per_step_conv[il].push_back(t_qkv);
             } else {
@@ -2496,15 +2520,15 @@ bool llama_kv_cache::per_step_alloc(const llama_model & model, int max_tokens, i
                 int nv = split->ne[0] / head_v_dim; // number of heads handled by this device
                 auto [this_conv_dim, this_ssm_dim] = model.hparams.n_embd_v_s_dims(nv);
 
-                if (max_tokens > 1) {
+                if (ssm_rows > 0) {
                     auto t_ssm = ggml_new_tensor_1d(ctx, GGML_TYPE_F32,
-                            (int64_t)(max_tokens - 1) * max_seqs * this_ssm_dim);
+                            (int64_t) ssm_rows * this_ssm_dim);
                     ggml_format_name(t_ssm, "per_step_ssm_l%d_%d", il, id);
                     ckpt.per_step_ssm[il][id] = t_ssm;
                 }
 
                 auto t_qkv = ggml_new_tensor_1d(ctx, GGML_TYPE_F32,
-                        (int64_t)max_tokens * max_seqs * this_conv_dim * (d_conv - 1));
+                        (int64_t) conv_rows * this_conv_dim * (d_conv - 1));
                 ggml_format_name(t_qkv, "per_step_qkv_l%d_%d", il, id);
                 ckpt.per_step_conv[il][id] = t_qkv;
             }
@@ -2517,15 +2541,18 @@ bool llama_kv_cache::per_step_alloc(const llama_model & model, int max_tokens, i
             return false;
         }
         ggml_backend_buffer_clear(buf, 0);
-        LLAMA_LOG_INFO("%s: %10s per-step buffer = %8.2f MiB (max_tokens=%d, max_seqs=%d)\n", __func__,
+        LLAMA_LOG_INFO("%s: %10s per-step buffer = %8.2f MiB "
+                       "(max_tokens=%d, max_seqs=%d, ssm_rows=%d, conv_rows=%d, draft_row_budget=%d)\n", __func__,
                        ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf) / 1024.0 / 1024.0,
-                       max_tokens, max_seqs);
+                       max_tokens, max_seqs, ssm_rows, conv_rows, ckpt.per_step_max_draft_rows);
         ckpt.per_step_ctxs.push_back(ctx);
         ckpt.per_step_bufs.push_back(buf);
     }
 
     ckpt.per_step_max_allocated = max_tokens;
     ckpt.per_step_max_seqs_allocated = max_seqs;
+    ckpt.per_step_ssm_rows_allocated = ssm_rows;
+    ckpt.per_step_conv_rows_allocated = conv_rows;
     return true;
 }
 
@@ -2589,6 +2616,16 @@ bool llama_kv_cache::per_step_restore(const llama_model & model, ggml_backend_sc
     const int seq_index = (int)std::distance(ckpt.per_step_seq_ids.begin(), seq_it);
     const int ssm_slot = step*ckpt.per_step_n_seqs + seq_index;
     const int conv_slot = seq_index*ckpt.per_step_n_tokens + step;
+    if (ssm_slot < 0 || ssm_slot >= ckpt.per_step_ssm_rows_allocated ||
+            conv_slot < 0 || conv_slot >= ckpt.per_step_conv_rows_allocated) {
+        LLAMA_LOG_ERROR("%s: checkpoint row is outside compact storage for seq_id=%d step=%d "
+                "(ssm_slot=%d/%d, conv_slot=%d/%d, n_seqs=%d, n_tokens=%d)\n",
+                __func__, (int) seq_id, step,
+                ssm_slot, ckpt.per_step_ssm_rows_allocated,
+                conv_slot, ckpt.per_step_conv_rows_allocated,
+                ckpt.per_step_n_seqs, ckpt.per_step_n_tokens);
+        return false;
+    }
 
     std::unordered_set<ggml_backend_t> backends_to_sync;
 
@@ -2794,7 +2831,6 @@ static void llama_kv_cache_seq_cp(
         GGML_ASSERT((uint32_t) seq_id_src < cache.size);
 
         cache.cells[seq_id_dst].src = seq_id_src;
-        cache.cells[seq_id_dst].pos = cache.cells[seq_id_src].pos;
         cache.do_copy = true;
     }
 
@@ -6299,6 +6335,10 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
         if (!checkpoint_seq_ids.empty()) {
             GGML_ASSERT(checkpoint_tokens_per_seq <= ckpt.per_step_max_allocated);
             GGML_ASSERT((int32_t) checkpoint_seq_ids.size() <= ckpt.per_step_max_seqs_allocated);
+            GGML_ASSERT((int64_t) (checkpoint_tokens_per_seq - 1) * checkpoint_seq_ids.size() <=
+                ckpt.per_step_ssm_rows_allocated);
+            GGML_ASSERT((int64_t) checkpoint_tokens_per_seq * checkpoint_seq_ids.size() <=
+                ckpt.per_step_conv_rows_allocated);
             ckpt.per_step_seq_ids = std::move(checkpoint_seq_ids);
             ckpt.per_step_n_tokens = checkpoint_tokens_per_seq;
             ckpt.per_step_n_seqs = (int32_t) ckpt.per_step_seq_ids.size();
@@ -6966,6 +7006,9 @@ static int llama_decode_internal(
                         (int)u_batch.all_seq_id, (int)lctx.n_outputs, (int)kv_self_used.n,
                         (int)u_batch.n_tokens,
                         kv_self_used.save_per_step_ssm, kv_self_used.ckpt.per_step_max_allocated,
+                        kv_self_used.ckpt.per_step_max_seqs_allocated,
+                        kv_self_used.ckpt.per_step_ssm_rows_allocated,
+                        kv_self_used.ckpt.per_step_conv_rows_allocated,
                         cparams.mtp_op_type, lctx.mtp_step_idx, lctx.mtp_n_heads,
                         lctx.swa_window_view.w_view,
                         lctx.swa_window_view.win_off,
@@ -8789,8 +8832,11 @@ struct llama_context * llama_init_from_model(
             llama_free(ctx);
             return nullptr;
         }
-        if (model->n_gpu_layers <= (int) model->hparams.n_layer) {
-            LLAMA_LOG_ERROR("%s: --hybrid-kv currently requires the complete model to be offloaded to CUDA\n", __func__);
+        // Hybrid cold/hot attention is built only for repeating transformer
+        // layers.  The output projection is outside that graph and can safely
+        // remain in CPU HBM, which is useful on capacity-constrained GPUs.
+        if (model->n_gpu_layers < (int) model->hparams.n_layer) {
+            LLAMA_LOG_ERROR("%s: --hybrid-kv currently requires all repeating model layers to be offloaded to CUDA\n", __func__);
             llama_free(ctx);
             return nullptr;
         }
@@ -9825,6 +9871,19 @@ int32_t llama_get_kv_cache_used_cells(const struct llama_context * ctx) {
     return ctx->kv_self.used;
 }
 
+int32_t llama_get_kv_cache_max_contiguous(const struct llama_context * ctx) {
+    uint32_t current = 0;
+    uint32_t largest = 0;
+    for (const auto & cell : ctx->kv_self.cells) {
+        if (cell.pos < 0) {
+            largest = std::max(largest, ++current);
+        } else {
+            current = 0;
+        }
+    }
+    return (int32_t) largest;
+}
+
 void llama_kv_cache_clear(struct llama_context * ctx) {
     llama_kv_cache_clear(ctx->kv_self);
     llama_reset_dsv4_state(ctx);
@@ -9969,6 +10028,29 @@ void llama_spec_ckpt_begin_batch(struct llama_context * ctx) {
     ckpt.per_step_seq_ids.clear();
     ckpt.per_step_n_tokens = 0;
     ckpt.per_step_n_seqs = 0;
+}
+
+bool llama_spec_ckpt_set_max_draft_rows(
+        struct llama_context * ctx, int32_t max_draft_rows) {
+    if (ctx == nullptr || max_draft_rows < 0) {
+        return false;
+    }
+
+    auto & ckpt = ctx->kv_self.ckpt;
+    if (ckpt.fixed_spec_mode != LLAMA_SPEC_CKPT_NONE || !ckpt.per_step_bufs.empty()) {
+        if (ckpt.per_step_max_draft_rows == max_draft_rows) {
+            return true;
+        }
+        LLAMA_LOG_ERROR("%s: checkpoint storage is already initialized "
+                "(current draft-row budget=%d, requested=%d)\n",
+                __func__, ckpt.per_step_max_draft_rows, max_draft_rows);
+        return false;
+    }
+
+    ckpt.per_step_max_draft_rows = max_draft_rows;
+    LLAMA_LOG_INFO("%s: aggregate per-step draft-row budget = %d%s\n",
+            __func__, max_draft_rows, max_draft_rows == 0 ? " (Cartesian allocation)" : "");
+    return true;
 }
 
 int llama_spec_ckpt_init(struct llama_context * ctx, int mode, int max_tokens) {
@@ -10126,7 +10208,13 @@ enum llama_spec_ckpt_restore_result llama_spec_ckpt_restore_ex(
                 return LLAMA_SPEC_CKPT_RESTORE_FAILED;
             }
             const llama_pos accepted_pos = n_past + accepted_step;
-            if (seq_id >= 0 && (uint32_t)seq_id < kv.size) {
+            // Recurrent caches dedicate cells[seq_id] to sequence state and
+            // therefore keep its state position there.  Qwen3Next is hybrid:
+            // cells[] remains the ordinary attention KV map while only src is
+            // reused for recurrent-state copy routing.  Writing accepted_pos
+            // into cells[seq_id] corrupts an unrelated token's KV position
+            // (and, with multiple sequences, often another sequence's prefix).
+            if (kv.recurrent && seq_id >= 0 && (uint32_t)seq_id < kv.size) {
                 kv.cells[seq_id].pos = accepted_pos;
             }
             llama_kv_cache_seq_rm(kv, seq_id, accepted_pos + 1, -1);
@@ -10877,8 +10965,17 @@ struct llama_data_read {
         }
     }
 
-    bool read_kv_cache_meta(struct llama_context * ctx, uint32_t cell_count, llama_seq_id dest_seq_id = -1) {
+    bool read_kv_cache_meta(
+            struct llama_context * ctx,
+                         uint32_t cell_count,
+                     llama_seq_id dest_seq_id = -1,
+                                bool preserve_existing_seq = false,
+            std::vector<std::pair<uint32_t, uint32_t>> * restore_ranges = nullptr) {
         struct llama_kv_cache & kv_self = ctx->kv_self;
+
+        if (restore_ranges != nullptr) {
+            restore_ranges->clear();
+        }
 
         if (dest_seq_id != -1) {
             // single sequence
@@ -10891,6 +10988,95 @@ struct llama_data_read {
             if (cell_count > kv_self.size) {
                 LLAMA_LOG_ERROR("%s: not enough cells in kv cache\n", __func__);
                 return false;
+            }
+
+            if (preserve_existing_seq) {
+                // Qwen3Next PARTIAL_ONLY checkpoints carry recurrent state
+                // (and, when enabled, compacted-layer payloads), but omit the
+                // ordinary attention K/V rows.  Replacing the sequence
+                // metadata here would require one new contiguous cell range
+                // and only happened to preserve the omitted K/V bytes when
+                // the allocator returned their old physical range.  It also
+                // fails near capacity even though the complete prefix is
+                // already resident.
+                //
+                // Read and validate the complete saved position multiset
+                // before changing live metadata.  The physical cells that
+                // hold the prefix must remain where they are because their
+                // ordinary attention K/V rows are omitted from this state.
+                std::unordered_map<llama_pos, uint32_t> saved_positions;
+                saved_positions.reserve(cell_count);
+                for (uint32_t i = 0; i < cell_count; ++i) {
+                    llama_pos pos;
+                    uint32_t n_seq_id;
+                    read_to(&pos, sizeof(pos));
+                    read_to(&n_seq_id, sizeof(n_seq_id));
+
+                    if (n_seq_id != 0) {
+                        LLAMA_LOG_ERROR("%s: invalid seq_id-agnostic kv cell\n", __func__);
+                        return false;
+                    }
+
+                    ++saved_positions[pos];
+                }
+
+                auto remaining_positions = saved_positions;
+                for (const auto & cell : kv_self.cells) {
+                    if (!cell.has_seq_id(dest_seq_id)) {
+                        continue;
+                    }
+                    auto it = remaining_positions.find(cell.pos);
+                    if (it != remaining_positions.end() && it->second > 0) {
+                        --it->second;
+                    }
+                }
+                for (const auto & entry : remaining_positions) {
+                    if (entry.second != 0) {
+                        LLAMA_LOG_ERROR("%s: checkpoint position %d is not resident for sequence %d\n",
+                                __func__, entry.first, dest_seq_id);
+                        return false;
+                    }
+                }
+
+                // The server checkpoint path deliberately restores the state
+                // before doing a Qwen3Next tail rewind.  Prune only metadata
+                // that is not part of the saved multiset; retained cells keep
+                // their physical indices and therefore their omitted K/V.
+                // Position counts make this safe even if metadata contains a
+                // duplicate position.
+                remaining_positions = saved_positions;
+                uint32_t new_head = kv_self.size;
+                const bool has_qnext_state = llama_kv_has_qnext_state_storage(kv_self);
+                for (uint32_t i = 0; i < kv_self.size; ++i) {
+                    auto & cell = kv_self.cells[i];
+                    if (!cell.has_seq_id(dest_seq_id)) {
+                        continue;
+                    }
+
+                    auto it = remaining_positions.find(cell.pos);
+                    if (it != remaining_positions.end() && it->second > 0) {
+                        --it->second;
+                        continue;
+                    }
+
+                    cell.seq_id.erase(dest_seq_id);
+                    if (cell.is_empty()) {
+                        if (cell.pos >= 0) {
+                            --kv_self.used;
+                        }
+                        cell.pos = -1;
+                        if (has_qnext_state) {
+                            cell.src = i;
+                        }
+                        if (new_head == kv_self.size) {
+                            new_head = i;
+                        }
+                    }
+                }
+                if (new_head != kv_self.size && new_head < kv_self.head) {
+                    kv_self.head = new_head;
+                }
+                return true;
             }
 
             llama_kv_cache_seq_rm(kv_self, dest_seq_id, -1, -1);
@@ -10914,20 +11100,79 @@ struct llama_data_read {
                 batch.n_seq_id[i] = 1;
                 batch.seq_id[i][0] = dest_seq_id;
             }
-            if (!llama_kv_cache_find_slot(kv_self, batch)) {
-                llama_batch_free(batch);
-                LLAMA_LOG_ERROR("%s: failed to find available cells in kv cache\n", __func__);
-                return false;
-            }
 
-            // DEBUG CHECK: kv_self.head should be our first cell, kv_self.head + cell_count - 1 should be our last cell (verify seq_id and pos values)
-            // Assume that this is one contiguous block of cells
-            GGML_ASSERT(kv_self.head + cell_count <= kv_self.size);
-            GGML_ASSERT(kv_self.cells[kv_self.head].pos == batch.pos[0]);
-            GGML_ASSERT(kv_self.cells[kv_self.head + cell_count - 1].pos == batch.pos[cell_count - 1]);
-            GGML_ASSERT(kv_self.cells[kv_self.head].has_seq_id(dest_seq_id));
-            GGML_ASSERT(kv_self.cells[kv_self.head + cell_count - 1].has_seq_id(dest_seq_id));
-            GGML_ASSERT(ctx->model.arch != LLM_ARCH_OPENPANGU || kv_self.head == 0);
+            if (cell_count > 0 && llama_kv_cache_find_slot(kv_self, batch)) {
+                // The normal decode allocator prefers a contiguous range. Keep
+                // that fast path for state restore when the live cache layout
+                // permits it.
+                GGML_ASSERT(kv_self.head + cell_count <= kv_self.size);
+                GGML_ASSERT(kv_self.cells[kv_self.head].pos == batch.pos[0]);
+                GGML_ASSERT(kv_self.cells[kv_self.head + cell_count - 1].pos == batch.pos[cell_count - 1]);
+                GGML_ASSERT(kv_self.cells[kv_self.head].has_seq_id(dest_seq_id));
+                GGML_ASSERT(kv_self.cells[kv_self.head + cell_count - 1].has_seq_id(dest_seq_id));
+                GGML_ASSERT(ctx->model.arch != LLM_ARCH_OPENPANGU || kv_self.head == 0);
+
+                if (restore_ranges != nullptr) {
+                    restore_ranges->emplace_back(kv_self.head, kv_self.head + cell_count);
+                }
+            } else if (cell_count > 0) {
+                // Long-running parallel workloads naturally interleave prompt
+                // chunks from several sequences. Evicting one sequence can
+                // therefore leave enough aggregate capacity for a disk state,
+                // but no single hole large enough for the old contiguous-only
+                // loader. Place the restored rows into the actual free ranges
+                // instead of relying on a context-length or slot-count cutoff.
+                std::vector<std::pair<uint32_t, uint32_t>> free_ranges;
+                uint32_t free_cells = 0;
+                uint32_t largest_free_range = 0;
+                uint32_t range_begin = kv_self.size;
+
+                for (uint32_t i = 0; i <= kv_self.size; ++i) {
+                    const bool free = i < kv_self.size && kv_self.cells[i].is_empty();
+                    if (free && range_begin == kv_self.size) {
+                        range_begin = i;
+                    } else if (!free && range_begin != kv_self.size) {
+                        const uint32_t range_size = i - range_begin;
+                        free_ranges.emplace_back(range_begin, i);
+                        free_cells += range_size;
+                        largest_free_range = std::max(largest_free_range, range_size);
+                        range_begin = kv_self.size;
+                    }
+                }
+
+                if (ctx->model.arch == LLM_ARCH_OPENPANGU || free_cells < cell_count) {
+                    llama_batch_free(batch);
+                    LLAMA_LOG_ERROR("%s: failed to place restored sequence: requested=%u, free=%u, largest_free=%u\n",
+                            __func__, cell_count, free_cells, largest_free_range);
+                    return false;
+                }
+
+                std::vector<std::pair<uint32_t, uint32_t>> selected_ranges;
+                selected_ranges.reserve(free_ranges.size());
+                uint32_t logical_row = 0;
+                for (const auto & range : free_ranges) {
+                    if (logical_row == cell_count) {
+                        break;
+                    }
+                    const uint32_t take = std::min(range.second - range.first, cell_count - logical_row);
+                    selected_ranges.emplace_back(range.first, range.first + take);
+                    for (uint32_t i = 0; i < take; ++i, ++logical_row) {
+                        llama_kv_cell & cell = kv_self.cells[range.first + i];
+                        cell.pos = batch.pos[logical_row];
+                        cell.seq_id.insert(dest_seq_id);
+                    }
+                }
+
+                GGML_ASSERT(logical_row == cell_count);
+                kv_self.used += cell_count;
+                kv_self.head = selected_ranges.front().first;
+
+                LLAMA_LOG_INFO("%s: fragmented sequence restore: requested=%u, free=%u, largest_free=%u, ranges=%zu\n",
+                        __func__, cell_count, free_cells, largest_free_range, selected_ranges.size());
+                if (restore_ranges != nullptr) {
+                    *restore_ranges = std::move(selected_ranges);
+                }
+            }
 
             // Cleanup
             llama_batch_free(batch);
@@ -10967,6 +11212,9 @@ struct llama_data_read {
 
             kv_self.head = 0;
             kv_self.used = cell_count;
+            if (restore_ranges != nullptr && cell_count > 0) {
+                restore_ranges->emplace_back(0, cell_count);
+            }
         }
 
         return true;
@@ -11111,7 +11359,12 @@ struct llama_data_read {
         return true;
     }
 
-    bool read_kv_cache_data(struct llama_context * ctx, uint32_t cell_count, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) {
+    bool read_kv_cache_data(
+            struct llama_context * ctx,
+                         uint32_t cell_count,
+                     llama_seq_id seq_id = -1,
+            llama_state_seq_flags flags = 0,
+            const std::vector<std::pair<uint32_t, uint32_t>> * restore_ranges = nullptr) {
         const struct llama_hparams & hparams = ctx->model.hparams;
         struct llama_kv_cache & kv_self = ctx->kv_self;
         bool need_kv = (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0;
@@ -11129,6 +11382,41 @@ struct llama_data_read {
         }
         if (cell_count > kv_self.size) {
             LLAMA_LOG_ERROR("%s: not enough cells in kv cache to restore state (%u > %u)\n", __func__, cell_count, kv_self.size);
+            return false;
+        }
+
+        // PARTIAL_ONLY states intentionally omit the ordinary attention K/V
+        // rows.  In the Qwen3Next checkpoint path read_kv_cache_meta() keeps
+        // those rows in their existing (possibly fragmented) physical cells,
+        // so there is no destination range to construct or validate here.
+        // Using kv_self.head as a synthetic range in that case can run past
+        // kv_self.size near capacity even though no K/V payload will use it.
+        const bool need_restore_ranges = need_kv && cell_count > 0;
+        if (!need_restore_ranges && cell_count > 0 &&
+                (restore_ranges == nullptr || restore_ranges->empty()) &&
+                (uint64_t) kv_self.head + cell_count > kv_self.size) {
+            LLAMA_LOG_INFO("%s: partial-state restore keeps resident K/V rows; "
+                    "no destination range needed (head=%u, saved_cells=%u, cache_size=%u)\n",
+                    __func__, kv_self.head, cell_count, kv_self.size);
+        }
+        std::vector<std::pair<uint32_t, uint32_t>> contiguous_range;
+        if (need_restore_ranges && (restore_ranges == nullptr || restore_ranges->empty())) {
+            contiguous_range.emplace_back(kv_self.head, kv_self.head + cell_count);
+        }
+        const auto & dst_ranges = restore_ranges != nullptr && !restore_ranges->empty()
+            ? *restore_ranges : contiguous_range;
+        uint64_t n_restore_rows = 0;
+        for (const auto & range : dst_ranges) {
+            if (range.first > range.second || range.second > kv_self.size) {
+                LLAMA_LOG_ERROR("%s: invalid restored cell range [%u, %u)\n",
+                        __func__, range.first, range.second);
+                return false;
+            }
+            n_restore_rows += range.second - range.first;
+        }
+        if (need_restore_ranges && n_restore_rows != cell_count) {
+            LLAMA_LOG_ERROR("%s: restored cell ranges cover %" PRIu64 " rows instead of %u\n",
+                    __func__, n_restore_rows, cell_count);
             return false;
         }
 
@@ -11185,16 +11473,31 @@ struct llama_data_read {
                 return false;
             }
 
-            const bool     k_compact = kv_self.is_compacted((int) il);
-            const uint32_t k_rows    = k_compact ? kv_self.live_swa() : cell_count;
-            const uint32_t k_dst     = k_compact ? kv_self.sink_rows  : kv_self.head;
-
-            if (k_rows) {
-                // Read and set the keys for the whole cell range
-                if (kv_self.k_l[il]->extra) {
-                    read_kv_cache_data_split(ctx, kv_self.k_l[il], read(k_rows * k_size_row), k_dst, k_size_row, k_rows, il);
-                } else {
-                    ggml_backend_tensor_set(kv_self.k_l[il], read(k_rows * k_size_row), k_dst * k_size_row, k_rows * k_size_row);
+            const bool k_compact = kv_self.is_compacted((int) il);
+            if (k_compact) {
+                const uint32_t k_rows = kv_self.live_swa();
+                if (k_rows) {
+                    const uint32_t k_dst = kv_self.sink_rows;
+                    const uint8_t * src = read(k_rows * k_size_row);
+                    if (kv_self.k_l[il]->extra) {
+                        read_kv_cache_data_split(ctx, kv_self.k_l[il], src, k_dst, k_size_row, k_rows, il);
+                    } else {
+                        ggml_backend_tensor_set(kv_self.k_l[il], src, k_dst * k_size_row, k_rows * k_size_row);
+                    }
+                }
+            } else if (cell_count) {
+                const uint8_t * src = read(cell_count * k_size_row);
+                size_t src_offset = 0;
+                for (const auto & range : dst_ranges) {
+                    const uint32_t rows = range.second - range.first;
+                    if (kv_self.k_l[il]->extra) {
+                        read_kv_cache_data_split(ctx, kv_self.k_l[il], src + src_offset,
+                                range.first, k_size_row, rows, il);
+                    } else {
+                        ggml_backend_tensor_set(kv_self.k_l[il], src + src_offset,
+                                (size_t) range.first * k_size_row, (size_t) rows * k_size_row);
+                    }
+                    src_offset += (size_t) rows * k_size_row;
                 }
             }
         }
@@ -11236,16 +11539,31 @@ struct llama_data_read {
                     return false;
                 }
 
-                const bool     v_compact = kv_self.is_compacted((int) il);
-                const uint32_t v_rows    = v_compact ? kv_self.live_swa() : cell_count;
-                const uint32_t v_dst     = v_compact ? kv_self.sink_rows  : kv_self.head;
-
-                if (v_rows) {
-                    // Read and set the values for the whole cell range
-                    if (kv_self.v_l[il]->extra) {
-                        read_kv_cache_data_split(ctx, kv_self.v_l[il], read(v_rows * v_size_row), v_dst, v_size_row, v_rows, il);
-                    } else {
-                        ggml_backend_tensor_set(kv_self.v_l[il], read(v_rows * v_size_row), v_dst * v_size_row, v_rows * v_size_row);
+                const bool v_compact = kv_self.is_compacted((int) il);
+                if (v_compact) {
+                    const uint32_t v_rows = kv_self.live_swa();
+                    if (v_rows) {
+                        const uint32_t v_dst = kv_self.sink_rows;
+                        const uint8_t * src = read(v_rows * v_size_row);
+                        if (kv_self.v_l[il]->extra) {
+                            read_kv_cache_data_split(ctx, kv_self.v_l[il], src, v_dst, v_size_row, v_rows, il);
+                        } else {
+                            ggml_backend_tensor_set(kv_self.v_l[il], src, v_dst * v_size_row, v_rows * v_size_row);
+                        }
+                    }
+                } else if (cell_count) {
+                    const uint8_t * src = read(cell_count * v_size_row);
+                    size_t src_offset = 0;
+                    for (const auto & range : dst_ranges) {
+                        const uint32_t rows = range.second - range.first;
+                        if (kv_self.v_l[il]->extra) {
+                            read_kv_cache_data_split(ctx, kv_self.v_l[il], src + src_offset,
+                                    range.first, v_size_row, rows, il);
+                        } else {
+                            ggml_backend_tensor_set(kv_self.v_l[il], src + src_offset,
+                                    (size_t) range.first * v_size_row, (size_t) rows * v_size_row);
+                        }
+                        src_offset += (size_t) rows * v_size_row;
                     }
                 }
             }
@@ -11303,20 +11621,32 @@ struct llama_data_read {
                     return false;
                 }
 
-                const bool     v_compact = kv_self.is_compacted((int) il);
-                const uint32_t v_rows    = v_compact ? kv_self.live_swa() : cell_count;
-                const uint32_t v_dst     = v_compact ? kv_self.sink_rows  : kv_self.head;
+                const bool v_compact = kv_self.is_compacted((int) il);
+                const uint32_t v_rows = v_compact ? kv_self.live_swa() : cell_count;
 
                 if (v_rows) {
                     const size_t v_size_el = ggml_type_size(kv_self.v_l[il]->type);
                     if (kv_self.v_l[il]->extra) {
                         throw std::runtime_error("Transposed V cache is not sypported with split mode 'graph'");
                     }
-                    // For each row in the transposed matrix, read the values for the whole cell range
+                    // For each row in the transposed matrix, scatter the saved
+                    // logical cell stream over the selected physical ranges.
                     const uint32_t kv_size = kv_self.rows((int) il);
                     for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
-                        const size_t dst_offset = (v_dst + (size_t) j * kv_size) * v_size_el;
-                        ggml_backend_tensor_set(kv_self.v_l[il], read(v_rows * v_size_el), dst_offset, v_rows * v_size_el);
+                        const uint8_t * src = read(v_rows * v_size_el);
+                        if (v_compact) {
+                            const size_t dst_offset = (kv_self.sink_rows + (size_t) j * kv_size) * v_size_el;
+                            ggml_backend_tensor_set(kv_self.v_l[il], src, dst_offset, v_rows * v_size_el);
+                            continue;
+                        }
+                        size_t src_offset = 0;
+                        for (const auto & range : dst_ranges) {
+                            const uint32_t rows = range.second - range.first;
+                            const size_t dst_offset = (range.first + (size_t) j * kv_size) * v_size_el;
+                            ggml_backend_tensor_set(kv_self.v_l[il], src + src_offset,
+                                    dst_offset, (size_t) rows * v_size_el);
+                            src_offset += (size_t) rows * v_size_el;
+                        }
                     }
                 }
             }
@@ -11429,10 +11759,18 @@ struct llama_data_read {
                 }
 
                 if (cell_count) {
-                    if (kv_self.kr_l[il]->extra) {
-                        read_kv_cache_data_split(ctx, kv_self.kr_l[il], read(cell_count * kr_size_row), kv_self.head, kr_size_row, cell_count, il);
-                    } else {
-                        ggml_backend_tensor_set(kv_self.kr_l[il], read(cell_count * kr_size_row), kv_self.head * kr_size_row, cell_count * kr_size_row);
+                    const uint8_t * src = read(cell_count * kr_size_row);
+                    size_t src_offset = 0;
+                    for (const auto & range : dst_ranges) {
+                        const uint32_t rows = range.second - range.first;
+                        if (kv_self.kr_l[il]->extra) {
+                            read_kv_cache_data_split(ctx, kv_self.kr_l[il], src + src_offset,
+                                    range.first, kr_size_row, rows, il);
+                        } else {
+                            ggml_backend_tensor_set(kv_self.kr_l[il], src + src_offset,
+                                    (size_t) range.first * kr_size_row, (size_t) rows * kr_size_row);
+                        }
+                        src_offset += (size_t) rows * kr_size_row;
                     }
                 }
             }
@@ -11573,12 +11911,17 @@ struct llama_data_read {
         }
 
         // scalars before rows: they set the placement offset, and seq_rm inside meta resets head_swa
-        bool res = read_kv_cache_meta(ctx, cell_count, seq_id);
+        const bool preserve_existing_seq =
+            (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != 0 &&
+            seq_id >= 0 && !kv_self.recurrent &&
+            llama_kv_has_qnext_state_storage(kv_self);
+        std::vector<std::pair<uint32_t, uint32_t>> restore_ranges;
+        bool res = read_kv_cache_meta(ctx, cell_count, seq_id, preserve_existing_seq, &restore_ranges);
         if (res && compact_blob) {
             kv_self.pos_base_swa = restore_pos_base;
             kv_self.head_swa     = restore_head_swa;
         }
-        res = res && read_kv_cache_data(ctx, cell_count, seq_id, flags);
+        res = res && read_kv_cache_data(ctx, cell_count, seq_id, flags, &restore_ranges);
 
         if (!res) {
             if (seq_id == -1) {

@@ -1934,6 +1934,38 @@ bool gpt_params_find_arg(int argc, char ** argv, const std::string & arg, gpt_pa
         params.cont_batching = false;
         return true;
     }
+    if (arg == "--prompt-fair-share") {
+        params.prompt_fair_share = true;
+        return true;
+    }
+    if (arg == "--no-prompt-fair-share") {
+        params.prompt_fair_share = false;
+        return true;
+    }
+    if (arg == "--mtp-prompt-piggyback") {
+        params.mtp_prompt_piggyback = true;
+        return true;
+    }
+    if (arg == "--no-mtp-prompt-piggyback") {
+        params.mtp_prompt_piggyback = false;
+        return true;
+    }
+    if (arg == "--mtp-adaptive-scheduling") {
+        params.mtp_adaptive_scheduling = true;
+        return true;
+    }
+    if (arg == "--no-mtp-adaptive-scheduling") {
+        params.mtp_adaptive_scheduling = false;
+        return true;
+    }
+    if (arg == "--mtp-prompt-chunk") {
+        CHECK_ARG
+        params.mtp_prompt_chunk = std::stoi(argv[i]);
+        if (params.mtp_prompt_chunk < 0) {
+            invalid_param = true;
+        }
+        return true;
+    }
     if (arg == "-no-fa" || arg == "--no-flash-attn") {
         params.flash_attn = false;
         return true;
@@ -3322,6 +3354,13 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
     options.push_back({ "*",           "-ns,   --sequences N",          "number of sequences to decode (default: %d)", params.n_sequences });
     options.push_back({ "*",           "-cb,   --cont-batching",        "enable continuous batching (a.k.a dynamic batching) (default: %s)", params.cont_batching ? "enabled" : "disabled" });
     options.push_back({ "*",           "-nocb, --no-cont-batching",     "disable continuous batching" });
+    options.push_back({ "server",      "       --prompt-fair-share",   "share each prefill batch across pending text prompts (default: %s)", params.prompt_fair_share ? "enabled" : "disabled" });
+    options.push_back({ "server",      "       --no-prompt-fair-share", "disable fair-share prefill admission" });
+    options.push_back({ "server",      "       --mtp-prompt-piggyback", "keep established MTP generations moving with root-only rows while a new prompt is admitted (default: %s)", params.mtp_prompt_piggyback ? "enabled" : "disabled" });
+    options.push_back({ "server",      "       --no-mtp-prompt-piggyback", "disable root-only MTP decode piggyback during prompt admission" });
+    options.push_back({ "server",      "       --mtp-adaptive-scheduling", "adapt MTP depth, decode cohort width, and prompt piggyback quantum from aggregate service throughput (default: %s)", params.mtp_adaptive_scheduling ? "enabled" : "disabled" });
+    options.push_back({ "server",      "       --no-mtp-adaptive-scheduling", "disable aggregate-throughput MTP scheduling" });
+    options.push_back({ "server",      "       --mtp-prompt-chunk N",   "fixed maximum prompt tokens per root-only MTP piggyback iteration (default: %d; 0 = adaptive when enabled, otherwise batch size)", params.mtp_prompt_chunk });
 
     options.push_back({ "multi-modality" });
     options.push_back({ "*",           "       --mmproj FILE",          "path to a multimodal projector file. see examples/mtmd/README.md" });

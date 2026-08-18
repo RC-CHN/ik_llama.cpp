@@ -419,6 +419,10 @@ struct gpt_params {
     bool multiline_input   = false; // reverse the usage of `\`
     bool simple_io         = false; // improves compatibility with subprocesses and limited consoles
     bool cont_batching     = true;  // insert new sequences for decoding on-the-fly
+    bool prompt_fair_share = false; // share each prefill batch across pending text prompts
+    bool mtp_prompt_piggyback = false; // keep established MTP generations moving during prompt admission
+    bool mtp_adaptive_scheduling = false; // adapt MTP depth, decode cohort width, and prompt quantum for aggregate throughput
+    int32_t mtp_prompt_chunk = 0;   // fixed prompt-token quantum (0 = adaptive when enabled, otherwise n_batch)
     bool flash_attn        = true;  // flash attention
     int  mla_attn          = 3;     // MLA 0: standard, 1: MLA with K and V^T cache, 2: MLA with just K cache, 3: the best of both worlds
     int  attn_max_batch    = 256;   // Max batch size to use when computing attention (only applicable if flash_attn = false)

@@ -2945,6 +2945,16 @@ ggml_cgraph * llm_build_context::llama_build_graph(
             ggml_backend_sched_set_tensor_backend(lctx.sched, cur, lctx.backend_cpu);
         }
 
+        // Keep the output projection on the CPU when its weights deliberately live
+        // in host memory.  Otherwise the scheduler may opportunistically stage the
+        // roughly 1 GiB vocabulary matrix in a CUDA compute buffer.  With embedded
+        // MTP contexts that staging is duplicated per context, consuming scarce
+        // VRAM without making use of the available host-HBM bandwidth.
+        if (strcmp(name, "result_output") == 0 &&
+                ggml_backend_buft_is_host(lctx.model.buft_output.buft)) {
+            ggml_backend_sched_set_tensor_backend(lctx.sched, cur, lctx.backend_cpu);
+        }
+
         if (strcmp(name, "hybrid_kv_hot_fa") == 0 ||
                 strcmp(name, "hybrid_kv_hot_stats") == 0 ||
                 strcmp(name, "hybrid_kv_cold_ready") == 0 ||

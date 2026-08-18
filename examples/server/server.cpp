@@ -849,6 +849,8 @@ int main(int argc, char ** argv) {
         const uint64_t t_tokens_generation = data.at("t_tokens_generation");
 
         const int32_t kv_cache_used_cells = data.at("kv_cache_used_cells");
+        const int32_t kv_cache_free_cells = data.at("kv_cache_free_cells");
+        const int32_t kv_cache_max_contiguous = data.at("kv_cache_max_contiguous");
 
         // metrics definition: https://prometheus.io/docs/practices/naming/#metric-names
         json all_metrics_def = json {
@@ -868,6 +870,50 @@ int main(int argc, char ** argv) {
                     {"name",  "tokens_predicted_seconds_total"},
                     {"help",  "Predict process time"},
                     {"value",  (uint64_t) data.at("t_tokens_generation_total") / 1.e3}
+            }, {
+                    {"name",  "mtp_adaptive_decode_updates_total"},
+                    {"help",  "Number of aggregate MTP decode-controller observations."},
+                    {"value",  (uint64_t) data.at("mtp_adaptive_decode_updates")}
+            }, {
+                    {"name",  "mtp_adaptive_decode_width_updates_total"},
+                    {"help",  "Number of adaptive decode-cohort width observations."},
+                    {"value",  (uint64_t) data.at("mtp_adaptive_decode_width_updates")}
+            }, {
+                    {"name",  "mtp_adaptive_decode_width_deferred_total"},
+                    {"help",  "Number of width observations deferred until its depth controller was comparable."},
+                    {"value",  (uint64_t) data.at("mtp_adaptive_decode_width_deferred")}
+            }, {
+                    {"name",  "mtp_adaptive_prompt_updates_total"},
+                    {"help",  "Number of mixed prompt/decode-controller observations."},
+                    {"value",  (uint64_t) data.at("mtp_adaptive_prompt_updates")}
+            }, {
+                    {"name",  "mtp_adaptive_prompt_censored_total"},
+                    {"help",  "Number of incomplete mixed prompt quanta excluded from controller learning."},
+                    {"value",  (uint64_t) data.at("mtp_adaptive_prompt_censored")}
+            }, {
+                    {"name",  "mtp_adaptive_decode_prior_transfers_total"},
+                    {"help",  "Number of relative MTP arm priors transferred between workload classes."},
+                    {"value",  (uint64_t) data.at("mtp_adaptive_decode_prior_transfers")}
+            }, {
+                    {"name",  "mtp_adaptive_decode_width_prior_transfers_total"},
+                    {"help",  "Number of relative decode-width priors transferred between workload classes."},
+                    {"value",  (uint64_t) data.at("mtp_adaptive_decode_width_prior_transfers")}
+            }, {
+                    {"name",  "kv_batch_capacity_caps_total"},
+                    {"help",  "Number of prompt scheduling iterations capped by current contiguous KV capacity."},
+                    {"value",  (uint64_t) data.at("kv_batch_capacity_caps_total")}
+            }, {
+                    {"name",  "kv_batch_retries_total"},
+                    {"help",  "Number of decode retries after a proposed batch could not be allocated."},
+                    {"value",  (uint64_t) data.at("kv_batch_retries_total")}
+            }, {
+                    {"name",  "hybrid_kv_fa_pages_checked_total"},
+                    {"help",  "Number of BF16 CPU flash-attention K pages considered for query cohorts."},
+                    {"value",  (uint64_t) data.at("hybrid_kv_fa_pages_checked")}
+            }, {
+                    {"name",  "hybrid_kv_fa_pages_skipped_total"},
+                    {"help",  "Number of all-masked BF16 CPU flash-attention K pages skipped without reading K/V."},
+                    {"value",  (uint64_t) data.at("hybrid_kv_fa_pages_skipped")}
             }}},
             {"gauge", {{
                     {"name",  "prompt_tokens_seconds"},
@@ -886,6 +932,29 @@ int main(int argc, char ** argv) {
                     {"help",  "KV-cache tokens."},
                     {"value",  (uint64_t) data.at("kv_cache_tokens_count")}
             },{
+                    {"name",  "kv_cache_free_cells"},
+                    {"help",  "Unused KV-cache cells."},
+                    {"value",  kv_cache_free_cells}
+            },{
+                    {"name",  "kv_cache_max_contiguous_cells"},
+                    {"help",  "Largest currently contiguous range of unused KV-cache cells."},
+                    {"value",  kv_cache_max_contiguous}
+            },{
+                    {"name",  "kv_cache_fragmentation_ratio"},
+                    {"help",  "One minus largest-contiguous/free KV cells; 0 means all free cells are contiguous."},
+                    {"value",  kv_cache_free_cells > 0
+                        ? 1.0 - (double) kv_cache_max_contiguous / kv_cache_free_cells : 0.0}
+            },{
+                    {"name",  "kv_batch_effective_cap"},
+                    {"help",  "Current prompt batch cap after applying live KV allocation constraints."},
+                    {"value",  (int32_t) data.at("kv_batch_effective_cap")}
+            },{
+                    {"name",  "hybrid_kv_fa_page_skip_ratio"},
+                    {"help",  "Cumulative fraction of checked BF16 CPU flash-attention K pages pruned by the mask."},
+                    {"value",  (uint64_t) data.at("hybrid_kv_fa_pages_checked") > 0
+                        ? (double) data.at("hybrid_kv_fa_pages_skipped") /
+                          (double) data.at("hybrid_kv_fa_pages_checked") : 0.0}
+            },{
                     {"name",  "requests_processing"},
                     {"help",  "Number of request processing."},
                     {"value",  (uint64_t) data.at("processing")}
@@ -893,6 +962,78 @@ int main(int argc, char ** argv) {
                     {"name",  "requests_deferred"},
                     {"help",  "Number of request deferred."},
                     {"value",  (uint64_t) data.at("deferred")}
+            },{
+                    {"name",  "mtp_adaptive_enabled"},
+                    {"help",  "Whether aggregate-throughput MTP scheduling is enabled."},
+                    {"value",  (int32_t) data.at("mtp_adaptive_enabled")}
+            },{
+                    {"name",  "mtp_adaptive_depth"},
+                    {"help",  "Current shared MTP draft-depth arm."},
+                    {"value",  (int32_t) data.at("mtp_adaptive_depth")}
+            },{
+                    {"name",  "mtp_adaptive_prompt_chunk"},
+                    {"help",  "Current prompt piggyback quantum."},
+                    {"value",  (int32_t) data.at("mtp_adaptive_prompt_chunk")}
+            },{
+                    {"name",  "mtp_adaptive_active_decode"},
+                    {"help",  "Decode requests scheduled in the current target microstep."},
+                    {"value",  (int32_t) data.at("mtp_adaptive_active_decode")}
+            },{
+                    {"name",  "mtp_adaptive_resident_decode"},
+                    {"help",  "Runnable decode requests retaining resident KV state."},
+                    {"value",  (int32_t) data.at("mtp_adaptive_resident_decode")}
+            },{
+                    {"name",  "mtp_adaptive_decode_width"},
+                    {"help",  "Current number of decode requests selected for a microstep."},
+                    {"value",  (int32_t) data.at("mtp_adaptive_decode_width")}
+            },{
+                    {"name",  "mtp_adaptive_decode_width_context_bucket"},
+                    {"help",  "Power-of-two context bucket used by the decode-width controller."},
+                    {"value",  (int32_t) data.at("mtp_adaptive_decode_width_context_bucket")}
+            },{
+                    {"name",  "mtp_adaptive_pending_prompt"},
+                    {"help",  "Prompt requests in the controller workload class."},
+                    {"value",  (int32_t) data.at("mtp_adaptive_pending_prompt")}
+            },{
+                    {"name",  "mtp_adaptive_context_bucket"},
+                    {"help",  "Power-of-two context-length bucket used by the controller."},
+                    {"value",  (int32_t) data.at("mtp_adaptive_context_bucket")}
+            },{
+                    {"name",  "mtp_adaptive_checkpoint_draft_row_budget"},
+                    {"help",  "Aggregate recurrent checkpoint draft rows available to one physical decode."},
+                    {"value",  (int32_t) data.at("mtp_adaptive_checkpoint_draft_row_budget")}
+            },{
+                    {"name",  "mtp_adaptive_checkpoint_draft_rows"},
+                    {"help",  "Aggregate recurrent checkpoint draft rows selected for the current decode."},
+                    {"value",  (int32_t) data.at("mtp_adaptive_checkpoint_draft_rows")}
+            },{
+                    {"name",  "mtp_adaptive_max_feasible_depth"},
+                    {"help",  "Largest per-request MTP depth feasible at the selected decode width."},
+                    {"value",  (int32_t) data.at("mtp_adaptive_max_feasible_depth")}
+            },{
+                    {"name",  "mtp_adaptive_reward"},
+                    {"help",  "Last aggregate decode TPS or normalized mixed-service reward."},
+                    {"value",  (double) data.at("mtp_adaptive_reward")}
+            },{
+                    {"name",  "mtp_adaptive_prefill_reference_tps"},
+                    {"help",  "Controller EMA of isolated aggregate prefill throughput."},
+                    {"value",  (double) data.at("mtp_adaptive_prefill_reference_tps")}
+            },{
+                    {"name",  "mtp_adaptive_decode_reference_tps"},
+                    {"help",  "Controller EMA of isolated aggregate decode throughput."},
+                    {"value",  (double) data.at("mtp_adaptive_decode_reference_tps")}
+            },{
+                    {"name",  "mtp_adaptive_decode_width_reference_tps"},
+                    {"help",  "Controller EMA of comparable decode-width observations."},
+                    {"value",  (double) data.at("mtp_adaptive_decode_width_reference_tps")}
+            },{
+                    {"name",  "mtp_adaptive_decode_arm_rate_tps"},
+                    {"help",  "Token/time aggregate rate estimate for the current MTP depth arm."},
+                    {"value",  (double) data.at("mtp_adaptive_decode_arm_rate_tps")}
+            },{
+                    {"name",  "mtp_adaptive_decode_width_arm_rate_tps"},
+                    {"help",  "Token/time aggregate rate estimate for the current decode-width arm."},
+                    {"value",  (double) data.at("mtp_adaptive_decode_width_arm_rate_tps")}
             }}}
         };
 

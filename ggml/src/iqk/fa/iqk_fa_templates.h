@@ -10,6 +10,7 @@
 #pragma once
 
 #include "iqk/iqk_config.h"
+#include "iqk/iqk_mul_mat.h"
 
 #if defined IQK_IMPLEMENT && defined GGML_IQK_FLASH_ATTENTION
 
@@ -110,6 +111,37 @@ inline int mask_effective_nk1(const char * mask, int n_rows, int stride_m, int n
         if (ik > ik_max) ik_max = ik;
     }
     return ik_max;
+}
+
+// The hybrid CPU/HBM path can share one physical KV cache between several
+// independent sequences.  The causal mask makes unrelated cache rows
+// numerically invisible, but doing the QK and PV work for a page that is
+// invisible to every query in the current cohort only wastes HBM bandwidth
+// and AMX/AVX cycles.  Test one kernel-sized page before loading its K/V rows.
+//
+// A negative mask stride is the compact Qwen GQA convention used below: one
+// source mask row is repeated for each group of six adjacent query heads.
+// Keep this helper in the BF16 implementation so other attention layouts are
+// unaffected.
+inline bool mask_page_all_invisible(
+        const char * mask, int n_queries, int stride_m, int k_step) {
+    if (mask == nullptr) {
+        return false;
+    }
+
+    constexpr uint16_t fp16_neg_inf = 0xfc00u;
+    for (int query = 0; query < n_queries; ++query) {
+        const size_t row_offset = stride_m >= 0
+            ? (size_t) query*(size_t) stride_m
+            : (size_t) (query/6)*(size_t) (-stride_m);
+        const auto * row = (const uint16_t *) (mask + row_offset);
+        for (int token = 0; token < k_step; ++token) {
+            if (row[token] != fp16_neg_inf) {
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 struct BaseHelper {
@@ -2255,6 +2287,8 @@ struct FlashAttnBF16 {
     template <typename KHelper, typename VHelper>
     void compute(KHelper& kh, VHelper& vh, int nq1, int nk1, int stride_q, int stride_m, int stride_qkv,
             const float * q, const char * mask, float * qkv, [[maybe_unused]] float * M, [[maybe_unused]] float * S) {
+        uint64_t pages_checked = 0;
+        uint64_t pages_skipped = 0;
         ggml_bf16_t q_bf16[q_step*Dk];
 #if defined(GGML_AMX_BF16) && defined(__AMX_TILE__) && defined(__AMX_BF16__) && defined(__x86_64__)
         typename FlashQKbf16<Dk, q_step, k_step>::amx_q_storage q_amx;
@@ -2286,6 +2320,14 @@ struct FlashAttnBF16 {
             auto mr = mask;
             int nk1_eff = mask_effective_nk1(mr, q_step, stride_m, nk1, k_step);
             for (int k1 = 0; k1 < nk1_eff/k_step; ++k1) {
+                ++pages_checked;
+                if (mask_page_all_invisible(mr, q_step, stride_m, k_step)) {
+                    ++pages_skipped;
+                    kh.next_block(k_step);
+                    vh.next_block(k_step);
+                    mr += k_step*sizeof(ggml_half);
+                    continue;
+                }
 #if defined(GGML_AMX_BF16) && defined(__AMX_TILE__) && defined(__AMX_BF16__) && defined(__x86_64__)
                 if (use_amx) {
 #if FA_TIMING
@@ -2364,6 +2406,14 @@ struct FlashAttnBF16 {
 #endif
             auto mr = mask;
             for (int k1 = 0; k1 < nk1/k_step; ++k1) {
+                ++pages_checked;
+                if (mask_page_all_invisible(mr, n_left, stride_m, k_step)) {
+                    ++pages_skipped;
+                    kh.next_block(k_step);
+                    vh.next_block(k_step);
+                    mr += k_step*sizeof(ggml_half);
+                    continue;
+                }
 #if defined(GGML_AMX_BF16) && defined(__AMX_TILE__) && defined(__AMX_BF16__) && defined(__x86_64__)
                 if (use_amx) {
                     FlashQKbf16<Dk, q_step, k_step>::multiply_mask_kq_amx(
@@ -2396,6 +2446,7 @@ struct FlashAttnBF16 {
 #endif
             fqkv.normalize_and_store(fms, n_left, stride_qkv, qkv, sinkf, sink_stride, M, S);
         }
+        iqk_fa_page_stats_add(pages_checked, pages_skipped);
 #if FA_TIMING
         Perf::instance().add(perf);
 #endif

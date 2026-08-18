@@ -9,6 +9,29 @@
 #include "iqk_flash_impl.h"
 #include "ggml.h"
 
+#include <atomic>
+
+namespace {
+std::atomic<uint64_t> g_fa_pages_checked{0};
+std::atomic<uint64_t> g_fa_pages_skipped{0};
+}
+
+extern "C" IQK_API void iqk_fa_page_stats_add(
+        uint64_t pages_checked, uint64_t pages_skipped) {
+    g_fa_pages_checked.fetch_add(pages_checked, std::memory_order_relaxed);
+    g_fa_pages_skipped.fetch_add(pages_skipped, std::memory_order_relaxed);
+}
+
+extern "C" IQK_API void iqk_fa_page_stats_get(
+        uint64_t * pages_checked, uint64_t * pages_skipped) {
+    if (pages_checked != nullptr) {
+        *pages_checked = g_fa_pages_checked.load(std::memory_order_relaxed);
+    }
+    if (pages_skipped != nullptr) {
+        *pages_skipped = g_fa_pages_skipped.load(std::memory_order_relaxed);
+    }
+}
+
 #if defined IQK_IMPLEMENT && defined GGML_IQK_FLASH_ATTENTION
 
 #include <algorithm>

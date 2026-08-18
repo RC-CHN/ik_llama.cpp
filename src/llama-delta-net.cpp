@@ -111,6 +111,12 @@ delta_net::delta_net(llama_context & _lctx, const llama_batch & _batch) : lctx(_
     const int max_per_step_seqs = lctx.kv_self.save_per_step_ssm
         ? lctx.kv_self.ckpt.per_step_max_seqs_allocated
         : 0;
+    const int max_per_step_ssm_rows = lctx.kv_self.save_per_step_ssm
+        ? lctx.kv_self.ckpt.per_step_ssm_rows_allocated
+        : 0;
+    const int max_per_step_conv_rows = lctx.kv_self.save_per_step_ssm
+        ? lctx.kv_self.ckpt.per_step_conv_rows_allocated
+        : 0;
     const bool checkpoint_output_rows = batch.logits != nullptr &&
         std::all_of(batch.logits, batch.logits + batch.n_tokens, [](int8_t output) { return output != 0; });
     const auto & capture_seq_ids = lctx.kv_self.ckpt.per_step_capture_seq_ids;
@@ -120,10 +126,14 @@ delta_net::delta_net(llama_context & _lctx, const llama_batch & _batch) : lctx(_
             return std::find(capture_seq_ids.begin(), capture_seq_ids.end(), seq) != capture_seq_ids.end();
         });
     const bool single_seq_checkpoint = checkpoint_output_rows && checkpoint_capture_allowed &&
-        all_same_seq && batch.n_tokens > 1 && batch.n_tokens <= max_per_step;
+        all_same_seq && batch.n_tokens > 1 && batch.n_tokens <= max_per_step &&
+        batch.n_tokens - 1 <= max_per_step_ssm_rows &&
+        batch.n_tokens <= max_per_step_conv_rows;
     const bool rectangular_checkpoint = checkpoint_output_rows && checkpoint_capture_allowed && rectangular_n_seqs > 1 &&
         rectangular_tokens_per_seq > 1 && rectangular_tokens_per_seq <= max_per_step &&
-        rectangular_n_seqs <= max_per_step_seqs;
+        rectangular_n_seqs <= max_per_step_seqs &&
+        (int64_t) (rectangular_tokens_per_seq - 1) * rectangular_n_seqs <= max_per_step_ssm_rows &&
+        (int64_t) rectangular_tokens_per_seq * rectangular_n_seqs <= max_per_step_conv_rows;
     save_per_step_states = lctx.kv_self.save_per_step_ssm &&
         (single_seq_checkpoint || rectangular_checkpoint);
 

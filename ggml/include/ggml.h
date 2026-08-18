@@ -2532,6 +2532,13 @@ extern "C" {
             int32_t              cold_capacity,
             bool                 return_partials);
 
+    // Cumulative BF16 CPU flash-attention K-page pruning counters.  A checked
+    // page is one kernel K tile considered for a query cohort; a skipped page
+    // had an all-negative-infinity mask and did not read or compute K/V.
+    GGML_API void ggml_flash_attn_ext_get_page_stats(
+            uint64_t * pages_checked,
+            uint64_t * pages_skipped);
+
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);

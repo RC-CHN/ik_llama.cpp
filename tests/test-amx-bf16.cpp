@@ -231,6 +231,112 @@ bool run_fa_repeated_mask_case(int n_tokens, int nk) {
     return true;
 }
 
+bool run_fa_sparse_page_case(int n_tokens, int nk) {
+    constexpr int d = 256;
+    constexpr int gqa = 6;
+    // BF16 D=256 selects a 64-token K tile when nk is divisible by 64.
+    // Alternate whole tiles so the sparse call exercises the page-pruning
+    // branch rather than merely masking lanes inside a computed tile.
+    constexpr int page = 64;
+    const int nq = n_tokens*gqa;
+    if (nk % (2*page) != 0) {
+        return false;
+    }
+    const int packed_nk = nk/2;
+
+    std::vector<float> q(static_cast<size_t>(nq)*d);
+    std::vector<ggml_bf16_t> k(static_cast<size_t>(nk)*d);
+    std::vector<ggml_bf16_t> v(static_cast<size_t>(nk)*d);
+    std::vector<ggml_bf16_t> packed_k(static_cast<size_t>(packed_nk)*d);
+    std::vector<ggml_bf16_t> packed_v(static_cast<size_t>(packed_nk)*d);
+    std::vector<ggml_fp16_t> sparse_mask(static_cast<size_t>(n_tokens)*nk);
+    std::vector<ggml_fp16_t> packed_mask(static_cast<size_t>(n_tokens)*packed_nk,
+        ggml_fp32_to_fp16(0.0f));
+
+    for (size_t i = 0; i < q.size(); ++i) {
+        q[i] = 0.25f*std::sin(0.019f*static_cast<float>(i));
+    }
+    for (size_t i = 0; i < k.size(); ++i) {
+        k[i] = ggml_fp32_to_bf16(0.25f*std::cos(0.003f*static_cast<float>(i)));
+        v[i] = ggml_fp32_to_bf16(std::sin(0.007f*static_cast<float>(i)));
+    }
+
+    int packed_row = 0;
+    for (int block = 0; block < nk/page; ++block) {
+        const bool visible = block % 2 == 0;
+        for (int offset = 0; offset < page; ++offset) {
+            const int row = block*page + offset;
+            for (int token = 0; token < n_tokens; ++token) {
+                sparse_mask[static_cast<size_t>(token)*nk + row] =
+                    ggml_fp32_to_fp16(visible ? 0.0f : -INFINITY);
+            }
+            if (visible) {
+                std::memcpy(packed_k.data() + static_cast<size_t>(packed_row)*d,
+                    k.data() + static_cast<size_t>(row)*d, d*sizeof(ggml_bf16_t));
+                std::memcpy(packed_v.data() + static_cast<size_t>(packed_row)*d,
+                    v.data() + static_cast<size_t>(row)*d, d*sizeof(ggml_bf16_t));
+                ++packed_row;
+            }
+        }
+    }
+    if (packed_row != packed_nk) {
+        return false;
+    }
+
+    std::vector<float> sparse(static_cast<size_t>(nq)*d);
+    std::vector<float> packed(static_cast<size_t>(nq)*d);
+    std::vector<float> sparse_m(nq), sparse_s(nq), packed_m(nq), packed_s(nq);
+    const int sparse_stride = nk*sizeof(ggml_fp16_t);
+    const int packed_stride = packed_nk*sizeof(ggml_fp16_t);
+    const bool sparse_handled = iqk_fa_256_256(
+        GGML_TYPE_BF16, GGML_TYPE_BF16, nq, nk,
+        d*sizeof(float), d*sizeof(ggml_bf16_t), d*sizeof(ggml_bf16_t),
+        -sparse_stride, d, q.data(), k.data(), v.data(), sparse_mask.data(),
+        1.0f/std::sqrt(static_cast<float>(d)), 0.0f, sparse.data(), nullptr, 0,
+        sparse_m.data(), sparse_s.data());
+    const bool packed_handled = iqk_fa_256_256(
+        GGML_TYPE_BF16, GGML_TYPE_BF16, nq, packed_nk,
+        d*sizeof(float), d*sizeof(ggml_bf16_t), d*sizeof(ggml_bf16_t),
+        -packed_stride, d, q.data(), packed_k.data(), packed_v.data(), packed_mask.data(),
+        1.0f/std::sqrt(static_cast<float>(d)), 0.0f, packed.data(), nullptr, 0,
+        packed_m.data(), packed_s.data());
+    if (!sparse_handled || !packed_handled) {
+        std::fprintf(stderr, "flash attention rejected sparse-page case tokens=%d, nk=%d\n",
+            n_tokens, nk);
+        return false;
+    }
+
+    double squared_error = 0.0;
+    double squared_reference = 0.0;
+    float max_output_error = 0.0f;
+    for (size_t i = 0; i < sparse.size(); ++i) {
+        const float error = sparse[i] - packed[i];
+        max_output_error = std::max(max_output_error, std::abs(error));
+        squared_error += static_cast<double>(error)*error;
+        squared_reference += static_cast<double>(packed[i])*packed[i];
+    }
+    const double relative_rms = std::sqrt(
+        squared_error/std::max(1.0e-30, squared_reference));
+
+    float max_stats_error = 0.0f;
+    for (int i = 0; i < nq; ++i) {
+        max_stats_error = std::max(max_stats_error, std::abs(sparse_m[i] - packed_m[i]));
+        max_stats_error = std::max(max_stats_error, std::abs(sparse_s[i] - packed_s[i]));
+    }
+    if (max_output_error > 0.08f || relative_rms > 0.04 || max_stats_error > 1.0e-3f) {
+        std::fprintf(stderr,
+            "sparse-page flash attention mismatch for tokens=%d, nk=%d: "
+            "max_output=%g, rel_rms=%g, stats=%g\n",
+            n_tokens, nk, max_output_error, relative_rms, max_stats_error);
+        return false;
+    }
+
+    std::printf("PASS AMX FA sparse pages tokens=%d, nq=%d, nk=%d, "
+        "max_output=%g, rel_rms=%g, stats=%g\n",
+        n_tokens, nq, nk, max_output_error, relative_rms, max_stats_error);
+    return true;
+}
+
 int run_benchmark() {
     constexpr matrix_case tc = { 512, 128, 4096, 1 };
     std::mt19937 rng(0x9470cu);
@@ -263,11 +369,111 @@ int run_benchmark() {
     return 0;
 }
 
+int run_fa_page_benchmark() {
+    constexpr int d = 256;
+    constexpr int n_tokens = 3;
+    constexpr int gqa = 6;
+    constexpr int nq = n_tokens*gqa;
+    constexpr int nk = 32768;
+    constexpr int page = 64;
+    constexpr int packed_nk = nk/2;
+    constexpr int iterations = 5;
+
+    std::vector<float> q(static_cast<size_t>(nq)*d);
+    std::vector<ggml_bf16_t> k(static_cast<size_t>(nk)*d);
+    std::vector<ggml_bf16_t> v(static_cast<size_t>(nk)*d);
+    std::vector<ggml_bf16_t> packed_k(static_cast<size_t>(packed_nk)*d);
+    std::vector<ggml_bf16_t> packed_v(static_cast<size_t>(packed_nk)*d);
+    std::vector<ggml_fp16_t> dense_mask(static_cast<size_t>(n_tokens)*nk,
+        ggml_fp32_to_fp16(0.0f));
+    std::vector<ggml_fp16_t> sparse_mask(static_cast<size_t>(n_tokens)*nk);
+    std::vector<ggml_fp16_t> packed_mask(static_cast<size_t>(n_tokens)*packed_nk,
+        ggml_fp32_to_fp16(0.0f));
+    std::vector<float> output(static_cast<size_t>(nq)*d);
+    std::vector<float> max(nq), sum(nq);
+
+    for (size_t i = 0; i < q.size(); ++i) {
+        q[i] = 0.25f*std::sin(0.019f*static_cast<float>(i));
+    }
+    for (size_t i = 0; i < k.size(); ++i) {
+        k[i] = ggml_fp32_to_bf16(0.25f*std::cos(0.003f*static_cast<float>(i)));
+        v[i] = ggml_fp32_to_bf16(std::sin(0.007f*static_cast<float>(i)));
+    }
+
+    int packed_row = 0;
+    for (int block = 0; block < nk/page; ++block) {
+        const bool visible = block % 2 == 0;
+        for (int offset = 0; offset < page; ++offset) {
+            const int row = block*page + offset;
+            for (int token = 0; token < n_tokens; ++token) {
+                sparse_mask[static_cast<size_t>(token)*nk + row] =
+                    ggml_fp32_to_fp16(visible ? 0.0f : -INFINITY);
+            }
+            if (visible) {
+                std::memcpy(packed_k.data() + static_cast<size_t>(packed_row)*d,
+                    k.data() + static_cast<size_t>(row)*d, d*sizeof(ggml_bf16_t));
+                std::memcpy(packed_v.data() + static_cast<size_t>(packed_row)*d,
+                    v.data() + static_cast<size_t>(row)*d, d*sizeof(ggml_bf16_t));
+                ++packed_row;
+            }
+        }
+    }
+
+    auto invoke = [&](const std::vector<ggml_bf16_t> & this_k,
+                      const std::vector<ggml_bf16_t> & this_v,
+                      const std::vector<ggml_fp16_t> & this_mask,
+                      int this_nk) {
+        return iqk_fa_256_256(
+            GGML_TYPE_BF16, GGML_TYPE_BF16, nq, this_nk,
+            d*sizeof(float), d*sizeof(ggml_bf16_t), d*sizeof(ggml_bf16_t),
+            -this_nk*(int) sizeof(ggml_fp16_t), d,
+            q.data(), this_k.data(), this_v.data(), this_mask.data(),
+            1.0f/std::sqrt(static_cast<float>(d)), 0.0f,
+            output.data(), nullptr, 0, max.data(), sum.data());
+    };
+    if (!invoke(k, v, dense_mask, nk) ||
+            !invoke(k, v, sparse_mask, nk) ||
+            !invoke(packed_k, packed_v, packed_mask, packed_nk)) {
+        return 1;
+    }
+
+    auto measure = [&](const std::vector<ggml_bf16_t> & this_k,
+                       const std::vector<ggml_bf16_t> & this_v,
+                       const std::vector<ggml_fp16_t> & this_mask,
+                       int this_nk) {
+        const auto begin = std::chrono::steady_clock::now();
+        for (int i = 0; i < iterations; ++i) {
+            if (!invoke(this_k, this_v, this_mask, this_nk)) {
+                return -1.0;
+            }
+        }
+        const auto end = std::chrono::steady_clock::now();
+        return 1e3*std::chrono::duration<double>(end - begin).count()/iterations;
+    };
+
+    const double dense_ms = measure(k, v, dense_mask, nk);
+    const double sparse_ms = measure(k, v, sparse_mask, nk);
+    const double packed_ms = measure(packed_k, packed_v, packed_mask, packed_nk);
+    if (dense_ms <= 0.0 || sparse_ms <= 0.0 || packed_ms <= 0.0) {
+        return 1;
+    }
+    std::printf("BF16 FA page benchmark nq=%d nk=%d visible=50%%: "
+        "dense=%.3f ms sparse=%.3f ms packed=%.3f ms "
+        "dense/sparse=%.2fx sparse/packed=%.2fx%s\n",
+        nq, nk, dense_ms, sparse_ms, packed_ms,
+        dense_ms/sparse_ms, sparse_ms/packed_ms,
+        std::getenv("GGML_AMX_DISABLE") ? " (AMX disabled)" : " (AMX requested)");
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char ** argv) {
     if (argc == 2 && std::strcmp(argv[1], "--bench") == 0) {
         return run_benchmark();
+    }
+    if (argc == 2 && std::strcmp(argv[1], "--bench-fa-pages") == 0) {
+        return run_fa_page_benchmark();
     }
 
     const matrix_case cases[] = {
@@ -283,5 +489,6 @@ int main(int argc, char ** argv) {
     if (!run_fa_case(12, 64)) return 1; // q_step=16, k_step=64
     if (!run_fa_case(30, 96)) return 1; // q_step=32, k_step=32
     if (!run_fa_repeated_mask_case(5, 96)) return 1;
+    if (!run_fa_sparse_page_case(3, 256)) return 1;
     return 0;
 }

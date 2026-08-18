@@ -844,6 +844,9 @@ extern "C" {
     // Returns the number of used KV cells (i.e. have at least one sequence assigned to them)
     LLAMA_API int32_t llama_get_kv_cache_used_cells(const struct llama_context * ctx);
 
+    // Returns the largest currently contiguous range of unused KV cells.
+    LLAMA_API int32_t llama_get_kv_cache_max_contiguous(const struct llama_context * ctx);
+
     // Clear the KV cache - both cell info is erased and KV data is zeroed
     LLAMA_API void llama_kv_cache_clear(
             struct llama_context * ctx);
@@ -865,6 +868,14 @@ extern "C" {
 
     // Initialise the checkpoint system for the upcoming speculation window.
     LLAMA_API int llama_spec_ckpt_init(struct llama_context * ctx, int mode, int max_tokens);
+
+    // Bound recurrent per-step checkpoint storage by the aggregate number of
+    // draft rows captured in one physical decode.  Zero keeps the traditional
+    // max_depth x max_sequences allocation.  This must be set before the first
+    // llama_spec_ckpt_init() call and is intended for a scheduler that enforces
+    // the same aggregate budget while trading speculative depth for width.
+    LLAMA_API bool llama_spec_ckpt_set_max_draft_rows(
+            struct llama_context * ctx, int32_t max_draft_rows);
 
     // Start a decode batch and restrict per-step checkpoint capture to
     // sequences subsequently registered by llama_spec_ckpt_save().

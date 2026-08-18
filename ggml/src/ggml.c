@@ -10874,6 +10874,21 @@ void ggml_flash_attn_ext_set_numa_shards(
     }
 }
 
+void ggml_flash_attn_ext_get_page_stats(
+        uint64_t * pages_checked,
+        uint64_t * pages_skipped) {
+#if GGML_USE_IQK_MULMAT
+    iqk_fa_page_stats_get(pages_checked, pages_skipped);
+#else
+    if (pages_checked != NULL) {
+        *pages_checked = 0;
+    }
+    if (pages_skipped != NULL) {
+        *pages_skipped = 0;
+    }
+#endif
+}
+
 void ggml_flash_attn_ext_add_sinks(
         struct ggml_tensor * a,
         struct ggml_tensor * sinks) {

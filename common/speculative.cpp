@@ -1947,6 +1947,10 @@ bool common_speculative_load_draft_model(
     gpt_params params_dft = params_base;
     if (params.has_stage_type(COMMON_SPECULATIVE_TYPE_MTP)) {
         params_dft.has_mtp = true;
+        // Hybrid KV is a target-context policy.  A companion/MTP-only context
+        // has its own cache placement and must still honor the draft cache
+        // type selected below.
+        params_dft.hybrid_kv = false;
     }
     params_dft.devices          = params.devices.empty() ? params_base.devices : params.devices;
     params_dft.model            = params.model;
@@ -2036,6 +2040,26 @@ bool common_speculative_prepare_mtp_runtime(
     if (!has_external_mtp) {
         gpt_params params_mtp = params_base;
         params_mtp.pooling_type = LLAMA_POOLING_TYPE_NONE;
+        params_mtp.hybrid_kv = false;
+        params_mtp.cache_type_k = params.cache_type_k.empty()
+            ? params_base.cache_type_k : params.cache_type_k;
+        params_mtp.cache_type_v = params.cache_type_v.empty()
+            ? params_base.cache_type_v : params.cache_type_v;
+
+        // The server creates one embedded-MTP context per slot.  Keeping the
+        // target's aggregate context size here makes every one of those
+        // private contexts allocate enough KV for all slots, even though it
+        // can only ever contain its owning slot's sequence.  Match the draft
+        // model path above: honor an explicit draft context, otherwise divide
+        // the target capacity across the configured parallel slots.
+        if (params.n_ctx > 0) {
+            params_mtp.n_ctx = params.n_ctx;
+        } else if (params_base.n_ctx > 0) {
+            params_mtp.n_ctx = params_base.n_ctx / std::max(1, params_base.n_parallel);
+        } else {
+            params_mtp.n_ctx = llama_n_ctx_train(model) / std::max(1, params_base.n_parallel);
+        }
+
         params.cparams_dft = common_context_params_to_llama(params_mtp);
     }
 
@@ -2267,7 +2291,11 @@ int32_t common_speculative_on_target_seq_batch(
     common_speculative_feature_view feature_view;
     const llama_batch * batch_for_spec = &batch;
     llama_batch seq_batch = {};
-    const bool needs_seq_split = is_prompt_warmup && !common_speculative_batch_is_exact_single_seq(batch, seq_id);
+    // A target-only decode token may be piggybacked on a prompt batch from a
+    // different server slot.  Both warmup and accepted-token updates need the
+    // owning sequence's rows only; passing the mixed batch to the private MTP
+    // context would otherwise make it reject the sequence layout.
+    const bool needs_seq_split = !common_speculative_batch_is_exact_single_seq(batch, seq_id);
 
     if (needs_seq_split) {
         const int n_seq_tokens = common_speculative_copy_seq_batch(batch, seq_id, seq_batch);

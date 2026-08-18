@@ -1284,10 +1284,14 @@ bool server_prompt_cache::load(server_prompt& prompt, const server_tokens& token
         prompt_tokens = prompt.tokens.clone();
         tokens_new_ex = tokens_new.clone();
     }
-    const auto lcp_best = prompt_tokens.get_common_prefix(ctx, tokens_new_ex);
-    float f_keep_best = float(lcp_best.second) / prompt_tokens.size();
+    const auto lcp_best_fuzzy = prompt_tokens.get_common_prefix(ctx, tokens_new_ex);
+    size_t lcp_best = rewind_to_checkpoint_on_save
+        ? prompt_tokens.get_common_prefix_exact(tokens_new_ex)
+        : lcp_best_fuzzy.second;
+    float f_keep_best = prompt_tokens.empty() ? 0.0f : float(lcp_best) / prompt_tokens.size();
     float sim_best = prompt_tokens.get_tokens_similarity(ctx, tokens_new_ex, prompt.n_kept_prompt, prompt.n_discarded_prompt);
-    LLAMA_LOG_INFO(" - looking for better prompt, base f_keep = %.3f, sim = %.3f, n_keep = %d, n_discarded_prompt = %d\n", f_keep_best, sim_best, prompt.n_kept_prompt, prompt.n_discarded_prompt);
+    LLAMA_LOG_INFO(" - looking for better prompt, base lcp = %zu, f_keep = %.3f, sim = %.3f, n_keep = %d, n_discarded_prompt = %d\n",
+            lcp_best, f_keep_best, sim_best, prompt.n_kept_prompt, prompt.n_discarded_prompt);
 
     auto it_best = states.end();
 
@@ -1300,13 +1304,20 @@ bool server_prompt_cache::load(server_prompt& prompt, const server_tokens& token
         else {
             tokens = it->tokens.clone();
         }
-        const auto lcp_cur = tokens.get_common_prefix(ctx, tokens_new_ex);
-        const float f_keep_cur = float(lcp_cur.first) / tokens.size();
+        const auto lcp_cur_fuzzy = tokens.get_common_prefix(ctx, tokens_new_ex);
+        const size_t lcp_cur = rewind_to_checkpoint_on_save
+            ? tokens.get_common_prefix_exact(tokens_new_ex)
+            : lcp_cur_fuzzy.first;
+        const float f_keep_cur = tokens.empty() ? 0.0f : float(lcp_cur) / tokens.size();
         if (f_keep_cur < min_reusable_fraction) {
             continue;
         }
         const float sim_cur = tokens.get_tokens_similarity(ctx, tokens_new_ex, it->n_kept_prompt, it->n_discarded_prompt);
-        if (sim_best < sim_cur) {
+        const bool better = rewind_to_checkpoint_on_save
+            ? (lcp_cur > lcp_best || (lcp_cur == lcp_best && sim_cur > sim_best))
+            : sim_best < sim_cur;
+        if (better) {
+            lcp_best = lcp_cur;
             f_keep_best = f_keep_cur;
             sim_best = sim_cur;
             it_best = it;
@@ -1314,7 +1325,8 @@ bool server_prompt_cache::load(server_prompt& prompt, const server_tokens& token
     }
 
     if (it_best != states.end()) {
-        LLAMA_LOG_INFO(" - found better prompt with f_keep = %.3f, sim = %.3f, n_keep = %d, n_discarded_prompt = %d\n", f_keep_best, sim_best, it_best->n_kept_prompt, it_best->n_discarded_prompt);
+        LLAMA_LOG_INFO(" - found better prompt with lcp = %zu, f_keep = %.3f, sim = %.3f, n_keep = %d, n_discarded_prompt = %d\n",
+                lcp_best, f_keep_best, sim_best, it_best->n_kept_prompt, it_best->n_discarded_prompt);
         if (!it_best->state_file.empty()) {
             make_ram_room(it_best->checkpoint_file_size);
             if (!server_prompt_load_checkpoint_file(*it_best)) {
@@ -1383,9 +1395,11 @@ server_prompt* server_prompt_cache::alloc(server_prompt & prompt, size_t state_s
     for (auto it = states.begin(); it != states.end();) {
         auto tokens_ctx_shift = prompt.tokens.clone();  // copy cache tokens
         tokens_ctx_shift.discard_n_tokens(prompt.n_kept_prompt, prompt.n_discarded_prompt);
-        auto prefix = it->tokens.get_common_prefix(ctx, tokens_ctx_shift);
-        const size_t len = prefix.first;
-        const size_t len_prompt = prefix.second;
+        const auto prefix_fuzzy = it->tokens.get_common_prefix(ctx, tokens_ctx_shift);
+        const size_t len = rewind_to_checkpoint_on_save
+            ? it->tokens.get_common_prefix_exact(tokens_ctx_shift)
+            : prefix_fuzzy.first;
+        const size_t len_prompt = rewind_to_checkpoint_on_save ? len : prefix_fuzzy.second;
         // first check if the current state is contained fully in the cache
         if (len_prompt == tokens_ctx_shift.size()) {
             LLAMA_LOG_INFO("%s", " - prompt is already in the cache, skipping\n");
@@ -1455,7 +1469,8 @@ static std::pair<std::string, std::string> server_prompt_cache_next_paths(server
 bool server_prompt_cache::stage_checkpoint(
         server_prompt_checkpoint & checkpoint,
             const server_tokens & tokens,
-                      int32_t      id_slot) {
+                      int32_t      id_slot,
+                       size_t      replaceable_disk_size) {
     if (!has_disk_tier() || !checkpoint.state_file.empty() || checkpoint.n_tokens <= 0 ||
             checkpoint.n_tokens > tokens.n_tokens()) {
         return false;
@@ -1466,7 +1481,7 @@ bool server_prompt_cache::stage_checkpoint(
     const size_t state_size = llama_state_seq_get_size(ctx, id_slot, 0);
     const size_t estimated_file_size = 3*sizeof(uint32_t) +
         state_tokens.size()*sizeof(llama_token) + state_size;
-    if (state_size == 0 || !make_disk_room(estimated_file_size)) {
+    if (state_size == 0 || !make_disk_room(estimated_file_size, replaceable_disk_size)) {
         LLAMA_LOG_WARN("cannot stage hybrid prompt checkpoint: %.3f MiB state does not fit the disk tier budget\n",
                 estimated_file_size / (1024.0 * 1024.0));
         return false;
@@ -1730,21 +1745,56 @@ void server_prompt_cache::make_ram_room(size_t incoming_size) {
     }
 }
 
-bool server_prompt_cache::make_disk_room(size_t incoming_size) {
-    if (!has_disk_tier() || limit_disk_size == 0) {
-        return has_disk_tier();
+bool server_prompt_cache::make_disk_room(size_t incoming_size, size_t replaceable_size) {
+    if (!has_disk_tier()) {
+        return false;
     }
 
-    while (incoming_size > limit_disk_size ||
-            disk_size() > limit_disk_size - incoming_size) {
+    // A live hybrid slot can carry an immutable disk snapshot that is about
+    // to be superseded by this write.  Keep the old file until the new one is
+    // atomically committed, but do not evict an unrelated LRU entry merely
+    // because both generations coexist for those few seconds.
+    bool space_query_warned = false;
+    while (true) {
+        const size_t current_size = disk_size();
+        const size_t reclaimable = std::min(current_size, replaceable_size);
+        const size_t retained_size = current_size - reclaimable;
+
+        const bool budget_fits = limit_disk_size == 0 ||
+            (incoming_size <= limit_disk_size &&
+             retained_size <= limit_disk_size - incoming_size);
+
+        // replaceable_size is useful for the logical cache budget, but the old
+        // snapshot deliberately remains present until the new .partial file is
+        // committed.  The backing filesystem therefore needs room for both
+        // generations.  Query its live headroom instead of assuming that the
+        // configured cache budget is the whole filesystem.
+        std::error_code space_ec;
+        const auto space = std::filesystem::space(disk_directory, space_ec);
+        const bool physical_fits = space_ec || incoming_size <= space.available;
+        if (space_ec && !space_query_warned) {
+            LLAMA_LOG_WARN("failed to query disk prompt-cache filesystem headroom for '%s': %s\n",
+                    disk_directory.c_str(), space_ec.message().c_str());
+            space_query_warned = true;
+        }
+
+        if (budget_fits && physical_fits) {
+            break;
+        }
         auto it = std::find_if(states.begin(), states.end(), [](const server_prompt & state) {
             return state.disk_size() > 0;
         });
         if (it == states.end()) {
             return false;
         }
-        LLAMA_LOG_INFO(" - making disk prompt-cache room, removing oldest spilled entry (%.3f MiB)\n",
-                it->disk_size() / (1024.0 * 1024.0));
+        LLAMA_LOG_INFO(" - making disk prompt-cache room, removing oldest spilled entry "
+                "(%.3f MiB, reason: %s%s%s, filesystem available: %.3f MiB, incoming: %.3f MiB)\n",
+                it->disk_size() / (1024.0 * 1024.0),
+                budget_fits ? "" : "tier budget",
+                !budget_fits && !physical_fits ? " + " : "",
+                physical_fits ? "" : "atomic-write headroom",
+                space_ec ? -1.0 : space.available / (1024.0 * 1024.0),
+                incoming_size / (1024.0 * 1024.0));
         server_prompt_remove_all_files(*it);
         states.erase(it);
     }

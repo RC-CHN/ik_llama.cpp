@@ -23,6 +23,8 @@ enum slot_command {
     SLOT_COMMAND_RELEASE,
 };
 
+struct server_mtp_adaptive_scheduler;
+
 struct server_slot {
     int id;
     int id_task = -1;
@@ -155,6 +157,8 @@ struct server_slot {
 
     // speculative decoding
     struct common_speculative * spec = nullptr;
+    bool speculative_n_max_explicit = false;
+    common_params_speculative speculative_adaptive_base;
     struct common_params_sampling sparams;
     common_sampler * ctx_sampling = nullptr;
 
@@ -226,6 +230,10 @@ struct server_metrics {
     uint64_t n_tokens_predicted = 0;
     uint64_t t_tokens_generation = 0;
 
+    uint64_t kv_batch_capacity_caps_total = 0;
+    uint64_t kv_batch_retries_total = 0;
+    int32_t kv_batch_effective_cap = 0;
+
     void init();
 
     void on_prompt_eval(const server_slot& slot);
@@ -274,6 +282,10 @@ struct server_context {
 
     server_metrics metrics;
 
+    // Opaque here so the controller implementation and its contextual bandit
+    // state stay local to server-context.cpp.
+    std::unique_ptr<server_mtp_adaptive_scheduler> mtp_scheduler;
+
     common_chat_templates_ptr chat_templates;
     server_chat_params  chat_params;
     std::map<std::string, bool> chat_template_caps;
@@ -283,6 +295,7 @@ struct server_context {
     int32_t cache_ram_n_min = 0;
     float cache_ram_similarity = 0.5f;
 
+    server_context();
     ~server_context();
 
     bool load_model(const gpt_params& params_);
@@ -364,7 +377,9 @@ struct server_context {
 
     void context_shift();
 
-    void add_sampled_tokens();
+    void add_sampled_tokens(
+            bool force_target_only = false,
+            const std::vector<uint8_t> * decode_schedule = nullptr);
 
     void align_parallel_mtp_drafts();
 

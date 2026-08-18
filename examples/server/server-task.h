@@ -506,7 +506,8 @@ struct server_prompt_cache {
     bool save(server_prompt & prompt, int32_t id_slot);
 
     bool stage_checkpoint(server_prompt_checkpoint & checkpoint,
-            const server_tokens & tokens, int32_t id_slot);
+            const server_tokens & tokens, int32_t id_slot,
+            size_t replaceable_disk_size = 0);
 
     bool spill_to_disk(server_prompt & prompt);
 
@@ -514,7 +515,7 @@ struct server_prompt_cache {
 
     void make_ram_room(size_t incoming_size);
 
-    bool make_disk_room(size_t incoming_size);
+    bool make_disk_room(size_t incoming_size, size_t replaceable_size = 0);
 
     bool load(server_prompt& prompt, const server_tokens& tokens_new, llama_context* ctx, int32_t id_slot, float min_reusable_fraction);
 
